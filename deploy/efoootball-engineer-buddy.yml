@@ -1,0 +1,69 @@
+# Engineer Buddy — PR reviewer for the efoootball repo.
+# Lives in the efoootball repo; pulls the buddy engine from its own repo.
+# Zero secrets: GITHUB_TOKEN (automatic) + keyless LLM gateways = $0/month.
+name: "Engineer Buddy — PR Review"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created] # comment "@engineer-buddy review" to re-run
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: engineer-buddy-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: >-
+      github.event_name == 'pull_request' ||
+      (
+        github.event_name == 'issue_comment' &&
+        startsWith(github.event.comment.body, '@engineer-buddy') &&
+        github.event.comment.user.type != 'Bot' &&
+        github.event.comment.author_association != 'NONE' &&
+        github.event.issue.pull_request != null
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PR number
+        id: pr
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+            echo "ref=${{ github.event.pull_request.head.ref }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+            echo "ref=refs/pull/${{ github.event.issue.number }}/head" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.ref }}
+          fetch-depth: 1
+
+      - name: Fetch Engineer Buddy engine
+        run: |
+          BUDDY_REPO="${BUDDY_REPO:-OpenAImakers/engineer-buddy}"
+          git clone --depth 1 "https://github.com/${BUDDY_REPO}.git" "$RUNNER_TEMP/engineer-buddy"
+        env:
+          BUDDY_REPO: ${{ vars.BUDDY_REPO }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run review (keyless — no API keys anywhere)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node "$RUNNER_TEMP/engineer-buddy/src/index.js" pr-review \
+            --repo "${{ github.repository }}" \
+            --pr "${{ steps.pr.outputs.number }}" \
+            --repo-dir "$GITHUB_WORKSPACE"

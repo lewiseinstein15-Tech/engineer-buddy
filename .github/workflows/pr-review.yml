@@ -1,0 +1,32 @@
+# Engineer Buddy reviews its own PRs (dogfooding). Zero secrets: the default
+# GITHUB_TOKEN + keyless LLM gateways are all it needs.
+name: "Engineer Buddy — PR Review (self)"
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: buddy-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run Engineer Buddy review
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node src/index.js pr-review \
+            --repo "${{ github.repository }}" \
+            --pr "${{ github.event.pull_request.number }}" \
+            --repo-dir "$GITHUB_WORKSPACE"

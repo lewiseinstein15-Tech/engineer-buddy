@@ -1,0 +1,17 @@
+# Manual / scheduled health probe of every keyless gateway in the brain chain.
+name: "Buddy Doctor"
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *" # daily snapshot
+
+jobs:
+  doctor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Probe gateways
+        run: node src/index.js doctor

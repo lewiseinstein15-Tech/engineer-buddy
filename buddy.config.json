@@ -1,0 +1,69 @@
+{
+  "gatewayOrder": ["kilo", "llm7", "pollinations", "duckai"],
+  "gateways": {
+    "kilo": {
+      "enabled": true,
+      "baseUrl": "https://api.kilo.ai/api/openrouter",
+      "apiKey": "anonymous",
+      "models": "auto",
+      "preferredModels": [
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "nvidia/nemotron-3.5-super-vl:free",
+        "cohere/north-mini-code:free",
+        "poolside/laguna-s-2.1:free",
+        "recursive/flint-v1.0:free",
+        "nvidia/nemotron-3.5-lightning:free"
+      ]
+    },
+    "llm7": {
+      "enabled": true,
+      "baseUrl": "https://api.llm7.io/v1",
+      "apiKey": "unused",
+      "models": ["codestral-latest", "gpt-oss:20b", "minimax-m2.7"]
+    },
+    "pollinations": {
+      "enabled": true,
+      "baseUrl": "https://text.pollinations.ai",
+      "apiKey": "",
+      "models": ["openai"]
+    },
+    "duckai": {
+      "enabled": true,
+      "baseUrl": "https://duckduckgo.com/duckchat",
+      "apiKey": "",
+      "models": ["gpt-4o-mini"]
+    },
+    "ollama": {
+      "enabled": false,
+      "baseUrl": "http://127.0.0.1:11434",
+      "apiKey": "",
+      "models": ["qwen2.5-coder:3b"]
+    }
+  },
+  "review": {
+    "maxDiffChars": 80000,
+    "maxFileChars": 30000,
+    "maxFindings": 8,
+    "requestChangesOnCritical": true,
+    "approveWhenClean": false,
+    "skipBots": true,
+    "skipDrafts": true,
+    "deepModeChangedLineThreshold": 200,
+    "deepMaxFiles": 3,
+    "excludeFiles": ["**/.env*", "**/*.pem", "**/*.key", "**/*.p12", "**/secrets.*"],
+    "labels": {
+      "clean": "buddy:clean",
+      "changes": "buddy:changes-requested",
+      "critical": "buddy:critical"
+    }
+  },
+  "circuitBreaker": {
+    "failureThreshold": 2,
+    "cooldownMs": 120000,
+    "maxRoundTrips": 2
+  },
+  "timeouts": {
+    "chatMs": 150000,
+    "httpMs": 30000
+  }
+}
