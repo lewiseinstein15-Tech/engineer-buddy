@@ -321,6 +321,8 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   let lastTask = null;
   let busy = false;
   let aborter = null;
+  let msgQueue = []; // messages typed while a turn runs (Claude Code queueing)
+  let busyLabel = null;
   let approvalDeny = null;
   let qToken = 0;
   let lastSigintAt = 0;
@@ -365,7 +367,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       events.push(ev);
       if (ev.type === 'tool') {
         toolCallsThisTurn += 1;
-        rl.setBusy(`working · ${toolCallsThisTurn} tool call${toolCallsThisTurn === 1 ? '' : 's'}`);
+        rl.setBusy(`working · ${toolCallsThisTurn} tool call${toolCallsThisTurn === 1 ? '' : 's'}${msgQueue.length ? ` · ${msgQueue.length} queued` : ''}`);
         lastGateway = ev.gateway || lastGateway;
         try {
           recorder?.append({ type: 'tool', tool: ev.tool, args: { _preview: truncate(JSON.stringify(ev.args), 160) }, observation: truncate(ev.observation, 160), denied: ev.denied });
@@ -463,7 +465,8 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
             `  ${c.bold('!cmd')}            run a shell command yourself (trusted, no gate)`,
             `  ${c.bold('@path')}           attach a file to the task (e.g. explain @src/app.js)`,
             `  ${c.bold('#note')}           remember a note in project memory (${HARNESS_DIR}/MEMORY.md)`,
-            `  ${c.bold('Ctrl+C')}          interrupt the running task · twice to quit`,
+            `  ${c.bold('Ctrl+C')}          interrupt the running task (drops queued messages) · twice to quit`,
+            `  ${c.bold('while busy')}       keep typing — messages queue and run in order next`,
             '',
             `  ${c.bold(c.cyan('Session'))}`,
             ...[
@@ -1115,40 +1118,65 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     await runTask(taskText, taskOpts);
   }
 
-  /** One Buddy turn (shared by plain tasks and /<skill-name> invocations). */
+  /** One Buddy turn (shared by plain tasks and /<skill-name> invocations).
+   *  Typing while a turn runs QUEUES the message (Claude Code style): queued
+   *  tasks run in order when the current turn ends; Ctrl+C interrupts the
+   *  turn AND clears the queue — stopping means stopping everything. */
   async function runTask(inputText, { skill = null, recordAs = null, anchor = null } = {}) {
     if (busy) {
-      say('  (Buddy is still working — one task at a time, Ctrl+C to interrupt)');
+      msgQueue.push({ text: inputText });
+      say(`  ${c.cyan('⌁ queued')} ${c.dim(`— I'll run it when this turn ends (${msgQueue.length} waiting)`)}`);
+      rl.setBusy(`${busyLabel || 'Buddy working'} · ${msgQueue.length} queued`);
       rl.prompt();
       return;
     }
     busy = true;
-    events = [];
-    toolCallsThisTurn = 0;
-    lastTask = { task: inputText, events };
-    turnStart.at = Date.now();
-    aborter = new AbortController();
-    const recorded = recordAs || inputText;
-    ensureRecorder(recorded).append({ type: 'user', text: recorded });
-    rl.setBusy(skill ? `Buddy working · /${skill.name}…` : 'Buddy working…');
+    let current = { text: inputText };
     try {
-      const out = await chat.turn(inputText, { signal: aborter.signal, skill, anchor });
-      rl.setBusy(null);
-      recorder.append({ type: 'say', text: out.said ?? '' });
-      lastTask.events = events;
-      // Claude-Code-style turn footer.
-      const secs = (Date.now() - turnStart.at) / 1000;
-      const ctxK = (chat.historyChars() / 1000).toFixed(1);
-      const gw = lastGateway || router.order[0];
-      console.log(c.gray(`  ⏱ ${secs.toFixed(1)}s · ${toolCallsThisTurn} tool call${toolCallsThisTurn === 1 ? '' : 's'} · ${ctxK}k ctx${out.steps ? c.gray(` · ${out.steps} steps`) : ''}${gw ? c.gray(` · ${gw}`) : ''}`));
-      debugLog(`turn done: steps=${out.steps} said=${out.said ? 'yes' : 'no'}`);
-    } catch (e) {
-      rl.setBusy(null);
-      console.log(`  ${c.red('turn failed')}: ${truncate(e.message, 300)}`);
+      while (current) {
+        events = [];
+        toolCallsThisTurn = 0;
+        lastTask = { task: current.text, events };
+        turnStart.at = Date.now();
+        aborter = new AbortController();
+        const recorded = recordAs || current.text;
+        ensureRecorder(recorded).append({ type: 'user', text: recorded });
+        busyLabel = skill ? `Buddy working · /${skill.name}…` : 'Buddy working…';
+        rl.setBusy(busyLabel);
+        let out = null;
+        try {
+          out = await chat.turn(current.text, { signal: aborter.signal, skill, anchor });
+          recorder.append({ type: 'say', text: out.said ?? '' });
+          lastTask.events = events;
+          // Claude-Code-style turn footer.
+          const secs = (Date.now() - turnStart.at) / 1000;
+          const ctxK = (chat.historyChars() / 1000).toFixed(1);
+          const gw = lastGateway || router.order[0];
+          console.log(c.gray(`  ⏱ ${secs.toFixed(1)}s · ${toolCallsThisTurn} tool call${toolCallsThisTurn === 1 ? '' : 's'} · ${ctxK}k ctx${out.steps ? c.gray(` · ${out.steps} steps`) : ''}${gw ? c.gray(` · ${gw}`) : ''}`));
+          debugLog(`turn done: steps=${out.steps} said=${out.said ? 'yes' : 'no'}`);
+        } catch (e) {
+          console.log(`  ${c.red('turn failed')}: ${truncate(e.message, 300)}`);
+        } finally {
+          rl.setBusy(null);
+          busyLabel = null;
+        }
+        // Interrupt = stop everything: the turn AND anything still queued.
+        if (out?.aborted && msgQueue.length) {
+          say(`  ${c.yellow('⏸')} queue cleared — ${msgQueue.length} queued message${msgQueue.length === 1 ? '' : 's'} dropped (interrupt stops everything)`);
+          msgQueue = [];
+        }
+        const next = msgQueue.shift();
+        if (next) say(`\n  ${c.cyan('▶')} running queued task: ${c.dim(truncate(next.text, 64))}`);
+        current = next || null;
+        skill = null; // queued tasks are plain tasks
+        anchor = null;
+        recordAs = null;
+      }
+    } finally {
+      aborter = null;
+      busy = false;
+      rl.prompt();
     }
-    aborter = null;
-    busy = false;
-    rl.prompt();
   }
 
   return null;

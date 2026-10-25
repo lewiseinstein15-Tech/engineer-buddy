@@ -237,6 +237,10 @@ The gate is a human decision; hooks are machine law. Put shell commands in `.bud
 }}
 ```
 
+### Queued messages — keep typing while Buddy works (v0.12.4)
+
+Tasks used to bounce while a turn ran (`one task at a time`). Now typing queues the message (Claude Code style): the input stays live, the busy footer shows the depth (`working · 3 tool calls · 1 queued`), and when the turn ends the queue drains **in order** — each queued task announced with a `▶ running queued task` line before it starts. Ctrl+C keeps its meaning: interrupt the turn **and** clear the queue (stopping means stopping everything). Slash commands still refuse while busy — only real tasks queue.
+
 ### /diff — see what changed without leaving the session (v0.12.3)
 
 `/diff` prints your uncommitted changes in one shot: `git status --short` (untracked files included), the `--stat` summary, and the diff body capped at ~6k chars so a big rework cannot flood the screen. Clean tree gets one quiet line; outside a repo it says so instead of erroring. (The model-side counterpart already exists — Buddy can run read-only `git diff` itself; this one is for YOUR eyes between turns.)
