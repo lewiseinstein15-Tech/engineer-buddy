@@ -34,7 +34,7 @@ const REPEAT_HINT_TOOLS = new Set(['fs_search', 'fs_read', 'fs_list', 'web_searc
 // a backstop. Exported for tests and the /context surface.
 export const AUTO_COMPACT_AT = 0.8;
 
-export function buildSystemPrompt({ harness, tools, skills = [], planMode = false }) {
+export function buildSystemPrompt({ harness, tools, skills = [], planMode = false, repoMap = '' }) {
   // Plan mode swaps the visible tool list right here: only research tools +
   // exit_plan stay; normal mode hides exit_plan so the model never sees a
   // tool it cannot use. (Filtering lives here so no caller can forget it.)
@@ -43,8 +43,13 @@ export function buildSystemPrompt({ harness, tools, skills = [], planMode = fals
     : tools.filter((t) => t.name !== 'exit_plan');
   const hasTodo = eff.some((t) => t.name === 'todo');
   const skillsBlock = describeSkillCatalog(skills);
+  const map = String(repoMap || '').trim();
   return [
     PROTOCOL_PREAMBLE,
+    // Repo map (aider-style): orientation before the first research step —
+    // the model sees the repo's shape and top symbols without burning a
+    // fs_list step on it. A hint, never the truth (files move).
+    ...(map ? ['', '## Repo map', map] : []),
     '',
     '## Tools',
     describeTools(eff),
@@ -85,6 +90,7 @@ export function createChat({
   approval = null, // async ({tool, summary}) => 'yes' | 'no' | 'always' | null
   modes = null, // shared { plan: boolean } — plan mode when .plan is true
   todoState = null, // shared { latest: [...] | null } — todo v2 state, kept through compaction
+  repoMap = null, // () => string | string — aider-style repo map injected into the system prompt
   hooks = null, // HookRunner (src/hooks.js) — user-defined lifecycle commands; null = unconfigured
   onEvent = () => {},
 }) {
@@ -109,7 +115,8 @@ export function createChat({
   // mode hides exit_plan so the model never sees it when it cannot run it.
   const systemMsg = () => {
     const plan = modes?.plan === true;
-    return { role: 'system', content: buildSystemPrompt({ harness, tools, skills, planMode: plan }) };
+    const map = typeof repoMap === 'function' ? repoMap() : repoMap || '';
+    return { role: 'system', content: buildSystemPrompt({ harness, tools, skills, planMode: plan, repoMap: map }) };
   };
 
   const historyChars = () => messages.reduce((n, m) => n + m.content.length, 0);
@@ -465,7 +472,9 @@ export function createChat({
     const toolGuidance = harness.toolGuidance?.length || 0;
     const guardrails = harness.guardrails?.length || 0;
     const skillsBlock = describeSkillCatalog(skills).length;
-    const system = buildSystemPrompt({ harness, tools, skills, planMode: plan }).length;
+    const map = typeof repoMap === 'function' ? repoMap() : repoMap || '';
+    const repoMapLen = String(map || '').length;
+    const system = buildSystemPrompt({ harness, tools, skills, planMode: plan, repoMap: map }).length;
     return {
       parts: {
         systemprompt,
@@ -473,9 +482,10 @@ export function createChat({
         toolGuidance,
         guardrails,
         skillsBlock,
+        repoMap: repoMapLen,
         // protocol preamble + tool definitions + plan-protocol/plan-mode
         // sections — measured as one remainder so the sum is always exact.
-        toolsAndProtocol: system - systemprompt - memory - toolGuidance - guardrails - skillsBlock,
+        toolsAndProtocol: system - systemprompt - memory - toolGuidance - guardrails - skillsBlock - repoMapLen,
       },
       system,
       conversation: historyChars(),

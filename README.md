@@ -237,6 +237,10 @@ The gate is a human decision; hooks are machine law. Put shell commands in `.bud
 }}
 ```
 
+### The repo map — orientation before the first research step (v0.12.1)
+
+Small models spend their first 2-4 steps on `fs_list`/`fs_read` just to learn what the repo looks like. Now every turn's system prompt opens with an **aider-style repo map**: file paths with their module-level symbols (`src/agent/chat.js: createChat, buildSystemPrompt`), **ranked by git churn** over the last 300 commits so the most-changed code survives the ~2.8k char cap. Zero dependencies (pure-JS symbol regexes for js/ts/jsx/tsx/py/go/rs, the same ignore-walk as `fs_list`), cached with a 60s TTL, and honest about its own staleness — the header tells the model it is *a hint, not the tree; use fs_list/fs_read/fs_search for the current truth*. `/map` shows exactly what the model sees (and rescans fresh); `chat.repoMap: false` in the config turns it off.
+
 ### Auto-compact — the loop shrinks context BEFORE the wall (v0.12.0)
 
 Compaction used to wait until history hit **100%** of the char budget — the turn that hit the wall paid for the full window first, and the free gateways' token caps punished the biggest turns the most. Now the loop compacts **proactively at ~80%** (`↺ context near budget — auto-compacted`), keeping the 100% wall as a backstop that bypasses every guard. An anti-churn guard stops the opposite failure (v0.9.4's live lesson: seven compactions in one turn dissolving the task) — a soft over-80% state with fewer than six fresh messages waits, the hard wall never does. `/context` shows where the trigger sits (`auto-compact at ~38.4k chars (80% of budget)`), and manual `/compact` still forces a pass anytime.

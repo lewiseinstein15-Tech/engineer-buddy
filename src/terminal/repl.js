@@ -24,6 +24,7 @@ import { buildSkillTool } from '../tools/skill.js';
 import { loadSkills } from '../skills/loader.js';
 import { buildExitPlanTool, listPlans, PLANS_DIR } from '../tools/planmode.js';
 import { listCheckpoints, restoreCheckpoint } from '../agent/checkpoints.js';
+import { buildRepoMap, createRepoMapProvider } from '../agent/repomap.js';
 import { HookRunner } from '../hooks.js';
 import { connectMcpServers, buildMcpTools, describeMcpServers, MCP_CONFIG_PATH } from '../tools/mcp.js';
 import { ensureHarness, loadHarness, harnessContext } from '../harness/scaffold.js';
@@ -40,7 +41,7 @@ export const VERSION = createRequire(import.meta.url)('../../package.json').vers
 // ── Slash commands (pure, testable) ──────────────────────────────────────────
 
 export const SLASH_COMMANDS = [
-  'help', 'new', 'clear', 'screen', 'compact', 'context', 'model', 'gateways', 'cost',
+  'help', 'new', 'clear', 'screen', 'compact', 'context', 'map', 'model', 'gateways', 'cost',
   'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'hooks', 'memory', 'experience', 'learn', 'review',
   'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit',
 ];
@@ -53,6 +54,7 @@ export const SLASH_DESCRIPTIONS = {
   screen: 'Clear the screen',
   compact: 'Summarize old context to free space',
   context: 'Show the context budget: what fills the window, chars + est. tokens',
+  map: 'Show the repo map (aider-style: files + top symbols, churn-ranked)',
   model: 'Pin a gateway first (e.g. /model kilo)',
   gateways: 'Health-probe the keyless chain',
   cost: 'Usage: brain calls, est. tokens, $0.00',
@@ -123,7 +125,7 @@ function makeHarness(root) {
 }
 
 /** Create a chat session bound to a workspace root. */
-export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {} } = {}) {
+export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {}, repoMap = null } = {}) {
   const { tools, todoState, mcp, shells, skills } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved });
   const harness = makeHarness(root);
   // Hooks: the deterministic guarantee layer (.buddy/settings.json). One
@@ -131,7 +133,7 @@ export async function createBuddySession({ root = process.cwd(), router, yolo = 
   const hooks = new HookRunner({ root });
   // todoState is shared: the todo tool writes it (local.js), compaction reads
   // it (todo v2 plan anchor) — one object, one truth.
-  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, todoState, hooks, onEvent });
+  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, todoState, hooks, onEvent, repoMap });
   if (resumeFrom) {
     for (const m of resumeMessages(loadSession(resumeFrom))) session.messages.push(m);
   }
@@ -221,12 +223,14 @@ export function appendMemoryNote(root, note) {
 export async function runOneShot({ router, root = process.cwd(), task, safe = false, yolo = false, quiet = false, config = {} } = {}) {
   const events = [];
   const render = makeRenderer({ quiet });
+  const repoMapProvider = config.chat?.repoMap === false ? null : createRepoMapProvider(root, { maxChars: config.chat?.repoMapChars || 2800 });
   const { chat, hooks } = await createBuddySession({
     root,
     router,
     yolo,
     approval: defaultApproval({ safe }),
     charBudget: config.chat?.charBudget,
+    repoMap: repoMapProvider,
     onEvent: (ev) => {
       events.push(ev);
       render(ev);
@@ -307,6 +311,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     root,
     router,
     modes,
+    repoMap: config.chat?.repoMap === false ? null : createRepoMapProvider(root, { maxChars: config.chat?.repoMapChars || 2800 }),
     onPlanApproved: ({ saved }) => {
       console.log(`\n  ${c.green('✓ plan approved')} — exited plan mode${saved ? c.gray(` · saved to ${path.relative(root, saved)}`) : ''}\n`);
     },
@@ -448,6 +453,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
             ...[
               ['/compact', 'summarize old context now to free space'],
               ['/context', 'token budget breakdown — system prompt, harness, conversation'],
+              ['/map', 'repo map — files + top symbols, ranked by git churn (aider-style)'],
               ['/cost', 'usage: brain calls, est. tokens, $0.00'],
               ['/model <name>', 'pin a gateway first (e.g. /model kilo) · /model auto restores'],
               ['/gateways', 'health-probe the keyless chain'],
@@ -511,6 +517,26 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       case 'context':
         say(renderContextBar(chat.contextBreakdown()));
         break;
+      case 'map': {
+        const s = busySpinner('scanning the repo');
+        try {
+          const m = buildRepoMap(root, { maxChars: config.chat?.repoMapChars || 2800 });
+          s.stop();
+          if (!m.text) {
+            say('\n  no map for this workspace — no code files with top-level symbols found\n');
+            break;
+          }
+          say(
+            `\n${c.bold('Repo map')} ${c.dim(`— ${m.files} files · ${m.symbols} symbols${m.truncated ? ' · capped (most-changed first)' : ''} · churn-ranked by git`)}` +
+              `\n${c.gray(m.text)}` +
+              `\n${c.dim('  injected into the system prompt each turn (turn it off: config chat.repoMap = false) — /map rescans fresh')}\n`
+          );
+        } catch (e) {
+          s.stop();
+          say(`\n  ${c.red('map failed')}: ${truncate(e.message, 200)}\n`);
+        }
+        break;
+      }
       case 'cost': {
         const u = chat.usage();
         const estK = ((u.charsIn + u.charsOut) / 4 / 1000).toFixed(1);
