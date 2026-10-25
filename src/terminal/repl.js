@@ -138,7 +138,8 @@ async function makeScopeAndTools({ root, router = null, onEvent = () => {}, appr
 
 function makeHarness(root) {
   ensureHarness(root);
-  const hctx = harnessContext(loadHarness(root));
+  // root passed → MEMORY.md @path imports are expanded at assembly time.
+  const hctx = harnessContext(loadHarness(root), root);
   const lessons = recentLessons(root);
   if (lessons.length) {
     hctx.memory += `\n\n## Lessons from past tasks\n${lessons.map((l) => `- ${l}`).join('\n')}`;
@@ -825,11 +826,16 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         const memPath = path.join(root, HARNESS_DIR, 'MEMORY.md');
         say(`\n${c.bold('Project memory')}: ${memPath}`);
         try {
-          say(c.dim(truncate(fs.readFileSync(memPath, 'utf8'), 1200) + '\n'));
+          const raw = fs.readFileSync(memPath, 'utf8');
+          say(c.dim(truncate(raw, 1200) + '\n'));
+          const imports = raw.split('\n').map((l) => l.trim()).filter((l) => /^@(?!@)\S+$/.test(l));
+          if (imports.length) {
+            say(c.gray(`  imports (${imports.length}, expanded into every session): ${imports.join(' · ')}\n`));
+          }
         } catch {
           say(c.dim('(missing — run /new or edit the harness)\n'));
         }
-        say(c.gray('  tip: type #<note> any time to add a memory note\n'));
+        say(c.gray('  tip: #<note> adds a memory note · a whole line "@path" imports a repo file into every session\n'));
         break;
       }
       case 'experience':

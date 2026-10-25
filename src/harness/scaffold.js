@@ -8,6 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { globMatches } from '../util.js';
+import { isSecretPath } from '../tools/local.js';
 import {
   HARNESS_DIR,
   SIZE_CAPS,
@@ -54,15 +55,104 @@ export function loadHarness(root = process.cwd()) {
   return merged;
 }
 
-/** Assemble the always-on context parts the chat loop injects. */
-export function harnessContext(harness) {
+/** Assemble the always-on context parts the chat loop injects.
+ *
+ * With `root` set, MEMORY.md `@path` imports are expanded (P1: memory
+ * imports) — a whole line starting with `@` pulls that repo file's content
+ * into memory at assembly time, so durable notes can reference living docs
+ * without duplicating them. Without `root`, behavior is unchanged (tests,
+ * pure callers).
+ */
+export function harnessContext(harness, root = null) {
+  const memory = root ? expandMemoryImports(root, harness['MEMORY.md'] || '') : harness['MEMORY.md'];
   return {
     systemprompt: harness['systemprompt.md'],
     guardrails: harness['guardrails.md'],
-    memory: harness['MEMORY.md'],
+    memory,
     toolGuidance: harness['tool_guidance.md'],
     skills: Object.fromEntries(Object.entries(harness).filter(([k]) => k.startsWith('skills/'))),
   };
+}
+
+// ── Memory @path imports ─────────────────────────────────────────────────────
+
+// Caps mirror the @file mention firewall: one import ≤ 4k chars, all imports
+// together ≤ 8k, nesting ≤ 3 deep. Imports are context, not a data feed.
+const IMPORT_MAX_FILE = 4000;
+const IMPORT_MAX_TOTAL = 8000;
+const IMPORT_MAX_DEPTH = 3;
+
+// Whole-line imports only: a trimmed line matching `@<path>` is an import.
+// Inline @tokens (emails, prose) are left alone; `@@` renders a literal `@`.
+const IMPORT_LINE = /^@((?:[A-Za-z0-9._\/-]|\\ )+)$/;
+
+function importMarker(reason) {
+  return `(memory import: ${reason})`;
+}
+
+/**
+ * Expand `@path` lines in a memory text against the repo root.
+ * Honest by construction: refused or missing imports become a visible
+ * marker line, never a silent drop. Cycles and nesting are capped.
+ */
+export function expandMemoryImports(root, text, { depth = 0, seen = new Set(), budget = { left: IMPORT_MAX_TOTAL } } = {}) {
+  const out = [];
+  for (const rawLine of String(text || '').split('\n')) {
+    const line = rawLine.trimEnd();
+    const trimmed = line.trim();
+    if (trimmed.startsWith('@@') && IMPORT_LINE.test(trimmed.slice(1))) {
+      out.push(`@${trimmed.slice(2)}`);
+      continue;
+    }
+    const m = IMPORT_LINE.exec(trimmed);
+    if (!m) {
+      out.push(line);
+      continue;
+    }
+    const rel = m[1].replace(/\\ /g, ' ');
+    if (depth >= IMPORT_MAX_DEPTH) {
+      // This line sits inside a level-3 import — reading it would be level 4.
+      out.push(importMarker(`@${rel} refused — nesting deeper than 3`));
+      continue;
+    }
+    if (budget.left <= 0) {
+      out.push(importMarker(`@${rel} skipped — import budget (8k chars) exhausted`));
+      continue;
+    }
+    if (rel.includes('..')) {
+      out.push(importMarker(`@${rel} refused — path escapes the repo`));
+      continue;
+    }
+    if (isSecretPath(rel)) {
+      out.push(importMarker(`@${rel} refused — secret paths are never loaded`));
+      continue;
+    }
+    const abs = path.resolve(root, rel);
+    if (seen.has(abs)) {
+      out.push(importMarker(`@${rel} skipped — circular import`));
+      continue;
+    }
+    let content;
+    try {
+      content = fs.readFileSync(abs, 'utf8');
+    } catch {
+      out.push(importMarker(`@${rel} — file not found`));
+      continue;
+    }
+    seen.add(abs);
+    const take = Math.min(content.length, IMPORT_MAX_FILE, budget.left);
+    let piece =
+      take < content.length
+        ? `${content.slice(0, take)}\n${importMarker(`@${rel} truncated at ${take} chars`)}`
+        : content;
+    budget.left -= take;
+    // A file may itself carry @imports — resolve them against ITS directory
+    // so relative refs stay relative to the imported file. The depth gate at
+    // the read site already refuses level-4 files, so recursion here is safe.
+    piece = expandMemoryImports(path.dirname(abs), piece, { depth: depth + 1, seen, budget });
+    out.push(`[imported: @${rel}]\n${piece.replace(/\n*$/, '\n')}[/imported]`);
+  }
+  return out.join('\n');
 }
 
 // ── Proposal validation (Harness² core/spec.py rules, adapted) ──────────────
