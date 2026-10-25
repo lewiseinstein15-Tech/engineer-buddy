@@ -117,6 +117,30 @@ Drop a `.buddy/mcp.json` in the workspace and Buddy becomes an MCP **host**: ser
 
 First use of each MCP tool asks for approval (answer `a` to always-allow for the session). Timeouts are capped per request; a dead server shows up in `/mcp` and its tools return clean ERROR observations — one bad server never blocks startup or kills a turn.
 
+**Try MCP in 60 seconds (zero installs):** the repo ships a demo server — pure Node, no dependencies, nothing to download.
+
+```bash
+# 1. create the config
+mkdir -p .buddy && cat > .buddy/mcp.json <<'EOF'
+{
+  "mcpServers": {
+    "demo": { "command": "node", "args": ["examples/echo-mcp.js"] }
+  }
+}
+EOF
+
+# 2. start buddy — the banner shows:  mcp: demo connected (3 tools)
+buddy
+```
+
+Then inside Buddy:
+
+```
+use the mcp__demo__echo tool to say "hello", then ask mcp__demo__now for the time in Africa/Nairobi
+```
+
+`echo`, `now` (IANA timezones) and `word_count` ride the full stack: spawn → initialize handshake → `tools/list` → approval gate → `tools/call`. See `examples/echo-mcp.js` — it is also a template for writing your own servers (~150 lines, stdio JSON-RPC only).
+
 ### Safety model (terminal mode)
 
 - **Approval gates** — writes, edits, and shell commands ask `[y]es / [n]o / [a]lways` unless you `/yolo`. One-shot mode (`-p`) is autonomous; add `--safe` to deny all writes.
