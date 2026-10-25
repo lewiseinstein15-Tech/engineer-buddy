@@ -205,6 +205,23 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
   return { ...out, events };
 }
 
+/** MCP status line under the banner (exported for tests). Never throws. */
+export function printMcpStatus(mcp) {
+  try {
+    const connected = mcp?.connected ?? [];
+    const failed = mcp?.failed ?? [];
+    if (connected.length) {
+      const toolCount = connected.reduce((n, x) => n + (x.tools || []).length, 0);
+      console.log(c.gray(`  mcp: ${connected.map((x) => x.name).join(', ')} connected (${toolCount} tool${toolCount === 1 ? '' : 's'}) — /mcp for details`));
+    }
+    if (failed.length) {
+      console.log(c.yellow(`  mcp failed: ${failed.map((x) => x.name).join(', ')} — /mcp for details`));
+    }
+  } catch {
+    /* status line is best effort — never blocks the session */
+  }
+}
+
 // ── Interactive REPL ─────────────────────────────────────────────────────────
 
 export async function startRepl({ router, root = process.cwd(), config = {}, yolo: yoloFlag = false } = {}) {
@@ -236,15 +253,6 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       git,
     })
   );
-
-  // MCP status (best effort — never blocks the session).
-  if (mcp.connected.length) {
-    const toolCount = mcp.connected.reduce((n, x) => n + (x.tools || []).length, 0);
-    console.log(c.gray(`  mcp: ${mcp.connected.map((x) => x.name).join(', ')} connected (${toolCount} tool${toolCount === 1 ? '' : 's'}) — /mcp for details`));
-  }
-  if (mcp.failed.length) {
-    console.log(c.yellow(`  mcp failed: ${mcp.failed.map((x) => x.name).join(', ')} — /mcp for details`));
-  }
 
   const initialOrder = [...router.order];
   let yolo = Boolean(yoloFlag);
@@ -302,6 +310,12 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       render(ev);
     },
   });
+
+  // MCP status (best effort — never blocks the session). Printed here, AFTER
+  // createBuddySession: servers connect inside it and `mcp` only exists once
+  // it returns. (v0.8.1 fix — this block used to sit before the destructure,
+  // a temporal-dead-zone ReferenceError on every interactive startup.)
+  printMcpStatus(mcp);
 
   const render = makeRenderer({ toolByName: new Map(tools.map((t) => [t.name, t])) });
 

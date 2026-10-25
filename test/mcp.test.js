@@ -6,7 +6,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { McpClient, loadMcpConfig, connectMcpServers, buildMcpTools, describeMcpServers, MCP_CONFIG_PATH } from '../src/tools/mcp.js';
 
-const FIXTURE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'mini-mcp.js');
+// Fixture lives OUTSIDE test/ on purpose: Node's test runner treats every
+// file inside test/ as a test file, and mini-mcp.js is a stdio server that
+// blocks on stdin — running it as a "test" hangs the whole suite (v0.8.1).
+const FIXTURE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures', 'mini-mcp.js');
 const nodeBin = process.execPath;
 
 function tmpRoot(configJson) {
