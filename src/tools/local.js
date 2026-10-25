@@ -168,8 +168,13 @@ export class LocalScope {
   }
 
   search(needle, opts = {}) {
-    this._guard(needle);
-    return this.repo.search(String(needle), { max: 15, ...opts });
+    // NOTE: deliberately NO _guard here — the needle is TEXT to find inside
+    // files, not a path. "/stats" and "../todo" are legitimate search strings
+    // (kilo lost a research step to 'ERROR: unsafe path "/stats"' in the
+    // v0.9.4 live test). Only sanity-check that there is something to find.
+    const q = String(needle ?? '').trim();
+    if (!q) throw new BuddyError('search: needle required', { code: 'BAD_NEEDLE' });
+    return this.repo.search(q, { max: 15, ...opts });
   }
 
   /** Overwrite or create a file (agent-scoped, policy-checked). */

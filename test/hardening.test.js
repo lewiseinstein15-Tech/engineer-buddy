@@ -162,3 +162,63 @@ test('compaction summary message tells the model not to imitate it', async () =>
   assert.match(summary.content, /Do not repeat it, do not imitate its format/);
   fs.rmSync(root, { recursive: true, force: true });
 });
+
+// ── v0.9.5: task anchor + mid-turn plan nudge + search-needle fix ────────────
+
+test('compaction pins the current task into the summary', async () => {
+  const root = tmpRoot();
+  const { tools, harness } = makeBuddy(root);
+  const read = '{"tool":"fs_read","args":{"path":"README.md"}}';
+  const router = fakeRouter([read, read, read, read, '{"tool":"say","message":"done"}']);
+  const chat = createChat({ router, tools, harness, charBudget: 50, maxStepsPerTurn: 6 });
+  await chat.turn('find a bug in the todo tool and fix it');
+  const summary = chat.messages.find((m) => m.content.includes('[Earlier conversation, summarized'));
+  assert.ok(summary, 'compaction must have run');
+  assert.match(summary.content, /CURRENT TASK \(from the user[^)]*\): find a bug in the todo tool and fix it/s);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('short follow-ups keep the pinned task across turns', async () => {
+  const root = tmpRoot();
+  const { tools, harness } = makeBuddy(root);
+  const read = '{"tool":"fs_read","args":{"path":"README.md"}}';
+  const router = fakeRouter([
+    '{"tool":"say","message":"ok"}', // turn 1: task lands, no compaction
+    read, read, read, '{"tool":"say","message":"done"}', // turn 2: "continue" + compaction
+  ]);
+  const chat = createChat({ router, tools, harness, charBudget: 50, maxStepsPerTurn: 5 });
+  await chat.turn('find a bug in the todo tool and fix it');
+  await chat.turn('continue');
+  const summaries = chat.messages.filter((m) => m.content.includes('[Earlier conversation, summarized'));
+  assert.ok(summaries.length >= 1, 'turn 2 must have compacted');
+  const last = summaries[summaries.length - 1].content;
+  assert.match(last, /CURRENT TASK \(from the user[^)]*\): find a bug in the todo tool and fix it/s);
+  assert.ok(!last.includes(': continue'), '"continue" must not replace the task anchor');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('plan mode: mid-turn nudge fires once at ~step 8, before the final step', async () => {
+  const root = tmpRoot();
+  const modes = { plan: true };
+  const { tools, harness } = makeBuddy(root, modes);
+  const read = '{"tool":"fs_read","args":{"path":"README.md"}}';
+  const router = fakeRouter([read, read, read, read, read, read, read, read, '{"tool":"exit_plan","args":{"summary":"s","plan":"1. p"}}', '{"tool":"say","message":"ok"}']);
+  const chat = createChat({ router, tools, harness, modes, maxStepsPerTurn: 10, approval: async () => 'yes' });
+  const out = await chat.turn('research then plan');
+  const nudges = chat.messages.filter((m) => m.content.includes('used enough research steps'));
+  assert.equal(nudges.length, 1, 'exactly one mid-turn nudge');
+  assert.equal(out.said, 'ok');
+  assert.equal(modes.plan, false);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('fs_search: needle is text — "/stats" searches instead of throwing unsafe path', () => {
+  const root = tmpRoot();
+  fs.writeFileSync(path.join(root, 'cmd.md'), 'the /stats command shows token usage\n');
+  const scope = new LocalScope(root);
+  const hits = scope.search('/stats');
+  assert.ok(hits.length >= 1, 'slash-prefixed needle must match file content');
+  assert.ok(hits.some((h) => h.file.includes('cmd.md')));
+  assert.throws(() => scope.search('   '), /needle required/);
+  fs.rmSync(root, { recursive: true, force: true });
+});

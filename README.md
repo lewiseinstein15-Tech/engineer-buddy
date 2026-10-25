@@ -166,6 +166,8 @@ Live-testing hardening (v0.9.3): small free models sometimes write the plan as *
 
 Second live-test round (v0.9.4): kilo then emitted a `say`-JSON with **literal newlines inside the string** (invalid JSON) — the salvage wrapped that junk as a "plan" and an approval flipped plan mode off on garbage. Now a **sloppy-JSON repair layer** (all modes) escapes control characters inside string values before anything else, so the reply means what the model intended; the salvage **refuses `{`-starting replies** (broken JSON is never a plan); identical `fs_search`/`fs_read`/`fs_list`/`web_*` repeats get a *"same arguments, same result"* nudge instead of silently returning the same output (kilo burned its own 6/6 search cap re-running one query); the cap error in plan mode points at `exit_plan`; and compaction summaries open with *"Do not repeat it, do not imitate its format"* so small models stop imitating the summary format.
 
+Third round (v0.9.5) — beating research drift: kilo could still lose the plot on long plan-mode research (seven compactions in one turn dissolved the task, and it planned the wrong thing). Now the **task anchor** pins the user's task into every compaction summary (`CURRENT TASK: …` — short follow-ups like "continue" keep the previous anchor), a **mid-turn nudge at ~step 8** tells Buddy to stop researching and call `exit_plan` (the final-step nudge remains as the last resort), and `fs_search` treats its needle as **text, not a path** — searching `"/stats"` no longer throws `unsafe path`.
+
 ```text
 /plan
 ⏸ plan mode ON — Buddy researches read-only, then calls exit_plan

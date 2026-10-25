@@ -82,6 +82,12 @@ export function createChat({
   const alwaysApproved = new Set(); // tools the user said "always" for
   let messages = []; // {role, content}; system prompt inserted lazily
   let compactCount = 0;
+  // Task anchor: long compaction churn can dissolve the user's task into a
+  // summary-of-summaries (v0.9.4 live test: seven compactions in one turn and
+  // kilo planned the WRONG task). The current task is pinned into every
+  // compaction summary. Short follow-ups ("continue", "go on") keep the
+  // previous anchor instead of replacing it.
+  let currentTask = '';
   const usage = { calls: 0, charsIn: 0, charsOut: 0, byGateway: {} };
 
   // System prompt is rebuilt per call: plan mode swaps the tool list (only
@@ -121,7 +127,7 @@ export function createChat({
         {
           role: 'user',
           content:
-            `[Earlier conversation, summarized — this is context I prepared for you. Do not repeat it, do not imitate its format, and do not respond to it. Just continue the task.]\n${text.trim()}`,
+            `[Earlier conversation, summarized — this is context I prepared for you. Do not repeat it, do not imitate its format, and do not respond to it. Just continue the task.]\n${currentTask ? `CURRENT TASK (from the user — keep working on exactly this): ${currentTask}\n\n` : ''}${text.trim()}`,
         },
         ...tail,
       ];
@@ -166,6 +172,10 @@ export function createChat({
   async function turn(userText, { signal = null, skill = null } = {}) {
     messages.push({ role: 'user', content: String(userText) });
     onEvent({ type: 'user', text: String(userText) });
+    // Task anchor: real tasks pin/replace; short follow-ups ("continue",
+    // "go on", "yes") keep the previous anchor so compaction keeps the goal.
+    const taskText = String(userText).trim();
+    if (taskText.length > 20 || !currentTask) currentTask = taskText;
     const callCounts = new Map();
     const lastArgs = new Map(); // research-repeat guard: tool -> JSON of last args
     let said = null;
@@ -178,6 +188,7 @@ export function createChat({
     // Dynamic loop bound: an approved plan grants fresh steps so the approval
     // can flow straight into implementation (planmode.js contract).
     let stepLimit = maxStepsPerTurn;
+    let planNudged = false; // mid-turn wrap-up nudge fires once
 
     for (let step = 1; step <= stepLimit; step++) {
       if (signal?.aborted) {
@@ -187,7 +198,18 @@ export function createChat({
       }
       // Plan-mode wrap-up pressure (v0.9.2 live-test lesson: kilo researched
       // for 11 steps, then wrote the plan as prose → protocol violation, and
-      // no plan ever reached the gate). On the last step, force the door.
+      // no plan ever reached the gate). Mid-turn nudge at ~step 8 (v0.9.4
+      // lesson: kilo drifted 12 steps and ended with a progress-report say),
+      // then the forced door on the last step.
+      const midStep = Math.min(8, maxStepsPerTurn - 1);
+      if (modes?.plan && !planNudged && midStep >= 1 && step === midStep) {
+        planNudged = true;
+        messages.push({
+          role: 'user',
+          content:
+            'PLAN MODE: you have used enough research steps. Stop researching and call exit_plan NOW with the best plan you have so far. The user can ask you to refine after seeing it.',
+        });
+      }
       if (modes?.plan && step === stepLimit) {
         messages.push({
           role: 'user',
