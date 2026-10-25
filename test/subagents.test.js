@@ -182,11 +182,51 @@ test('runSubagent: failure isolation — router crash becomes an ERROR report', 
   assert.match(report, /^ERROR: subagent:x failed — all gateways down/);
 });
 
-test('runSubagent: step budget without finish → PARTIAL report with last observation', async () => {
+test('runSubagent: step budget without finish → forced wrap-up turn produces the report', async () => {
+  // burns BOTH budget steps on tools, then answers the forced wrap-up with a finish
+  const router = mockRouter([
+    { tool: 'fs_search', args: { needle: 'a' } },
+    { tool: 'fs_search', args: { needle: 'b' } },
+    { tool: 'finish', result: 'salvaged wrap-up report' },
+  ]);
+  const report = await runSubagent({
+    router,
+    agent: { name: 'w', tools: ['fs_search'], systemPrompt: 'p', maxSteps: 2 },
+    parentTools: fakeTools,
+    task: 't',
+  });
+  assert.equal(report, 'salvaged wrap-up report');
+  // 2 loop steps + 1 forced wrap-up call = 3 brain calls
+  assert.equal(router.calls.length, 3);
+  // the wrap-up call must have been told tools are off the table
+  const lastHistory = router.calls[2].contents.map((c) => String(c)).join('\n');
+  assert.match(lastHistory, /BUDGET EXHAUSTED/);
+});
+
+test('runSubagent: budget nudges reach the model before the final steps', async () => {
+  const router = mockRouter([
+    { tool: 'fs_search', args: { needle: 'a' } },
+    { tool: 'fs_search', args: { needle: 'b' } },
+    { tool: 'finish', result: 'converged in time' },
+  ]);
+  const report = await runSubagent({
+    router,
+    agent: { name: 'n', tools: ['fs_search'], systemPrompt: 'p', maxSteps: 2 },
+    parentTools: fakeTools,
+    task: 't',
+  });
+  assert.equal(report, 'converged in time');
+  // maxSteps=2 → the FINAL STEP nudge must precede the model's last call
+  const beforeLastCall = router.calls[1].contents.map((c) => String(c)).join('\n');
+  assert.match(beforeLastCall, /FINAL STEP/);
+});
+
+test('runSubagent: wrap-up that still refuses to finish → compact PARTIAL (steps used, no raw dumps)', async () => {
   const endless = [];
   const router = {
     calls: endless,
     async chat() {
+      endless.push(1);
       return { text: JSON.stringify({ tool: 'fs_search', args: { needle: 'x' } }), model: 'm', gateway: 'g', latencyMs: 1 };
     },
   };
@@ -196,8 +236,10 @@ test('runSubagent: step budget without finish → PARTIAL report with last obser
     parentTools: fakeTools,
     task: 't',
   });
-  assert.match(report, /^PARTIAL: subagent:y hit its step budget \(2\)/);
-  assert.match(report, /hits for x/);
+  assert.match(report, /^PARTIAL: subagent:y hit its step budget \(2\) without a final report\. Steps used: fs_search ×2\./);
+  assert.match(report, /Last observation \(fs_search\): hits for x/);
+  // wrap-up got its chance and the repair retry too: 2 loop steps + 1 wrap-up + 1 repair
+  assert.equal(router.calls.length, 4);
 });
 
 test('runSubagent: object finish results are stringified; empty is handled', async () => {

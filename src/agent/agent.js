@@ -104,6 +104,57 @@ export async function runAgent({ router, tools, systemPrompt, messages, maxSteps
     noteStep({ step: i, tool, args, observation: truncate(observation, 200), repaired, ...meta });
     history.push({ role: 'assistant', content: JSON.stringify({ tool, args }) });
     history.push({ role: 'user', content: `TOOL OBSERVATION:\n${observation}\n\nContinue with the next JSON step.` });
+
+    // Budget nudges — small free models happily burn the entire budget on
+    // exploration and never converge. Tell them loudly BEFORE the last two
+    // chances so a real report lands inside the budget (v0.8.2).
+    const remaining = maxSteps - i;
+    if (remaining === 2) {
+      history.push({
+        role: 'user',
+        content: `BUDGET WARNING: only 2 steps remain (of ${maxSteps}). Wrap up NOW — at most one more short tool call, then finish with your report.`,
+      });
+    } else if (remaining === 1) {
+      history.push({
+        role: 'user',
+        content: 'FINAL STEP: this is your last step. Do NOT call a tool. Respond with {"tool":"finish","result":...} where result is your complete final report based on what you have gathered.',
+      });
+    }
   }
-  return { finished: false, result: null, steps, history };
+
+  // Budget exhausted without a finish — one forced wrap-up turn: tools are
+  // off the table and the model MUST produce its report now. This is what
+  // turns "explored for N steps" into an actual answer (v0.8.2).
+  const isFinish = (p) => p.ok && p.value && typeof p.value === 'object' && p.value.tool === 'finish';
+  try {
+    history.push({
+      role: 'user',
+      content:
+        'BUDGET EXHAUSTED: stop calling tools immediately. Reply with EXACTLY ONE JSON object: ' +
+        '{"tool":"finish","result":"<your complete final report based on what you gathered so far>"}. ' +
+        'A partial answer is required — report what you know now.',
+    });
+    let wrap = await router.chat(history, { maxTokens });
+    let parsed = extractJson(wrap.text);
+    if (!isFinish(parsed)) {
+      // one self-repair retry, same contract as the main loop — anything that
+      // is still not a finish (prose, or yet another tool call) is a refusal
+      history.push({ role: 'assistant', content: truncate(wrap.text, 700) });
+      history.push({
+        role: 'user',
+        content: 'PROTOCOL ERROR: respond again with EXACTLY ONE JSON object: {"tool":"finish","result":"<your final report>"}. No other text. Do NOT call a tool.',
+      });
+      wrap = await router.chat(history, { maxTokens });
+      parsed = extractJson(wrap.text);
+      if (!isFinish(parsed)) {
+        noteStep({ step: maxSteps + 1, error: 'forced wrap-up did not produce a finish', raw: truncate(wrap.text, 200), model: wrap.model, gateway: wrap.gateway, latencyMs: wrap.latencyMs });
+        return { finished: false, result: null, steps, history };
+      }
+    }
+    const payload = parsed.value.result ?? parsed.value.args ?? {};
+    noteStep({ step: maxSteps + 1, tool: 'finish', args: {}, observation: '(final report delivered on the forced wrap-up turn)', forced: true, model: wrap.model, gateway: wrap.gateway, latencyMs: wrap.latencyMs });
+    return { finished: true, result: payload, steps, history, forcedFinish: true };
+  } catch {
+    return { finished: false, result: null, steps, history };
+  }
 }

@@ -85,9 +85,12 @@ const BUILTIN_PRESETS = [
     maxSteps: 10,
     systemPrompt: [
       'You are Explore, Engineer Buddy\'s read-only code scout.',
-      'You find where things live and how they connect. Move fast, search aggressively, read what you find.',
-      'Rules: never modify anything (you have no write tools anyway). Cite concrete file paths and line numbers.',
-      'Finish with a compact report: the answer, then the key files/symbols that back it up. No filler.',
+      'You find where things live and how they connect. You have a HARD step budget — plan for convergence, not completeness:',
+      '  1. At most 2 fs_search calls, with precise needles (symbol names, not broad words).',
+      '  2. Read at most 3 files, narrowly. Never re-read something you already saw.',
+      '  3. Then STOP exploring and finish with your report — even if it is partial.',
+      'A compact report NOW beats a perfect report never. Report format: the answer first, then the key files/symbols (path:line) as evidence. No filler.',
+      'Rules: never modify anything (you have no write tools anyway).',
     ].join('\n'),
   },
   {
@@ -262,11 +265,19 @@ export async function runSubagent({ router, agent, parentTools, task, maxTokens 
       const out = typeof res.result === 'string' ? res.result : JSON.stringify(res.result);
       return truncate(out && out.trim() ? out : '(sub-agent finished with an empty report)', RESULT_CHAR_CAP);
     }
-    // Budget reached without finish — salvage the last observation.
+    // Budget reached without finish — compact salvage: what it DID plus the
+    // tail of the last observation. Never paste raw file contents into the
+    // parent's context (the v0.8.1 dump ate context and read like noise).
+    const toolCounts = new Map();
+    for (const s of res.steps) {
+      if (s.tool && s.tool !== 'finish') toolCounts.set(s.tool, (toolCounts.get(s.tool) || 0) + 1);
+    }
+    const did = [...toolCounts.entries()].map(([t, n]) => (n > 1 ? `${t} ×${n}` : t)).join(', ');
     const last = [...res.steps].reverse().find((s) => s.observation);
     return truncate(
       `PARTIAL: ${label} hit its step budget (${agent.maxSteps || 8}) without a final report.` +
-        (last ? ` Last observation:\n${last.observation}` : ' No tool output captured.'),
+        (did ? ` Steps used: ${did}.` : '') +
+        (last ? ` Last observation (${last.tool}): ${String(last.observation).replace(/\s+/g, ' ').trim()}` : ' No tool output captured.'),
       RESULT_CHAR_CAP
     );
   } catch (e) {
