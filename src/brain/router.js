@@ -83,28 +83,53 @@ export class GatewayRouter {
     // estimate the compaction budget uses. When NO gateway fits, limits are
     // relaxed and the biggest windows are tried first: a maybe-rejected call
     // beats never calling at all.
-    const reqChars = (Array.isArray(messages) ? messages : []).reduce(
-      (n, m) => n + (typeof m?.content === 'string' ? m.content.length : JSON.stringify(m?.content ?? '').length),
-      0
-    );
+    const reqChars = (Array.isArray(messages) ? messages : []).reduce((n, m) => {
+      // Vision content arrays: only TEXT parts count — base64 payloads would
+      // poison the token estimate (the transcript placeholder already did).
+      const c = m?.content;
+      if (Array.isArray(c)) return n + c.reduce((k, p) => k + (p?.type === 'text' ? String(p.text).length : 0), 0);
+      return n + (typeof c === 'string' ? c.length : JSON.stringify(c ?? '').length);
+    }, 0);
     const reqTok = estimateTokens(reqChars);
+    // Vision routing (v0.13.3): a request carrying images goes to gateways
+    // that can see first — a text-only model would reject or ignore them.
+    const wantsVision = (Array.isArray(messages) ? messages : []).some(
+      (m) => Array.isArray(m.content) && m.content.some((p) => p?.type === 'image_url')
+    );
+    let chain = this.order;
+    if (wantsVision) {
+      const canSee = this.order.filter((n) => this.gateways.get(n)?.vision);
+      if (canSee.length && canSee.length < this.order.length) {
+        chain = [...canSee, ...this.order.filter((n) => !canSee.includes(n))];
+        debugLog(`router: image request — vision gateways first (${canSee.join(', ')})`);
+      }
+    }
+    // Non-vision gateways get a string-only view: text parts joined, images
+    // replaced by an honest omission note (a text-only API would 400 on
+    // image parts — stripping beats crashing).
+    const stripImages = (msgs) =>
+      msgs.map((m) => {
+        if (!Array.isArray(m.content)) return m;
+        const text = m.content.filter((p) => p?.type === 'text').map((p) => p.text).join('\n');
+        return { ...m, content: `${text}\n[image omitted — this gateway cannot see images]` };
+      });
     const limitOf = (name) => this.gateways.get(name)?.ctxLimit || null;
     const fits = (name) => {
       const lim = limitOf(name);
       return !lim || reqTok <= lim;
     };
-    const fitting = this.order.filter(fits);
+    const fitting = chain.filter(fits);
     let ignoreLimits = false;
     let effOrder = this.order;
-    if (this.order.length && !fitting.length) {
+    if (chain.length && !fitting.length) {
       ignoreLimits = true;
-      effOrder = [...this.order].sort((a, b) => (limitOf(b) || Infinity) - (limitOf(a) || Infinity));
+      effOrder = [...chain].sort((a, b) => (limitOf(b) || Infinity) - (limitOf(a) || Infinity));
       debugLog(`router: no gateway window holds ~${reqTok} tok — trying biggest windows first (limits relaxed)`);
     }
     // Walk the FULL chain order: fitting gateways are tried, oversized ones
     // are skipped in-loop WITH a recorded reason (the final error must show
     // every gateway and why it never answered — the v0.9.6 lesson).
-    const loopOrder = ignoreLimits ? effOrder : this.order;
+    const loopOrder = ignoreLimits ? effOrder : chain;
     for (let round = 1; round <= this.maxRoundTrips; round++) {
       for (const name of loopOrder) {
         if (this._isOpen(name)) {
@@ -128,10 +153,11 @@ export class GatewayRouter {
           continue;
         }
         const gw = this.gateways.get(name);
+        const prepared = wantsVision && !gw.vision ? stripImages(messages) : messages;
         const t0 = Date.now();
         try {
           debugLog(`router: round ${round} trying ${name}…`);
-          const out = await gw.chat(messages, opts);
+          const out = await gw.chat(prepared, opts);
           const latencyMs = Date.now() - t0;
           this._recordSuccess(name);
           return { ...out, gateway: name, latencyMs, attempts, round };

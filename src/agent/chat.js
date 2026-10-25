@@ -109,6 +109,22 @@ export function createChat({
   // compaction summary. Short follow-ups ("continue", "go on") keep the
   // previous anchor instead of replacing it.
   let currentTask = '';
+  // Image input (P1): attached images live in a side store keyed by a
+  // placeholder token; history keeps ONLY the token text, so compaction,
+  // budget accounting and the JSON protocol stay string-shaped. At call time
+  // the router expands tokens into vision content for gateways that can see
+  // (and strips them for gateways that can't). FIFO-capped so a long session
+  // can't hoard base64 forever.
+  const imageStore = new Map();
+  const IMAGE_TOKEN_RE = /⟪img:[^⟫]*⟫/g;
+  function registerImage(name, dataUrl) {
+    const token = `⟪img:${imageStore.size + 1}:${name}⟫`;
+    imageStore.set(token, dataUrl);
+    while (imageStore.size > 8) {
+      imageStore.delete(imageStore.keys().next().value);
+    }
+    return token;
+  }
   // Real token accounting (P1): gateway-reported usage when the API provides
   // it, chars ÷ 4 estimate when it doesn't — and /cost says which. Compaction
   // calls count too: they are real brain calls with real prompt sizes.
@@ -217,6 +233,25 @@ export function createChat({
     }
   }
 
+  /**
+   * History → wire format. Messages carrying image tokens become OpenAI
+   * vision content arrays ([{type:'text'},{type:'image_url'},…]); the
+   * router strips arrays for gateways without vision. Everything else
+   * passes through untouched.
+   */
+  function toWire(msgs) {
+    return msgs.map((m) => {
+      if (typeof m.content !== 'string' || !m.content.includes('⟪img:')) return m;
+      const text = m.content.replace(IMAGE_TOKEN_RE, '');
+      const parts = [{ type: 'text', text }];
+      for (const tok of m.content.match(IMAGE_TOKEN_RE) || []) {
+        const url = imageStore.get(tok);
+        if (url) parts.push({ type: 'image_url', image_url: { url } });
+      }
+      return { ...m, content: parts };
+    });
+  }
+
   async function callModel() {
     await maybeCompact();
     const history = [systemMsg(), ...messages];
@@ -224,7 +259,7 @@ export function createChat({
     // string is token-heavy, and a truncated escape = protocol violation
     // (v0.9.2 live-test lesson).
     const maxTok = modes?.plan ? Math.max(maxTokens, 2500) : maxTokens;
-    const out = await router.chat(history, { maxTokens: maxTok });
+    const out = await router.chat(toWire(history), { maxTokens: maxTok });
     // Usage telemetry (the /cost surface) — real tokens when the gateway
     // reports them, chars ÷ 4 estimate otherwise.
     recordUsage(
@@ -246,7 +281,7 @@ export function createChat({
    * Run one user turn to completion.
    * @returns {{said:string|null, steps:number}}
    */
-  async function turn(userText, { signal = null, skill = null, anchor = null } = {}) {
+  async function turn(userText, { signal = null, skill = null, anchor = null, images = [] } = {}) {
     // UserPromptSubmit hook: exit 2 refuses the prompt BEFORE it enters the
     // conversation or costs a brain call (deterministic gatekeeper).
     if (hooks) {
@@ -256,7 +291,15 @@ export function createChat({
         return { said: null, steps: 0, error: true, hookBlocked: true };
       }
     }
-    messages.push({ role: 'user', content: String(userText) });
+    // Image attachments (v0.13.3): history keeps one placeholder line per
+    // image; the dataUrl rides in the side store (≤2 per task, FIFO store).
+    let userContent = String(userText);
+    for (const img of (Array.isArray(images) ? images : []).slice(0, 2)) {
+      if (!img?.dataUrl) continue;
+      const token = registerImage(String(img.name || 'image'), img.dataUrl);
+      userContent += `\n[image attached: ${img.name || 'image'}] ${token}`;
+    }
+    messages.push({ role: 'user', content: userContent });
     onEvent({ type: 'user', text: String(userText) });
     // Task anchor: real tasks pin/replace; short follow-ups ("continue",
     // "go on", "yes") keep the previous anchor so compaction keeps the goal.

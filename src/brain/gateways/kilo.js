@@ -43,6 +43,10 @@ export function createKiloGateway(cfg, timeouts) {
   return {
     name: 'kilo',
     ctxLimit: gwCtxLimit(cfg, DEFAULT_CTX_LIMIT),
+    // Vision: best effort — the OpenRouter-style catalog mixes vision and
+    // text-only free models; the API rejects image parts per-model and the
+    // chain falls through. Disable with gateways.kilo.vision = false.
+    vision: cfg.vision !== false,
     async chat(messages, { maxTokens = 2048, temperature = 0.2, timeoutMs = timeouts.chatMs, model } = {}) {
       let chosen = model || null;
       if (!chosen || chosen === 'auto') {

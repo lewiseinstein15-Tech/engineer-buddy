@@ -263,13 +263,15 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
   if (hooks?.size) hooks.fireAndForget('SessionStart', { mode: 'one-shot' });
   // @file mentions work headless too: `buddy -p "explain @src/app.js"`.
   let taskText = task;
+  let taskImages = [];
   try {
     const ex = expandMentions(task, { root });
     if (ex.attached.length) taskText = ex.text + ex.block;
+    taskImages = ex.images || [];
   } catch {
     /* mentions are best effort — the raw task still runs */
   }
-  const out = await chat.turn(taskText);
+  const out = await chat.turn(taskText, { images: taskImages });
   return { ...out, events };
 }
 
@@ -1148,13 +1150,13 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           say(
             `  ${a.ok ? c.green('+') : c.yellow('!')} ${a.path}${
               a.ok
-                ? c.gray(a.kind === 'dir' ? ` (${a.entries} entr${a.entries === 1 ? 'y' : 'ies'})` : ` (${a.lines} lines${a.bytes ? `, ${(a.bytes / 1024).toFixed(1)}kb` : ''})`)
+                ? c.gray(a.kind === 'dir' ? ` (${a.entries} entr${a.entries === 1 ? 'y' : 'ies'})` : a.kind === 'image' ? ` (image, ${a.kb}KB ${a.mime.split('/')[1]})` : ` (${a.lines} lines${a.bytes ? `, ${(a.bytes / 1024).toFixed(1)}kb` : ''})`)
                 : c.gray(` (${a.error})`)
             }`
           );
         }
         taskText = ex.text + ex.block;
-        taskOpts = { recordAs: ex.text, anchor: ex.text };
+        taskOpts = { recordAs: ex.text, anchor: ex.text, images: ex.images };
       }
     } catch {
       /* mentions are best effort — the raw input still runs */
@@ -1166,7 +1168,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
    *  Typing while a turn runs QUEUES the message (Claude Code style): queued
    *  tasks run in order when the current turn ends; Ctrl+C interrupts the
    *  turn AND clears the queue — stopping means stopping everything. */
-  async function runTask(inputText, { skill = null, recordAs = null, anchor = null } = {}) {
+  async function runTask(inputText, { skill = null, recordAs = null, anchor = null, images = [] } = {}) {
     if (busy) {
       msgQueue.push({ text: inputText });
       say(`  ${c.cyan('⌁ queued')} ${c.dim(`— I'll run it when this turn ends (${msgQueue.length} waiting)`)}`);
@@ -1189,7 +1191,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         rl.setBusy(busyLabel);
         let out = null;
         try {
-          out = await chat.turn(current.text, { signal: aborter.signal, skill, anchor });
+          out = await chat.turn(current.text, { signal: aborter.signal, skill, anchor, images });
           recorder.append({ type: 'say', text: out.said ?? '' });
           lastTask.events = events;
           // Claude-Code-style turn footer.

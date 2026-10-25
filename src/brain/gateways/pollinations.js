@@ -3,6 +3,8 @@
 // Anonymous tier: ~1 request / 30s per IP. On FREE_LIMIT the API answers 402
 // with "Retry after Ns" — we surface that as RateLimitError so the router
 // parks Pollinations for exactly that long and moves on. Verified 2026-10-25.
+// Vision-capable (v0.13.3): the openai endpoint accepts image_url content
+// parts — this is Buddy's default path for screenshot/@image.png input.
 import { fetchWithTimeout, RateLimitError, BuddyError } from '../../util.js';
 import { extractUsage, gwCtxLimit } from '../usage.js';
 
@@ -15,6 +17,7 @@ export function createPollinationsGateway(cfg, timeouts) {
   return {
     name: 'pollinations',
     ctxLimit: gwCtxLimit(cfg, DEFAULT_CTX_LIMIT),
+    vision: cfg.vision !== false,
     async chat(messages, { maxTokens = 2048, temperature = 0.2, timeoutMs = timeouts.chatMs, model } = {}) {
       const m = model || models[0];
       let res;
