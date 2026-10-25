@@ -722,6 +722,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         say(
           `\n${renderTable(rows, { headers: ['event', 'matcher', 'command'] })}` +
             `\n${c.dim('  exit 0 = allow · exit 2 = block (stderr → Buddy) · 10s timeout · JSON on stdin')}` +
+            `\n${c.dim('  matcher = tool-name regex ("fs_write|fs_append") · alias "pre_edit" covers fs_write|fs_replace|fs_append|multi_edit')}` +
             (hookRunner.warnings.length ? c.yellow(`\n  warnings: ${hookRunner.warnings.join(' · ')}`) : '') +
             '\n'
         );

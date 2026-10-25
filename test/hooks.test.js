@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { loadHooks, HookRunner, HOOK_EVENTS } from '../src/hooks.js';
+import { loadHooks, HookRunner, HOOK_EVENTS, HOOK_ALIASES } from '../src/hooks.js';
 import { createChat } from '../src/agent/chat.js';
 import { SLASH_COMMANDS } from '../src/terminal/repl.js';
 import { LocalScope, buildLocalTools } from '../src/tools/local.js';
@@ -83,6 +83,26 @@ test('hooks: loadHooks parses object and array forms, expands aliases', () => {
   assert.ok(flat.some((h) => h.event === 'PreToolUse' && h.matcher === 'bash' && h.command === 'node a.js'));
   assert.ok(flat.some((h) => h.event === 'OnError'));
   assert.equal(runner.size, 5);
+});
+
+test('hooks: pre_edit alias covers every mutating file tool (v0.11.2 live leak: a fs_write-only rule was routed via fs_append)', () => {
+  const re = new RegExp(`^(?:${HOOK_ALIASES.pre_edit.matcher})$`);
+  for (const t of ['fs_write', 'fs_replace', 'fs_append', 'multi_edit']) {
+    assert.ok(re.test(t), `pre_edit matches ${t}`);
+  }
+  assert.equal(re.test('fs_read'), false, 'read tools stay untouched');
+  assert.equal(re.test('bash'), false, 'commands are pre_command territory');
+});
+
+test('hooks: explicit matcher alternation covers sibling tools', async () => {
+  const root = tmpRoot();
+  const cmd = writeScript(root, 'block-edits.js', 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{process.stderr.write("writes are frozen today");process.exit(2);});');
+  writeSettings(root, { hooks: { PreToolUse: { matcher: 'fs_write|fs_append', command: cmd } } });
+  const runner = new HookRunner({ root });
+  assert.equal((await runner.run('PreToolUse', { tool: 'fs_write', args: {} })).blocked, true);
+  assert.equal((await runner.run('PreToolUse', { tool: 'fs_append', args: {} })).blocked, true, 'the fs_append escape route is closed');
+  assert.equal((await runner.run('PreToolUse', { tool: 'fs_read', args: {} })).blocked, false, 'read tools stay untouched');
+  fs.rmSync(root, { recursive: true, force: true });
 });
 
 test('hooks: junk config degrades to warnings, never throws', () => {
