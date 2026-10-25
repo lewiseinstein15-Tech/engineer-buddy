@@ -78,6 +78,7 @@ export function createChat({
   approval = null, // async ({tool, summary}) => 'yes' | 'no' | 'always' | null
   modes = null, // shared { plan: boolean } — plan mode when .plan is true
   todoState = null, // shared { latest: [...] | null } — todo v2 state, kept through compaction
+  hooks = null, // HookRunner (src/hooks.js) — user-defined lifecycle commands; null = unconfigured
   onEvent = () => {},
 }) {
   const byName = new Map(tools.map((t) => [t.name, t]));
@@ -104,6 +105,14 @@ export function createChat({
 
   async function maybeCompact(force = false) {
     if (!force && historyChars() <= charBudget) return;
+    // PreCompact hook: a user command can veto compaction this round (exit 2).
+    if (hooks) {
+      const r = await hooks.run('PreCompact', { chars: historyChars(), forced: Boolean(force) });
+      if (r.blocked) {
+        debugLog(`chat: compaction blocked by hook: ${r.stderr}`);
+        return;
+      }
+    }
     const keep = 4;
     const head = messages.slice(0, Math.max(0, messages.length - keep));
     const tail = messages.slice(-keep);
@@ -180,6 +189,15 @@ export function createChat({
    * @returns {{said:string|null, steps:number}}
    */
   async function turn(userText, { signal = null, skill = null } = {}) {
+    // UserPromptSubmit hook: exit 2 refuses the prompt BEFORE it enters the
+    // conversation or costs a brain call (deterministic gatekeeper).
+    if (hooks) {
+      const r = await hooks.run('UserPromptSubmit', { prompt: String(userText) });
+      if (r.blocked) {
+        onEvent({ type: 'error', text: `prompt blocked by hook: ${r.stderr}` });
+        return { said: null, steps: 0, error: true, hookBlocked: true };
+      }
+    }
     messages.push({ role: 'user', content: String(userText) });
     onEvent({ type: 'user', text: String(userText) });
     // Task anchor: real tasks pin/replace; short follow-ups ("continue",
@@ -318,6 +336,7 @@ export function createChat({
         said = String(msg);
         messages.push({ role: 'assistant', content: JSON.stringify({ tool: 'say', message: said }) });
         onEvent({ type: 'say', text: said });
+        if (hooks) hooks.fireAndForget('Stop', { said }); // exit 2 is advisory only here (v1)
         return { said, steps: step };
       }
 
@@ -336,11 +355,20 @@ export function createChat({
         if (used >= cap) {
           observation = `ERROR: tool "${tool}" already used ${used}/${cap} times this turn. Work differently${modes?.plan ? ', say, or call exit_plan with the plan you have' : ' or say'}.`;
         } else {
-          callCounts.set(tool, used + 1);
-          // Skills v2: an active skill restricts this task to its allowed tools.
-          if (skillRestriction && !skillRestriction.allowed.has(tool)) {
-            observation = `ERROR: the "${skillRestriction.name}" skill restricts this task to tools: ${[...skillRestriction.allowed].join(', ')}. Finish with say, or ask the user to load a different skill.`;
-          } else {
+          // Hooks run BEFORE the cap is burned, the gate fires, or anything
+          // executes — the deterministic guarantee layer (exit 2 = block).
+          if (hooks) {
+            const hr = await hooks.run('PreToolUse', { tool, args });
+            if (hr.blocked) {
+              observation = `BLOCKED by hook: ${hr.stderr}\nDo not retry the exact same call — change your approach or ask the user to review .buddy/settings.json.`;
+            }
+          }
+          if (observation === undefined) {
+            callCounts.set(tool, used + 1);
+            // Skills v2: an active skill restricts this task to its allowed tools.
+            if (skillRestriction && !skillRestriction.allowed.has(tool)) {
+              observation = `ERROR: the "${skillRestriction.name}" skill restricts this task to tools: ${[...skillRestriction.allowed].join(', ')}. Finish with say, or ask the user to load a different skill.`;
+            } else {
             // Claude-Code-style preview: risky tools show WHAT will change before approval.
             try {
               preview = impl.preview ? impl.preview(args) : null;
@@ -363,6 +391,7 @@ export function createChat({
                 skillRestriction = { name: loaded.name, allowed: new Set([...loaded.allowedTools, 'skill', 'say']) };
               }
             }
+            }
           }
         }
       }
@@ -375,6 +404,16 @@ export function createChat({
           observation = `NOTE: identical repeat of ${tool} — same arguments, same result. Change the query/arguments, pick a different tool, or wrap up.\n\n${observation}`;
         }
         lastArgs.set(tool, key);
+      }
+
+      // PostToolUse hook: sees the final observation; exit 2 appends the
+      // hook's stderr as a visible note (audit-and-annotate, not a veto —
+      // the tool already ran).
+      if (hooks) {
+        const hr = await hooks.run('PostToolUse', { tool, args, observation: truncate(String(observation), 2000), denied });
+        if (hr.blocked) observation = `${observation}\n[hook] ${hr.stderr}`;
+        // OnError: Buddy's extension — deterministic reactions to tool failures.
+        if (!denied && String(observation).startsWith('ERROR')) hooks.fireAndForget('OnError', { tool, args, observation: truncate(String(observation), 2000) });
       }
 
       // Approved plan → the SAME turn flows into implementation. Grant fresh

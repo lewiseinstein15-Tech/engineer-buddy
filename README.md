@@ -226,6 +226,17 @@ Small models keep asking path questions with the content search. Now they have t
 
 `multi_edit` batches several exact-snippet changes to one file **atomically**: every edit is simulated first — one bad match aborts the whole batch (file byte-identical) with the precise failing edit number, and the approval preview renders the combined diff. `fs_replace` gained `replace_all` and its ambiguity error now names the matching lines. And the big one: a **file-freshness guard** — Buddy tracks what it read, and refuses to edit any file that changed outside its tools (`changed since you last read it — fs_read it again`) until it re-reads. Bash-mangled files, half-applied batches, concurrent terminals: blind re-edits just stopped.
 
+### Hooks — rules the model cannot talk its way around (v0.11.0)
+
+The gate is a human decision; hooks are machine law. Put shell commands in `.buddy/settings.json` and Buddy fires them at lifecycle points — `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `PreCompact`, `Stop`, `SessionStart`, `SessionEnd`, `OnError` (plus friendly aliases: `pre_edit`, `pre_command`, …). Each hook receives one JSON event on stdin; **exit 0 allows, exit 2 blocks** — a `PreToolUse` block stops the tool before it runs and feeds the hook's stderr straight back to the model ("BLOCKED by hook: no destructive commands"), a `UserPromptSubmit` block refuses the prompt before a single brain call is spent. Matchers limit the blast radius (`{"matcher": "bash", "command": "node check.js"}`), a 10s timeout kills runaway hooks, and broken config degrades to warnings — a bad hook can never take the agent down. `/hooks` shows what is armed.
+
+```json
+{ "hooks": {
+    "PreToolUse": { "matcher": "bash", "command": "node scripts/no-force-push.js" },
+    "pre_edit":   "node scripts/require-test-first.js"
+}}
+```
+
 ### Safety model (terminal mode)
 
 - **Approval gates** — writes, edits, and shell commands ask `[y]es / [n]o / [a]lways` unless you `/yolo`. One-shot mode (`-p`) is autonomous; add `--safe` to deny all writes. Plan mode (above) is the strongest gate: **nothing mutates until the plan itself is approved**.

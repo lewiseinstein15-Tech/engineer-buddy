@@ -24,6 +24,7 @@ import { buildSkillTool } from '../tools/skill.js';
 import { loadSkills } from '../skills/loader.js';
 import { buildExitPlanTool, listPlans, PLANS_DIR } from '../tools/planmode.js';
 import { listCheckpoints, restoreCheckpoint } from '../agent/checkpoints.js';
+import { HookRunner } from '../hooks.js';
 import { connectMcpServers, buildMcpTools, describeMcpServers, MCP_CONFIG_PATH } from '../tools/mcp.js';
 import { ensureHarness, loadHarness, harnessContext } from '../harness/scaffold.js';
 import { HARNESS_DIR } from '../harness/defaults.js';
@@ -40,7 +41,7 @@ export const VERSION = createRequire(import.meta.url)('../../package.json').vers
 
 export const SLASH_COMMANDS = [
   'help', 'new', 'clear', 'screen', 'compact', 'model', 'gateways', 'cost',
-  'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'memory', 'experience', 'learn', 'review',
+  'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'hooks', 'memory', 'experience', 'learn', 'review',
   'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit',
 ];
 
@@ -64,6 +65,7 @@ export const SLASH_DESCRIPTIONS = {
   plan: 'Toggle plan mode — read-only research until the plan is approved',
   plans: 'List approved plans saved under .buddy/plans/',
   rewind: 'List checkpoints — /rewind 1 restores files to before the latest edit',
+  hooks: 'Show lifecycle hooks (.buddy/settings.json) — exit 2 blocks a tool/prompt',
   memory: 'Show project memory (edit it to teach Buddy)',
   experience: 'Lessons from past tasks',
   learn: 'Reflect on the last task → harness refinement',
@@ -123,13 +125,16 @@ function makeHarness(root) {
 export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {} } = {}) {
   const { tools, todoState, mcp, shells, skills } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved });
   const harness = makeHarness(root);
+  // Hooks: the deterministic guarantee layer (.buddy/settings.json). One
+  // runner per session — the REPL reads it for /hooks, the loop obeys it.
+  const hooks = new HookRunner({ root });
   // todoState is shared: the todo tool writes it (local.js), compaction reads
   // it (todo v2 plan anchor) — one object, one truth.
-  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, todoState, onEvent });
+  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, todoState, hooks, onEvent });
   if (resumeFrom) {
     for (const m of resumeMessages(loadSession(resumeFrom))) session.messages.push(m);
   }
-  return { chat: session, tools, todoState, mcp, shells, skills };
+  return { chat: session, tools, todoState, mcp, shells, skills, hooks };
 }
 
 function defaultApproval(busy) {
@@ -211,7 +216,7 @@ export function appendMemoryNote(root, note) {
 export async function runOneShot({ router, root = process.cwd(), task, safe = false, yolo = false, quiet = false, config = {} } = {}) {
   const events = [];
   const render = makeRenderer({ quiet });
-  const { chat } = await createBuddySession({
+  const { chat, hooks } = await createBuddySession({
     root,
     router,
     yolo,
@@ -222,6 +227,7 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
       render(ev);
     },
   });
+  if (hooks?.size) hooks.fireAndForget('SessionStart', { mode: 'one-shot' });
   const out = await chat.turn(task);
   return { ...out, events };
 }
@@ -292,7 +298,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   let toolCallsThisTurn = 0;
   const turnStart = { at: 0 };
 
-  const { chat, tools, todoState, mcp, shells, skills: skillCatalog } = await createBuddySession({
+  const { chat, tools, todoState, mcp, shells, skills: skillCatalog, hooks: hookRunner } = await createBuddySession({
     root,
     router,
     modes,
@@ -342,6 +348,14 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   // it returns. (v0.8.1 fix — this block used to sit before the destructure,
   // a temporal-dead-zone ReferenceError on every interactive startup.)
   printMcpStatus(mcp);
+
+  // SessionStart hook (fire-and-forget — a slow hook must not delay the REPL).
+  if (hookRunner?.size) {
+    hookRunner.fireAndForget('SessionStart', { mode: 'interactive' });
+    if (hookRunner.warnings.length) {
+      console.log(c.yellow(`  hooks: ${hookRunner.warnings.join(' · ')} — /hooks for details`));
+    }
+  }
 
   const render = makeRenderer({ toolByName: new Map(tools.map((t) => [t.name, t])) });
 
@@ -449,6 +463,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
               ['/plan', 'toggle plan mode — read-only research, plan approved at the gate'],
               ['/plans', 'list approved plans in .buddy/plans/'],
               ['/rewind [n]', 'list checkpoints · /rewind 1 restores files to before the latest edit'],
+              ['/hooks', 'show lifecycle hooks (.buddy/settings.json) — exit 2 blocks a tool or prompt'],
               ['/permissions', 'show session approvals · /permissions reset'],
               ['/review [staged]', 'Buddy reviews your uncommitted diff'],
               ['/yolo', 'toggle auto-approval (careful)'],
@@ -687,6 +702,26 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         say(`\n  ↩ rewound to the state before ${c.bold(ck.tool)} (${(ck.time || '').slice(0, 19).replace('T', ' ')})\n    ${parts.join(' · ') || 'nothing to do'}\n${c.dim('  files only — the conversation was not rewound')}\n`);
         break;
       }
+      case 'hooks': {
+        if (!hookRunner.size && !hookRunner.warnings.length) {
+          say(
+            `\n  no hooks configured — add ${c.bold('.buddy/settings.json')}:\n` +
+              c.dim('    { "hooks": { "PreToolUse": { "matcher": "bash", "command": "node check.js" } } }\n') +
+              c.dim('  the hook gets ONE JSON event on stdin: {"event":"PreToolUse","tool":"bash","args":{…}}\n') +
+              c.dim('  exit 0 = allow · exit 2 = BLOCK (stderr is fed back to Buddy) · other exits never block\n') +
+              c.dim(`  events: PreToolUse, PostToolUse, UserPromptSubmit, Stop, PreCompact, SessionStart, SessionEnd, OnError\n  aliases: pre_edit, post_edit, pre_command, post_command, on_error\n`)
+          );
+          break;
+        }
+        const rows = hookRunner.list().map((h) => [c.bold(h.event), h.matcher || c.dim('(all)'), truncate(h.command, 58)]);
+        say(
+          `\n${renderTable(rows, { headers: ['event', 'matcher', 'command'] })}` +
+            `\n${c.dim('  exit 0 = allow · exit 2 = block (stderr → Buddy) · 10s timeout · JSON on stdin')}` +
+            (hookRunner.warnings.length ? c.yellow(`\n  warnings: ${hookRunner.warnings.join(' · ')}`) : '') +
+            '\n'
+        );
+        break;
+      }
       case 'memory': {
         const memPath = path.join(root, HARNESS_DIR, 'MEMORY.md');
         say(`\n${c.bold('Project memory')}: ${memPath}`);
@@ -828,6 +863,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       }
       case 'quit':
       case 'exit':
+        if (hookRunner?.size) hookRunner.fireAndForget('SessionEnd', { reason: 'quit' });
         rl.close();
         return 0;
       default:
