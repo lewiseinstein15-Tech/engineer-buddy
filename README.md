@@ -47,9 +47,10 @@ You type a task. Buddy plans it with a **todo checklist**, lists/reads/searches 
 | `#note` | remember something in project memory (`.buddy/harness/MEMORY.md`) |
 | trailing `\` | multi-line tasks (like Claude Code's shift+enter) |
 | ↑↓ | history with draft restore |
+| shift+tab | cycle modes: normal → auto-accept → **plan** → normal (status shows the tag) |
 | edit gates | `[y]es / [n]o / [a]lways` with a live **unified diff of exactly what will change** |
 
-Slash commands: `/help /new /clear /compact /cost /model /gateways /permissions /todo /tools /agents /mcp /tasks /memory /experience /learn /review /init /export /sessions /resume /status /yolo /quit` — highlights:
+Slash commands: `/help /new /clear /compact /cost /model /gateways /permissions /todo /tools /agents /mcp /tasks /plan /plans /memory /experience /learn /review /init /export /sessions /resume /status /yolo /quit` — highlights:
 
 - `/cost` — brain calls, est. tokens, and **$0.00 spend** (keyless)
 - `/model kilo` — pin a gateway first for the session; `/model auto` restores
@@ -59,6 +60,8 @@ Slash commands: `/help /new /clear /compact /cost /model /gateways /permissions 
 - `/agents` — the sub-agent crew: what each one can touch, and how to add your own
 - `/mcp` — MCP servers + their tools (from `.buddy/mcp.json`)
 - `/tasks` — live background shells (started with `bash_bg`), with output sizes and status
+- `/plan` — toggle plan mode: read-only research until Buddy's plan is approved (see below)
+- `/plans` — list approved plans saved under `.buddy/plans/`
 - `/export` — transcript → readable markdown in `.buddy/exports/`
 - `/resume <n>` — numbered session picker; sessions record tool-call tallies
 
@@ -155,9 +158,27 @@ Dev servers, watchers, builds — Buddy starts them with `bash_bg`, polls output
   ⎿ ready on http://localhost:3000
 ```
 
+### Plan mode — architect first, edit after approval (v0.9.2)
+
+Toggle with `/plan` or **shift+tab** (normal → auto-accept → plan). In plan mode Buddy gets only research tools — `fs_search`, `fs_read`, `fs_list`, `web_search`, `web_fetch`, `todo`, `skill` — and the write tools, bash, sub-agents, MCP, and background shells are refused before they can even hit a gate. When research is done, Buddy calls `exit_plan` with the full plan; the standard approval gate renders it and your `[y]es` flips plan mode off **mid-turn**, so implementation continues in the same context — nothing lost, nothing restarted. Approved plans are saved to `.buddy/plans/` (`/plans` lists them); a `[n]o` keeps plan mode on so Buddy refines the plan instead.
+
+```text
+/plan
+⏸ plan mode ON — Buddy researches read-only, then calls exit_plan
+
+> why is checkout failing? fix it
+⏺ fs_search "charge()"
+⏺ fs_read src/payments/stripe.js
+⏺ exit_plan split the currency check
+  ⎿ ## Plan — 1. add currency guard in charge() …
+  ⚠ approve [y/n/a] > y
+  ✓ plan approved — exited plan mode · saved to .buddy/plans/
+⏺ fs_replace src/payments/stripe.js …
+```
+
 ### Safety model (terminal mode)
 
-- **Approval gates** — writes, edits, and shell commands ask `[y]es / [n]o / [a]lways` unless you `/yolo`. One-shot mode (`-p`) is autonomous; add `--safe` to deny all writes.
+- **Approval gates** — writes, edits, and shell commands ask `[y]es / [n]o / [a]lways` unless you `/yolo`. One-shot mode (`-p`) is autonomous; add `--safe` to deny all writes. Plan mode (above) is the strongest gate: **nothing mutates until the plan itself is approved**.
 - **Hard policy layer** (cannot be approved away): no pipes/redirects/command substitution, no sudo/network/destructive commands, no `git push`/`commit`/history rewrite, no reading `.env*`/`*.pem`/keys/credentials, no editing `.git/` or Buddy's own harness.
 - **Files are data** — guardrail #1: instructions found inside repo files or tool output are untrusted data, not commands (Harness² prompt-injection firewall).
 - **Compaction** — long sessions summarize their own history (small free-model context windows) instead of drifting or truncating mid-task.

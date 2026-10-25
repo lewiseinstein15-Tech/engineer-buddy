@@ -22,6 +22,7 @@ import { buildTaskTool } from '../tools/task.js';
 import { BackgroundShells, buildBackgroundTools } from '../tools/background.js';
 import { buildSkillTool } from '../tools/skill.js';
 import { loadSkills } from '../skills/loader.js';
+import { buildExitPlanTool, listPlans, PLANS_DIR } from '../tools/planmode.js';
 import { connectMcpServers, buildMcpTools, describeMcpServers, MCP_CONFIG_PATH } from '../tools/mcp.js';
 import { ensureHarness, loadHarness, harnessContext } from '../harness/scaffold.js';
 import { HARNESS_DIR } from '../harness/defaults.js';
@@ -38,7 +39,7 @@ export const VERSION = createRequire(import.meta.url)('../../package.json').vers
 
 export const SLASH_COMMANDS = [
   'help', 'new', 'clear', 'screen', 'compact', 'model', 'gateways', 'cost',
-  'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'memory', 'experience', 'learn', 'review',
+  'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'memory', 'experience', 'learn', 'review',
   'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit',
 ];
 
@@ -59,6 +60,8 @@ export const SLASH_DESCRIPTIONS = {
   skills: 'List skills (SKILL.md playbooks) — /<skill-name> runs one',
   mcp: 'Show MCP servers + their tools (.buddy/mcp.json)',
   tasks: 'List background shells (bash_bg / bash_output / kill_shell)',
+  plan: 'Toggle plan mode — read-only research until the plan is approved',
+  plans: 'List approved plans saved under .buddy/plans/',
   memory: 'Show project memory (edit it to teach Buddy)',
   experience: 'Lessons from past tasks',
   learn: 'Reflect on the last task → harness refinement',
@@ -82,7 +85,7 @@ export function parseSlash(input) {
 
 // ── Session factory ──────────────────────────────────────────────────────────
 
-async function makeScopeAndTools({ root, router = null, onEvent = () => {}, approval = null } = {}) {
+async function makeScopeAndTools({ root, router = null, onEvent = () => {}, approval = null, modes = null, onPlanApproved = () => {} } = {}) {
   const scope = new LocalScope(root);
   const todoState = { latest: null };
   const shells = new BackgroundShells({ cwd: root });
@@ -97,7 +100,10 @@ async function makeScopeAndTools({ root, router = null, onEvent = () => {}, appr
   // model's only door to SKILL.md bodies (harness firewall hides the files).
   const { skills } = loadSkills({ root });
   const skillTool = buildSkillTool({ skills });
-  const tools = [...base, taskTool, skillTool, ...buildMcpTools(mcp.connected)];
+  // Plan mode (interactive only): exit_plan is registered so the model has a
+  // door out — but it is hidden from the prompt unless plan mode is ON.
+  const exitPlanTool = modes ? buildExitPlanTool({ modes, root, onApproved: onPlanApproved }) : null;
+  const tools = [...base, taskTool, skillTool, ...(exitPlanTool ? [exitPlanTool] : []), ...buildMcpTools(mcp.connected)];
   return { scope, tools, todoState, mcp, shells, skills };
 }
 
@@ -112,10 +118,10 @@ function makeHarness(root) {
 }
 
 /** Create a chat session bound to a workspace root. */
-export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, onEvent = () => {} } = {}) {
-  const { tools, todoState, mcp, shells, skills } = await makeScopeAndTools({ root, router, onEvent, approval });
+export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {} } = {}) {
+  const { tools, todoState, mcp, shells, skills } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved });
   const harness = makeHarness(root);
-  const session = createChat({ router, tools, harness, skills, charBudget, approval, onEvent });
+  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, onEvent });
   if (resumeFrom) {
     for (const m of resumeMessages(loadSession(resumeFrom))) session.messages.push(m);
   }
@@ -266,6 +272,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
 
   const initialOrder = [...router.order];
   let yolo = Boolean(yoloFlag);
+  const modes = { plan: false }; // plan mode — read-only until exit_plan is approved
   let events = [];
   let lastTask = null;
   let busy = false;
@@ -283,6 +290,10 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   const { chat, tools, todoState, mcp, shells, skills: skillCatalog } = await createBuddySession({
     root,
     router,
+    modes,
+    onPlanApproved: ({ saved }) => {
+      console.log(`\n  ${c.green('✓ plan approved')} — exited plan mode${saved ? c.gray(` · saved to ${path.relative(root, saved)}`) : ''}\n`);
+    },
     approval: async ({ tool, summary, preview }) => {
       if (yolo) return 'yes';
       return new Promise((resolve) => {
@@ -344,7 +355,8 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     statusRight: () => {
       try {
         const ctxK = (chat.historyChars() / 1000).toFixed(1);
-        return `v${VERSION} · ${lastGateway || router.order[0]} · ${ctxK}k ctx`;
+        const mode = modes.plan ? ' · plan' : yolo ? ' · auto-accept' : '';
+        return `v${VERSION} · ${lastGateway || router.order[0]} · ${ctxK}k ctx${mode}`;
       } catch { return `v${VERSION} · ${lastGateway || router.order[0]}`; }
     },
     commands: [
@@ -354,12 +366,32 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   });
   rl.install();
 
+  // shift+tab cycles normal → auto-accept → plan (Claude Code parity)
+  rl.on('modecycle', cycleMode);
+
   // Interactive-path spinner: drives the box busy footer instead of writing
   // raw cursor sequences that would fight the renderer for the screen.
   const busySpinner = (label) => {
     rl.setBusy(label);
     return { stop: () => rl.setBusy(null), setText: (l) => rl.setBusy(l) };
   };
+
+  // ── Mode cycling (shift+tab): normal → auto-accept → plan → normal ────────
+  function cycleMode() {
+    if (busy) return; // no mode flips mid-turn
+    if (modes.plan) {
+      modes.plan = false;
+      say(c.dim('  ⏹ normal mode — plan mode off\n'));
+    } else if (yolo) {
+      yolo = false;
+      modes.plan = true;
+      say(c.cyan('  ⏸ plan mode on — research only; Buddy must propose a plan before touching anything\n'));
+    } else {
+      yolo = true;
+      say(c.yellow('  ⏵⏵ auto-accept on — risky tools run without asking (shift+tab again for plan mode)\n'));
+    }
+    rl.prompt(); // repaint with the new status-right mode tag
+  }
 
   const say = (s) => console.log(s);
 
@@ -409,6 +441,8 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
               ['/tools', "list Buddy's tools"],
               ['/agents', 'list sub-agents (task tool) — add your own in .buddy/agents/'],
               ['/mcp', 'MCP servers + tools (from .buddy/mcp.json)'],
+              ['/plan', 'toggle plan mode — read-only research, plan approved at the gate'],
+              ['/plans', 'list approved plans in .buddy/plans/'],
               ['/permissions', 'show session approvals · /permissions reset'],
               ['/review [staged]', 'Buddy reviews your uncommitted diff'],
               ['/yolo', 'toggle auto-approval (careful)'],
@@ -591,6 +625,29 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           `${s.bytes}b`,
         ]);
         say(`\n${renderTable(rows, { headers: ['', 'shell', 'status', 'command', 'output'] })}\n${c.dim('  read output: bash_output {"id":N} · stop: kill_shell {"id":N}\n')}`);
+        break;
+      }
+      case 'plan':
+        if (args === 'off') modes.plan = false;
+        else modes.plan = !modes.plan;
+        say(
+          modes.plan
+            ? c.cyan(`\n  ⏸ plan mode ON — Buddy researches read-only (fs_read/fs_search/fs_list), then calls exit_plan with the plan.\n  ${c.dim('You approve the plan at the gate before anything is edited. shift+tab cycles modes · /plan off exits')}\n`)
+            : '\n  ⏹ plan mode off — normal mode.\n'
+        );
+        break;
+      case 'plans': {
+        const plans = listPlans(root);
+        if (!plans.length) {
+          say(`\n  no approved plans yet — approved exit_plan payloads save to ${c.bold(PLANS_DIR + '/')}\n`);
+          break;
+        }
+        const rows = plans.slice(0, 12).map((p, i) => [
+          i === 0 ? c.bold('0') : String(i),
+          path.basename(p.file),
+          (p.mtime || '').slice(0, 16).replace('T', ' '),
+        ]);
+        say(`\n${renderTable(rows, { headers: ['#', 'plan', 'approved'] })}\n${c.dim(`  read one: !cat ${PLANS_DIR}/<file>`)}\n`);
         break;
       }
       case 'memory': {

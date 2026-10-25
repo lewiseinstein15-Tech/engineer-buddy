@@ -33,7 +33,7 @@ export { charWidth, strWidth, wrapContent };
 // ctx: { paletteOpen? } — switches ↑/↓ from history to palette navigation.
 // Returns { action, data } where action ∈ insert|submit|backspace|delete|left|right|
 // home|end|kill-line|kill-word-before|history-prev|history-next|complete|
-// palette-prev|palette-next|escape|sigint|eof|null
+// mode-cycle|palette-prev|palette-next|escape|sigint|eof|null
 export function applyKey(key, ctx = {}) {
   const name = key.name ?? '';
   if (key.ctrl && name === 'c') return { action: 'sigint' };
@@ -51,7 +51,7 @@ export function applyKey(key, ctx = {}) {
   if (key.ctrl && name === 'w') return { action: 'kill-word-before' };
   if (name === 'up') return ctx.paletteOpen ? { action: 'palette-prev' } : { action: 'history-prev' };
   if (name === 'down') return ctx.paletteOpen ? { action: 'palette-next' } : { action: 'history-next' };
-  if (name === 'tab') return { action: 'complete' };
+  if (name === 'tab') return key.shift ? { action: 'mode-cycle' } : { action: 'complete' };
   const seq = key.sequence ?? '';
   if (!key.ctrl && !key.meta && seq >= ' ' && !seq.startsWith('\x1b')) {
     return { action: 'insert', data: seq };
@@ -338,6 +338,7 @@ export function createInputBox({
       case 'palette-prev': paletteSel = Math.max(0, paletteSel - 1); break;
       case 'palette-next': paletteSel = Math.min(items.length - 1, paletteSel + 1); break;
       case 'complete': acceptPalette(items); break;
+      case 'mode-cycle': handlers.modecycle?.(); break; // shift+tab: normal → auto-accept → plan
       case 'submit': submitLine(); return; // submitLine handles its own repaint
       case 'escape':
         if (items.length) { paletteClosed = true; break; }

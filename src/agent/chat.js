@@ -11,6 +11,7 @@
 import { extractJson, debugLog, truncate } from '../util.js';
 import { describeTools } from './agent.js';
 import { describeSkillCatalog } from '../skills/loader.js';
+import { PLAN_TOOLS, planModePrompt } from '../tools/planmode.js';
 
 export const PROTOCOL_PREAMBLE = [
   'You are Engineer Buddy ("Buddy Code"), a software engineer working in the user\'s terminal inside this repository.',
@@ -20,14 +21,20 @@ export const PROTOCOL_PREAMBLE = [
   'Never output prose outside JSON. Never invent tool results. Never claim you ran a command you did not run.',
 ].join('\n');
 
-export function buildSystemPrompt({ harness, tools, skills = [] }) {
-  const hasTodo = tools.some((t) => t.name === 'todo');
+export function buildSystemPrompt({ harness, tools, skills = [], planMode = false }) {
+  // Plan mode swaps the visible tool list right here: only research tools +
+  // exit_plan stay; normal mode hides exit_plan so the model never sees a
+  // tool it cannot use. (Filtering lives here so no caller can forget it.)
+  const eff = planMode
+    ? tools.filter((t) => PLAN_TOOLS.has(t.name))
+    : tools.filter((t) => t.name !== 'exit_plan');
+  const hasTodo = eff.some((t) => t.name === 'todo');
   const skillsBlock = describeSkillCatalog(skills);
   return [
     PROTOCOL_PREAMBLE,
     '',
     '## Tools',
-    describeTools(tools),
+    describeTools(eff),
     ...(hasTodo
       ? [
           '',
@@ -35,6 +42,7 @@ export function buildSystemPrompt({ harness, tools, skills = [] }) {
           'For any multi-step task, FIRST call the todo tool with a short plan (max 8 items, all "pending"), then update item statuses ("in_progress" → "done") as you work. Keep texts short.',
         ]
       : []),
+    ...(planMode ? ['', planModePrompt()] : []),
     '',
     '## Who you are',
     harness.systemprompt,
@@ -61,6 +69,7 @@ export function createChat({
   maxStepsPerTurn = 14,
   maxTokens = 1500,
   approval = null, // async ({tool, summary}) => 'yes' | 'no' | 'always' | null
+  modes = null, // shared { plan: boolean } — plan mode when .plan is true
   onEvent = () => {},
 }) {
   const byName = new Map(tools.map((t) => [t.name, t]));
@@ -69,7 +78,13 @@ export function createChat({
   let compactCount = 0;
   const usage = { calls: 0, charsIn: 0, charsOut: 0, byGateway: {} };
 
-  const systemMsg = () => ({ role: 'system', content: buildSystemPrompt({ harness, tools, skills }) });
+  // System prompt is rebuilt per call: plan mode swaps the tool list (only
+  // PLAN_TOOLS + exit_plan visible) and injects the read-only section; normal
+  // mode hides exit_plan so the model never sees it when it cannot run it.
+  const systemMsg = () => {
+    const plan = modes?.plan === true;
+    return { role: 'system', content: buildSystemPrompt({ harness, tools, skills, planMode: plan }) };
+  };
 
   const historyChars = () => messages.reduce((n, m) => n + m.content.length, 0);
 
@@ -198,7 +213,10 @@ export function createChat({
       let observation;
       let denied = false;
       let preview = null;
-      if (!impl) {
+      // Plan mode hard wall: refuse BEFORE caps burn or gates fire.
+      if (impl && modes?.plan && !PLAN_TOOLS.has(tool)) {
+        observation = `ERROR: plan mode is active — only research tools are allowed (${[...PLAN_TOOLS].join(', ')}). Use fs_search/fs_read/fs_list to investigate, then call exit_plan with your plan.`;
+      } else if (!impl) {
         observation = `ERROR: unknown tool "${tool}". Available: ${[...byName.keys()].join(', ')}`;
       } else {
         const cap = impl.maxCalls ?? 6;
