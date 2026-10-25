@@ -89,9 +89,16 @@ Protocol reminder: every step is ONE JSON object {"tool":...,"args":{...}}, or {
 - Context cost hierarchy (cheapest first): tool calls > skills > this file > systemprompt > memory. Keep always-on files tight; put long recipes into skills/<name>/SKILL.md and load them only when triggered.
 
 ## Skills
+- The catalog below (## Skills in this prompt) lists skills by description — when the task matches one, call the skill tool with that name FIRST and follow its playbook.
 - When the user asks you to write a git commit message, load the \`commit-message\` skill.`;
 
-export const DEFAULT_SKILL_COMMIT_MESSAGE = `# Skill: commit-message
+export const DEFAULT_SKILL_COMMIT_MESSAGE = `---
+name: commit-message
+description: Write a conventional commit message from the current uncommitted diff. Use when the user asks for a commit message or what to put in a commit.
+allowed-tools: fs_read, fs_search, bash
+---
+
+# Skill: commit-message
 
 Trigger: "commit message", "commit msg", "what should the commit say".
 
@@ -103,10 +110,19 @@ Steps:
 
 export const DEFAULT_SKILLS_README = `# Skills (on-demand playbooks)
 
-Each skill lives in skills/<name>/SKILL.md and is loaded only when the
-always-on text names it (Harness² "triggered skills" rule — a skill that is
-never triggered is dead weight and fails harness validation).
+Each skill lives in skills/<name>/SKILL.md. Frontmatter makes it discoverable:
 
+    ---
+    name: my-skill
+    description: What it does and when to use it — Buddy auto-loads it from this.
+    allowed-tools: fs_read, fs_search, bash
+    ---
+
+Three layers (later shadows earlier by name): bundled (shipped with Buddy),
+~/.buddy/skills/ (personal, all your repos), .buddy/harness/skills/ (this repo).
+
+The body stays out of context until needed: Buddy loads it with the skill tool
+when the task matches the description, and you can run /<skill-name> yourself.
 Keep skills as short numbered playbooks with concrete commands.`;
 
 /** relPath (under .buddy/harness/) -> default content */

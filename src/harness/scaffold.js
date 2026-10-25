@@ -127,14 +127,19 @@ export function validateHarnessProposal(proposal, current = {}) {
   }
   if (errors.length) return errors;
 
-  // Triggered-skills rule: a skill file may only be proposed if the skill name
-  // appears in one of the always-on files (merged view: proposal wins).
+  // Triggered-skills rule: a skill file may only be proposed if it is either
+  // (a) triggered by name in an always-on file (Harness² rule), or (b) a
+  // Skills v2 skill whose frontmatter description lets the model auto-trigger
+  // it from the always-on catalog.
   const merged = { ...current, ...proposal };
   const alwaysOnText = ALWAYS_ON.map((f) => merged[f] || '').join('\n');
   for (const rel of rels) {
     const name = skillNameOf(rel);
     if (name && !alwaysOnText.includes(name)) {
-      errors.push(`skill "${name}" is never triggered — add "When <situation>, load the \`${name}\` skill" to tool_guidance.md (or another always-on file) in the same proposal`);
+      const hasV2Description = /^description:\s*\S/m.test(String(merged[rel] || ''));
+      if (!hasV2Description) {
+        errors.push(`skill "${name}" is never triggered — add "When <situation>, load the \`${name}\` skill" to tool_guidance.md (or another always-on file) in the same proposal, or give the SKILL.md a frontmatter description (Skills v2 auto-trigger)`);
+      }
     }
   }
   return errors;

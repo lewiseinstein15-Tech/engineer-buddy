@@ -10,6 +10,7 @@
 //   - per-turn tool call caps + one protocol-repair retry (v0.2 heritage)
 import { extractJson, debugLog, truncate } from '../util.js';
 import { describeTools } from './agent.js';
+import { describeSkillCatalog } from '../skills/loader.js';
 
 export const PROTOCOL_PREAMBLE = [
   'You are Engineer Buddy ("Buddy Code"), a software engineer working in the user\'s terminal inside this repository.',
@@ -19,8 +20,9 @@ export const PROTOCOL_PREAMBLE = [
   'Never output prose outside JSON. Never invent tool results. Never claim you ran a command you did not run.',
 ].join('\n');
 
-export function buildSystemPrompt({ harness, tools }) {
+export function buildSystemPrompt({ harness, tools, skills = [] }) {
   const hasTodo = tools.some((t) => t.name === 'todo');
+  const skillsBlock = describeSkillCatalog(skills);
   return [
     PROTOCOL_PREAMBLE,
     '',
@@ -42,6 +44,7 @@ export function buildSystemPrompt({ harness, tools }) {
     '',
     '## Tool guidance',
     harness.toolGuidance,
+    ...(skillsBlock ? ['', skillsBlock] : []),
     '',
     '## Guardrails',
     harness.guardrails,
@@ -53,6 +56,7 @@ export function createChat({
   router,
   tools,
   harness,
+  skills = [], // full skill catalog (Skills v2) — disabled ones stay user-invocable
   charBudget = 48000, // history budget (chars) before compaction
   maxStepsPerTurn = 14,
   maxTokens = 1500,
@@ -65,7 +69,7 @@ export function createChat({
   let compactCount = 0;
   const usage = { calls: 0, charsIn: 0, charsOut: 0, byGateway: {} };
 
-  const systemMsg = () => ({ role: 'system', content: buildSystemPrompt({ harness, tools }) });
+  const systemMsg = () => ({ role: 'system', content: buildSystemPrompt({ harness, tools, skills }) });
 
   const historyChars = () => messages.reduce((n, m) => n + m.content.length, 0);
 
@@ -123,11 +127,17 @@ export function createChat({
    * Run one user turn to completion.
    * @returns {{said:string|null, steps:number}}
    */
-  async function turn(userText, { signal = null } = {}) {
+  async function turn(userText, { signal = null, skill = null } = {}) {
     messages.push({ role: 'user', content: String(userText) });
     onEvent({ type: 'user', text: String(userText) });
     const callCounts = new Map();
     let said = null;
+    // Skills v2: a user-invoked skill with allowed-tools arms the restriction
+    // immediately; model-loaded skills arm it when the skill tool succeeds.
+    let skillRestriction = null;
+    if (skill?.allowedTools?.length) {
+      skillRestriction = { name: skill.name, allowed: new Set([...skill.allowedTools, 'skill', 'say']) };
+    }
 
     for (let step = 1; step <= maxStepsPerTurn; step++) {
       if (signal?.aborted) {
@@ -197,20 +207,33 @@ export function createChat({
           observation = `ERROR: tool "${tool}" already used ${used}/${cap} times this turn. Work differently or say.`;
         } else {
           callCounts.set(tool, used + 1);
-          // Claude-Code-style preview: risky tools show WHAT will change before approval.
-          try {
-            preview = impl.preview ? impl.preview(args) : null;
-          } catch {
-            preview = null; // a broken preview must never block the gate
+          // Skills v2: an active skill restricts this task to its allowed tools.
+          if (skillRestriction && !skillRestriction.allowed.has(tool)) {
+            observation = `ERROR: the "${skillRestriction.name}" skill restricts this task to tools: ${[...skillRestriction.allowed].join(', ')}. Finish with say, or ask the user to load a different skill.`;
+          } else {
+            // Claude-Code-style preview: risky tools show WHAT will change before approval.
+            try {
+              preview = impl.preview ? impl.preview(args) : null;
+            } catch {
+              preview = null; // a broken preview must never block the gate
+            }
+            if (impl.risky && approval && !alwaysApproved.has(tool)) {
+              const decision = await approval({ tool, args, summary: impl.render ? impl.render(args) : truncate(JSON.stringify(args), 200), preview });
+              if (decision === 'always') alwaysApproved.add(tool);
+              denied = decision === 'no';
+            }
+            observation = denied
+              ? 'DENIED by the user: the action did NOT run. Ask the user how to proceed or pick another approach.'
+              : await impl.run(args, { signal }).catch((e) => `ERROR: ${e.message}`);
+            // Loading a skill with allowed-tools arms the restriction for the
+            // rest of the turn (the skill tool's success output starts with "SKILL: ").
+            if (tool === 'skill' && !denied && String(observation).startsWith('SKILL: ')) {
+              const loaded = skills.find((s) => s.name === String(args?.name || '').trim() && !s.disableModelInvocation);
+              if (loaded?.allowedTools?.length) {
+                skillRestriction = { name: loaded.name, allowed: new Set([...loaded.allowedTools, 'skill', 'say']) };
+              }
+            }
           }
-          if (impl.risky && approval && !alwaysApproved.has(tool)) {
-            const decision = await approval({ tool, args, summary: impl.render ? impl.render(args) : truncate(JSON.stringify(args), 200), preview });
-            if (decision === 'always') alwaysApproved.add(tool);
-            denied = decision === 'no';
-          }
-          observation = denied
-            ? 'DENIED by the user: the action did NOT run. Ask the user how to proceed or pick another approach.'
-            : await impl.run(args, { signal }).catch((e) => `ERROR: ${e.message}`);
         }
       }
 

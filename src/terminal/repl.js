@@ -20,6 +20,8 @@ import { LocalScope, buildLocalTools, runBash } from '../tools/local.js';
 import { buildWebTools } from '../tools/web.js';
 import { buildTaskTool } from '../tools/task.js';
 import { BackgroundShells, buildBackgroundTools } from '../tools/background.js';
+import { buildSkillTool } from '../tools/skill.js';
+import { loadSkills } from '../skills/loader.js';
 import { connectMcpServers, buildMcpTools, describeMcpServers, MCP_CONFIG_PATH } from '../tools/mcp.js';
 import { ensureHarness, loadHarness, harnessContext } from '../harness/scaffold.js';
 import { HARNESS_DIR } from '../harness/defaults.js';
@@ -36,7 +38,7 @@ export const VERSION = createRequire(import.meta.url)('../../package.json').vers
 
 export const SLASH_COMMANDS = [
   'help', 'new', 'clear', 'screen', 'compact', 'model', 'gateways', 'cost',
-  'permissions', 'todo', 'tools', 'agents', 'mcp', 'tasks', 'memory', 'experience', 'learn', 'review',
+  'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'memory', 'experience', 'learn', 'review',
   'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit',
 ];
 
@@ -54,6 +56,7 @@ export const SLASH_DESCRIPTIONS = {
   todo: "Show Buddy's current plan",
   tools: "List Buddy's tools",
   agents: 'List sub-agents (task tool) — and how to add your own',
+  skills: 'List skills (SKILL.md playbooks) — /<skill-name> runs one',
   mcp: 'Show MCP servers + their tools (.buddy/mcp.json)',
   tasks: 'List background shells (bash_bg / bash_output / kill_shell)',
   memory: 'Show project memory (edit it to teach Buddy)',
@@ -90,8 +93,12 @@ async function makeScopeAndTools({ root, router = null, onEvent = () => {}, appr
   const taskTool = buildTaskTool({ router, tools: base, agents, approval, onSubEvent: onEvent });
   // MCP servers — optional, timeout-capped, never blocks startup on failure.
   const mcp = await connectMcpServers(root).catch(() => ({ connected: [], failed: [] }));
-  const tools = [...base, taskTool, ...buildMcpTools(mcp.connected)];
-  return { scope, tools, todoState, mcp, shells };
+  // Skills v2 — bundled + personal + project catalog; the skill tool is the
+  // model's only door to SKILL.md bodies (harness firewall hides the files).
+  const { skills } = loadSkills({ root });
+  const skillTool = buildSkillTool({ skills });
+  const tools = [...base, taskTool, skillTool, ...buildMcpTools(mcp.connected)];
+  return { scope, tools, todoState, mcp, shells, skills };
 }
 
 function makeHarness(root) {
@@ -106,13 +113,13 @@ function makeHarness(root) {
 
 /** Create a chat session bound to a workspace root. */
 export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, onEvent = () => {} } = {}) {
-  const { tools, todoState, mcp, shells } = await makeScopeAndTools({ root, router, onEvent, approval });
+  const { tools, todoState, mcp, shells, skills } = await makeScopeAndTools({ root, router, onEvent, approval });
   const harness = makeHarness(root);
-  const session = createChat({ router, tools, harness, charBudget, approval, onEvent });
+  const session = createChat({ router, tools, harness, skills, charBudget, approval, onEvent });
   if (resumeFrom) {
     for (const m of resumeMessages(loadSession(resumeFrom))) session.messages.push(m);
   }
-  return { chat: session, tools, todoState, mcp, shells };
+  return { chat: session, tools, todoState, mcp, shells, skills };
 }
 
 function defaultApproval(busy) {
@@ -273,7 +280,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   let toolCallsThisTurn = 0;
   const turnStart = { at: 0 };
 
-  const { chat, tools, todoState, mcp, shells } = await createBuddySession({
+  const { chat, tools, todoState, mcp, shells, skills: skillCatalog } = await createBuddySession({
     root,
     router,
     approval: async ({ tool, summary, preview }) => {
@@ -340,7 +347,10 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         return `v${VERSION} · ${lastGateway || router.order[0]} · ${ctxK}k ctx`;
       } catch { return `v${VERSION} · ${lastGateway || router.order[0]}`; }
     },
-    commands: SLASH_COMMANDS.map((n) => ({ name: `/${n}`, desc: SLASH_DESCRIPTIONS[n] || '' })),
+    commands: [
+      ...SLASH_COMMANDS.map((n) => ({ name: `/${n}`, desc: SLASH_DESCRIPTIONS[n] || '' })),
+      ...skillCatalog.map((s) => ({ name: `/${s.name}`, desc: `[skill] ${s.description.slice(0, 58)}` })),
+    ],
   });
   rl.install();
 
@@ -391,6 +401,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
               ['/memory', 'show project memory (edit it to teach Buddy)'],
               ['/experience', 'lessons from past tasks'],
               ['/learn', 'reflect on the last task → harness refinement'],
+              ['/skills', 'list skills — /<skill-name> runs one directly'],
               ['/todo', "show Buddy's current plan"],
             ].map(([k, d]) => `    ${c.bold(k.padEnd(20))} ${c.dim(d)}`),
             `  ${c.bold(c.cyan('Safety & tools'))}`,
@@ -510,6 +521,28 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
             `\n${c.dim('  dispatch: Buddy calls the task tool itself — or ask it to ("use the plan agent to …")')}` +
             `\n${c.dim('  add your own: .buddy/agents/<name>.md with frontmatter (name, description, tools, maxSteps) + a persona body')}\n` +
             (warnings.length ? c.yellow(`  skipped: ${warnings.join(' · ')}\n`) : '')
+        );
+        break;
+      }
+      case 'skills': {
+        if (!skillCatalog.length) {
+          say(
+            `\n  no skills loaded — add ${c.bold('.buddy/harness/skills/<name>/SKILL.md')} (frontmatter: name, description, allowed-tools)` +
+              `\n  ${c.dim('bundled: shipped with Buddy · personal: ~/.buddy/skills/<name>/SKILL.md')}\n`
+          );
+          break;
+        }
+        const rows = skillCatalog.map((s) => [
+          s.disableModelInvocation ? c.dim('user-only') : c.green('auto'),
+          c.bold(`/${s.name}`),
+          s.source,
+          s.allowedTools?.length ? s.allowedTools.join(', ') : c.dim('all tools'),
+          truncate(s.description, 56),
+        ]);
+        say(
+          `\n${renderTable(rows, { headers: ['trigger', 'skill', 'source', 'allowed tools', 'description'] })}` +
+            `\n${c.dim('  Buddy auto-loads a skill when your task matches its description — or run /<skill-name> args yourself')}\n` +
+            c.dim('  add one: .buddy/harness/skills/<name>/SKILL.md · yours everywhere: ~/.buddy/skills/<name>/SKILL.md\n')
         );
         break;
       }
@@ -816,6 +849,16 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
 
     const slash = parseSlash(input);
     if (slash) {
+      // Skills v2: /<skill-name> runs a skill directly (checked after the
+      // built-in command list, before the unknown-command error).
+      if (!SLASH_COMMANDS.includes(slash.name)) {
+        const rec = skillCatalog.find((s) => s.name === slash.name);
+        if (rec) {
+          const text = `[The user invoked the /${rec.name} skill]${slash.args ? ` with arguments: ${slash.args}` : ''}\n\nFollow this playbook exactly:\n\n${rec.body}`;
+          await runTask(text, { skill: rec, recordAs: input });
+          return;
+        }
+      }
       if (busy) {
         say('  (Buddy is still working — Ctrl+C to interrupt first)');
         rl.prompt();
@@ -837,6 +880,11 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     }
 
     // A real task for Buddy.
+    await runTask(input);
+  }
+
+  /** One Buddy turn (shared by plain tasks and /<skill-name> invocations). */
+  async function runTask(inputText, { skill = null, recordAs = null } = {}) {
     if (busy) {
       say('  (Buddy is still working — one task at a time, Ctrl+C to interrupt)');
       rl.prompt();
@@ -845,13 +893,14 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     busy = true;
     events = [];
     toolCallsThisTurn = 0;
-    lastTask = { task: input, events };
+    lastTask = { task: inputText, events };
     turnStart.at = Date.now();
     aborter = new AbortController();
-    ensureRecorder(input).append({ type: 'user', text: input });
-    rl.setBusy('Buddy working…');
+    const recorded = recordAs || inputText;
+    ensureRecorder(recorded).append({ type: 'user', text: recorded });
+    rl.setBusy(skill ? `Buddy working · /${skill.name}…` : 'Buddy working…');
     try {
-      const out = await chat.turn(input, { signal: aborter.signal });
+      const out = await chat.turn(inputText, { signal: aborter.signal, skill });
       rl.setBusy(null);
       recorder.append({ type: 'say', text: out.said ?? '' });
       lastTask.events = events;

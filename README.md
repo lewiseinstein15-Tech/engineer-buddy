@@ -184,6 +184,35 @@ I needed a serious AI engineer that lives in my repos: reviews every PR before a
 | 4 | **Issue triage** | every new issue (auto) | type/priority/labels + a useful first response |
 | 5 | **Release notes** | `@engineer-buddy notes` | merged PRs → grouped, human-ready changelog draft |
 
+## Skills (SKILL.md — open standard, user-addable)
+
+Skills are on-demand playbooks in `SKILL.md` files. Their `name` + `description` are always in context (tiny); the body loads only when needed — Buddy calls the `skill` tool when your task matches a description, or you run `/<skill-name>` directly.
+
+```markdown
+---
+name: pr-review
+description: Engineering-grade review of a diff. Use when asked to review a PR or branch.
+allowed-tools: fs_read, fs_search, fs_list, bash, todo
+---
+# Skill: pr-review
+1. Run `git diff HEAD` ...
+```
+
+Three layers, later shadows earlier by name:
+
+| Layer | Location | Scope |
+|---|---|---|
+| **bundled** | shipped with Buddy | the 5 CI playbooks below, usable in your terminal |
+| **personal** | `~/.buddy/skills/<name>/SKILL.md` | you, in every repo |
+| **project** | `.buddy/harness/skills/<name>/SKILL.md` | this repo only |
+
+- `allowed-tools` is enforced: while a skill is active, tools outside the list get an ERROR observation until the turn ends (`say` and `skill` always allowed).
+- `disable-model-invocation: true` hides a skill from the model — only you can run it via `/<skill-name>`.
+- Supporting files (`.md/.txt/.json/.csv/.yaml`) next to a SKILL.md load through the same tool: `{"tool":"skill","args":{"name":"x","file":"checklist.md"}}`.
+- `/skills` lists everything loaded with trigger mode, source, and tool restrictions.
+
+The 5 CI skills are also bundled playbooks (`skills/*/SKILL.md`), so the same review/fix/audit/triage/notes rubrics now work inside your terminal — copy one into `.buddy/harness/skills/` and edit it to make it yours. The GitHub-bot pipelines in `src/skills/*.js` remain the CI execution layer.
+
 ## The keyless brain chain
 
 All providers verified live on **2026-10-25**. No keys anywhere.
