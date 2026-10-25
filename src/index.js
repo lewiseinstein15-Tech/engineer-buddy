@@ -45,6 +45,9 @@ Local coding agent (Buddy Code — like Claude Code, in your terminal):
   engineer-buddy init                   scaffold .buddy/harness/ (systemprompt, guardrails,
                                         MEMORY.md, tool guidance, skills)
 
+In the REPL: /help for commands · !cmd runs your own shell · #note saves to
+project memory · Ctrl+C interrupts the running task (twice quits).
+
 GitHub skills (CI):
   engineer-buddy pr-review     --repo OWNER/NAME --pr N [--dry-run] [--repo-dir PATH]
   engineer-buddy fix-issue     --repo OWNER/NAME --issue N [--dry-run] --repo-dir PATH
@@ -262,7 +265,7 @@ async function cmdChat(argv, { oneShot = false } = {}) {
     }
     return 0;
   }
-  return (await startRepl({ router, root, config: cfg })) ?? 0;
+  return (await startRepl({ router, root, config: cfg, yolo: Boolean(values.yolo) })) ?? 0;
 }
 
 async function cmdInit(argv) {

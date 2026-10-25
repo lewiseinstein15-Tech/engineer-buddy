@@ -10,6 +10,38 @@ import path from 'node:path';
 import { BuddyError, truncate } from '../util.js';
 import { LocalRepo } from './repo.js';
 import { isAgentDeniedPath } from '../harness/scaffold.js';
+import { renderTextDiff, renderDiff, diffLines } from '../terminal/difflib.js';
+
+// ── Edit previews (shown before approval, Claude-Code style) ────────────────
+
+function currentContent(scope, rel) {
+  try {
+    const r = scope.read(rel, 60000);
+    return r?.content ?? '';
+  } catch {
+    return ''; // new file or unreadable — empty old side
+  }
+}
+
+function previewWrite(scope, rel, content) {
+  const before = currentContent(scope, rel);
+  if (!before) {
+    const lines = String(content ?? '').split('\n').slice(0, 10);
+    const body = renderDiff(lines.map((s) => ({ t: '+', s })), { maxLines: 10 });
+    return `${body}\n  │ ${lines.length > 10 ? '… (new file)' : '(new file)'}`.trimEnd();
+  }
+  return renderTextDiff(before, content, { maxLines: 16 });
+}
+
+function previewReplace(scope, rel, find, replace) {
+  const before = currentContent(scope, rel);
+  if (!before || !before.includes(String(find))) return null; // preview pointless — run() will error
+  return renderTextDiff(String(find), String(replace ?? ''), { maxLines: 16 });
+}
+
+function previewAppend(content) {
+  return renderDiff(diffLines('', String(content ?? '')), { maxLines: 10 });
+}
 
 // ── Bash policy ──────────────────────────────────────────────────────────────
 
@@ -36,10 +68,13 @@ export function blockedBashReason(cmd) {
 
 const GIT_READ_RE = /^git (status|diff|log|branch|show|remote|tag)( .*)?$/;
 
-/** Run one allowlist-checked simple command. Never throws. */
-export function runBash(cmd, { cwd = process.cwd(), timeoutMs = 180000, maxOutputChars = 8000, env = {} } = {}) {
+/** Run one allowlist-checked simple command. Never throws.
+ * opts.signal — AbortSignal: kills the child and resolves with interrupted:true.
+ * opts.trusted — skip the policy blocklist (ONLY for the user's own `!` shell
+ * passthrough, where the human typed the command). */
+export function runBash(cmd, { cwd = process.cwd(), timeoutMs = 180000, maxOutputChars = 8000, env = {}, signal = null, trusted = false } = {}) {
   return new Promise((resolve) => {
-    const blocked = blockedBashReason(cmd);
+    const blocked = trusted ? null : blockedBashReason(cmd);
     if (blocked) {
       resolve({ ok: false, code: -1, stdout: '', stderr: `BLOCKED: ${blocked}`, durationMs: 0, timedOut: false, command: cmd, blocked: true });
       return;
@@ -54,6 +89,7 @@ export function runBash(cmd, { cwd = process.cwd(), timeoutMs = 180000, maxOutpu
         shell: true,
         timeout: timeoutMs,
         killSignal: 'SIGKILL',
+        detached: process.platform !== 'win32', // own process group → we can kill sh AND its children
         env: { PATH: process.env.PATH, HOME: process.env.HOME || '/tmp', LANG: 'C.UTF-8', NO_COLOR: '1', ...env },
       });
     } catch (e) {
@@ -65,13 +101,30 @@ export function runBash(cmd, { cwd = process.cwd(), timeoutMs = 180000, maxOutpu
     const cap = (s, chunk) => (s.length < maxOutputChars ? s + chunk : s);
     child.stdout.on('data', (d) => { out = cap(out, d.toString()); });
     child.stderr.on('data', (d) => { err = cap(err, d.toString()); });
+    // Kill the WHOLE process group — `sh -c "sleep 5"` otherwise leaves sleep
+    // running and the pipe open long after sh is dead.
+    const killTree = () => {
+      try {
+        if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, 'SIGKILL');
+        else child.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    };
+    // Abort support: a user Ctrl+C kills the running command immediately.
+    const onAbort = () => killTree();
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
     const killer = setTimeout(() => {
       timedOut = true;
-      try { child.kill('SIGKILL'); } catch { /* gone */ }
+      killTree();
     }, timeoutMs);
     const finish = (code) => {
       clearTimeout(killer);
-      resolve({ ok: !timedOut && code === 0, code, stdout: truncate(out, maxOutputChars), stderr: truncate(err, maxOutputChars), durationMs: Date.now() - t0, timedOut, command });
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve({ ok: !timedOut && code === 0, code, stdout: truncate(out, maxOutputChars), stderr: truncate(err, maxOutputChars), durationMs: Date.now() - t0, timedOut, interrupted: Boolean(signal?.aborted), command });
     };
     child.on('error', (e) => { clearTimeout(killer); resolve({ ok: false, code: -1, stdout: truncate(out, maxOutputChars), stderr: e.message, durationMs: Date.now() - t0, timedOut, command }); });
     child.on('close', finish);
@@ -174,8 +227,26 @@ function fmtResult(r) {
  * Build the local tool set.
  * @returns tools with {name, description, args, run, risky?, render?}
  */
-export function buildLocalTools({ scope, bashTimeoutMs = 180000 } = {}) {
+export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { latest: null } } = {}) {
   return [
+    {
+      name: 'todo',
+      description:
+        'Track a multi-step plan. Call FIRST with the plan (all pending), then update statuses (in_progress / done) as you work. Max 8 items, short texts.',
+      args: '{"items":[{"text":"read the failing test","status":"pending"}]}',
+      render: (a) => `todo (${(a?.items || []).length} items)`,
+      run: async ({ items } = {}) => {
+        if (!Array.isArray(items) || !items.length) return 'ERROR: items must be a non-empty array of {"text":..., "status":"pending|in_progress|done"}';
+        const norm = items.slice(0, 8).map((it, i) => ({
+          text: String(it?.text ?? `item ${i + 1}`).slice(0, 120),
+          status: ['pending', 'in_progress', 'done'].includes(it?.status) ? it.status : 'pending',
+        }));
+        todoState.latest = norm;
+        return `PLAN (${norm.filter((x) => x.status === 'done').length}/${norm.length} done):\n${norm
+          .map((it) => `- [${it.status === 'done' ? 'x' : it.status === 'in_progress' ? '~' : ' '}] ${it.text}`)
+          .join('\n')}\nKeep statuses updated as you progress.`;
+      },
+    },
     {
       name: 'fs_list',
       description: 'List files in a directory of this repo.',
@@ -209,6 +280,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000 } = {}) {
       args: '{"path":"src/file.js","content":"full new file content"}',
       risky: true,
       render: (a) => `fs_write ${a?.path}`,
+      preview: (a) => previewWrite(scope, a?.path, a?.content),
       run: async ({ path: p, content }) => {
         if (typeof content !== 'string' || !content.trim()) return 'ERROR: content required';
         const r = scope.write(p, content);
@@ -221,6 +293,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000 } = {}) {
       args: '{"path":"src/file.js","find":"exact existing snippet","replace":"new snippet"}',
       risky: true,
       render: (a) => `fs_replace ${a?.path}`,
+      preview: (a) => previewReplace(scope, a?.path, a?.find, a?.replace),
       run: async ({ path: p, find, replace }) => {
         if (typeof find !== 'string' || !find) return 'ERROR: find required';
         const r = scope.replace(p, find, String(replace ?? ''));
@@ -233,6 +306,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000 } = {}) {
       args: '{"path":"notes.md","content":"text"}',
       risky: true,
       render: (a) => `fs_append ${a?.path}`,
+      preview: (a) => previewAppend(a?.content),
       run: async ({ path: p, content }) => {
         if (typeof content !== 'string' || !content.trim()) return 'ERROR: content required';
         const r = scope.append(p, content);
@@ -246,7 +320,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000 } = {}) {
       args: '{"command":"npm test"}',
       risky: true,
       render: (a) => `bash ${a?.command}`,
-      run: async ({ command }) => fmtResult(await runBash(command, { cwd: scope.root, timeoutMs: bashTimeoutMs })),
+      run: async ({ command }, ctx = {}) => fmtResult(await runBash(command, { cwd: scope.root, timeoutMs: bashTimeoutMs, signal: ctx.signal })),
     },
   ];
 }

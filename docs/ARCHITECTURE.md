@@ -1,6 +1,6 @@
 # Engineer Buddy — Architecture
 
-> Status: v0.3 — Buddy Code (terminal coding agent with a Harness² harness) + five GitHub skills shipped. This document is the full engineering design: the brain chain, the agent skeleton, the complete tool taxonomy, the deployment topology, and the terminal agent. Everything here runs at **$0/month with zero API keys**.
+> Status: v0.4 — Buddy Code with the complete Claude Code-style interface (diff-preview gates, Ctrl+C interrupt with process-group kill, todo plans, /cost /model /gateways /review /export, session exports) + five GitHub skills shipped. This document is the full engineering design: the brain chain, the agent skeleton, the complete tool taxonomy, the deployment topology, and the terminal agent. Everything here runs at **$0/month with zero API keys**.
 
 ---
 
@@ -311,7 +311,7 @@ Separation is deliberate: buddy updates ship on their own cadence and never requ
 | LLM calls (keyless) | free | 2–6 calls | $0 |
 | **Total** | | | **$0.00** |
 
-## 8. Buddy Code (v0.3) — the terminal coding agent
+## 8. Buddy Code (v0.4) — the terminal coding agent
 
 The same brain and tool discipline, running locally like Claude Code. New modules:
 
@@ -319,14 +319,23 @@ The same brain and tool discipline, running locally like Claude Code. New module
 src/
   harness/defaults.js     the default Harness² surface as markdown (5 of 8 components)
   harness/scaffold.js     ensure/load/validate/apply + self-edit firewall (AGENT_DENY_GLOBS)
-  agent/chat.js           conversational loop: strict-JSON protocol, approval gates,
-                          per-turn tool caps, 1 protocol-repair retry, history compaction
+  agent/chat.js           conversational loop: strict-JSON protocol, approval gates with
+                          edit previews, per-turn tool caps, 1 protocol-repair retry,
+                          history compaction (+ compactNow), AbortSignal support, usage()
   tools/local.js          LocalScope (fs read/write/replace/append/list/search) + bash
-                          with blockedBashReason() policy + segment-based secret refusal
-  terminal/ui.js          zero-dep ANSI rendering (colors, spinner, tool-call display)
-  terminal/repl.js        interactive REPL + slash commands + approval prompts;
+                          with blockedBashReason() policy, trusted passthrough mode,
+                          AbortSignal process-group kill, diff previews, todo tool
+  terminal/ui.js          zero-dep ANSI rendering (logo banner, boxes, tables, todo
+                          checklists, tool cards, spinner with live label)
+  terminal/markdown.js    markdown-lite renderer (headings, bullets, inline code,
+                          fenced blocks, links) for Buddy's replies
+  terminal/difflib.js     LCS line diff + colored renderer for edit previews
+  terminal/repl.js        interactive REPL: tab-completion, multi-line input, Ctrl+C
+                          interrupt routing (approval deny → turn abort → double-tap
+                          exit), ! shell passthrough, # memory notes, full slash set;
                           runOneShot() for headless `buddy -p`
-  session.js              JSONL transcripts (.buddy/sessions/), /resume
+  session.js              JSONL transcripts (.buddy/sessions/), numbered /resume,
+                          markdown /export (.buddy/exports/)
   learn.js                Harness² k=1 reflection: EXPERIENCE.md + validated harness
                           proposal with verbatim-error retry and KEEP_BASE default
 ```

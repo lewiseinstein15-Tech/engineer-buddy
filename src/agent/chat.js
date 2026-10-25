@@ -20,11 +20,19 @@ export const PROTOCOL_PREAMBLE = [
 ].join('\n');
 
 export function buildSystemPrompt({ harness, tools }) {
+  const hasTodo = tools.some((t) => t.name === 'todo');
   return [
     PROTOCOL_PREAMBLE,
     '',
     '## Tools',
     describeTools(tools),
+    ...(hasTodo
+      ? [
+          '',
+          '## Plan protocol',
+          'For any multi-step task, FIRST call the todo tool with a short plan (max 8 items, all "pending"), then update item statuses ("in_progress" → "done") as you work. Keep texts short.',
+        ]
+      : []),
     '',
     '## Who you are',
     harness.systemprompt,
@@ -55,13 +63,14 @@ export function createChat({
   const alwaysApproved = new Set(); // tools the user said "always" for
   let messages = []; // {role, content}; system prompt inserted lazily
   let compactCount = 0;
+  const usage = { calls: 0, charsIn: 0, charsOut: 0, byGateway: {} };
 
   const systemMsg = () => ({ role: 'system', content: buildSystemPrompt({ harness, tools }) });
 
   const historyChars = () => messages.reduce((n, m) => n + m.content.length, 0);
 
-  async function maybeCompact() {
-    if (historyChars() <= charBudget) return;
+  async function maybeCompact(force = false) {
+    if (!force && historyChars() <= charBudget) return;
     const keep = 4;
     const head = messages.slice(0, Math.max(0, messages.length - keep));
     const tail = messages.slice(-keep);
@@ -91,20 +100,41 @@ export function createChat({
   async function callModel() {
     await maybeCompact();
     const history = [systemMsg(), ...messages];
-    return router.chat(history, { maxTokens });
+    const out = await router.chat(history, { maxTokens });
+    // Usage telemetry (the /cost surface). Rough char-based accounting.
+    usage.calls += 1;
+    usage.charsIn += history.reduce((n, m) => n + m.content.length, 0);
+    usage.charsOut += (out.text || '').length;
+    const gw = out.gateway || 'unknown';
+    usage.byGateway[gw] = usage.byGateway[gw] || { calls: 0, charsOut: 0 };
+    usage.byGateway[gw].calls += 1;
+    usage.byGateway[gw].charsOut += (out.text || '').length;
+    return out;
+  }
+
+  /** Force a compaction pass now (slash /compact). */
+  async function compactNow() {
+    const before = compactCount;
+    await maybeCompact(true);
+    return { compacted: compactCount > before, messages: messages.length };
   }
 
   /**
    * Run one user turn to completion.
    * @returns {{said:string|null, steps:number}}
    */
-  async function turn(userText) {
+  async function turn(userText, { signal = null } = {}) {
     messages.push({ role: 'user', content: String(userText) });
     onEvent({ type: 'user', text: String(userText) });
     const callCounts = new Map();
     let said = null;
 
     for (let step = 1; step <= maxStepsPerTurn; step++) {
+      if (signal?.aborted) {
+        onEvent({ type: 'interrupted', at: step });
+        messages.push({ role: 'user', content: '[The user interrupted this turn.] Continue only if they ask again.' });
+        return { said: null, steps: step - 1, aborted: true };
+      }
       let res;
       try {
         res = await callModel();
@@ -157,6 +187,7 @@ export function createChat({
       const impl = byName.get(tool);
       let observation;
       let denied = false;
+      let preview = null;
       if (!impl) {
         observation = `ERROR: unknown tool "${tool}". Available: ${[...byName.keys()].join(', ')}`;
       } else {
@@ -166,19 +197,25 @@ export function createChat({
           observation = `ERROR: tool "${tool}" already used ${used}/${cap} times this turn. Work differently or say.`;
         } else {
           callCounts.set(tool, used + 1);
+          // Claude-Code-style preview: risky tools show WHAT will change before approval.
+          try {
+            preview = impl.preview ? impl.preview(args) : null;
+          } catch {
+            preview = null; // a broken preview must never block the gate
+          }
           if (impl.risky && approval && !alwaysApproved.has(tool)) {
-            const decision = await approval({ tool, summary: impl.render ? impl.render(args) : truncate(JSON.stringify(args), 200) });
+            const decision = await approval({ tool, args, summary: impl.render ? impl.render(args) : truncate(JSON.stringify(args), 200), preview });
             if (decision === 'always') alwaysApproved.add(tool);
             denied = decision === 'no';
           }
           observation = denied
             ? 'DENIED by the user: the action did NOT run. Ask the user how to proceed or pick another approach.'
-            : await impl.run(args).catch((e) => `ERROR: ${e.message}`);
+            : await impl.run(args, { signal }).catch((e) => `ERROR: ${e.message}`);
         }
       }
 
       debugLog(`chat step ${step}: ${tool}${denied ? ' (denied)' : ''} → ${truncate(observation, 120)}`);
-      onEvent({ type: 'tool', tool, args, observation, denied, model: res.model, gateway: res.gateway });
+      onEvent({ type: 'tool', tool, args, observation, denied, preview, argText: impl?.render ? String(impl.render(args) || '').slice(0, 200) : '', model: res.model, gateway: res.gateway });
       messages.push({ role: 'assistant', content: JSON.stringify({ tool, args }) });
       messages.push({ role: 'user', content: `TOOL OBSERVATION:\n${observation}\n\nContinue with the next JSON step.` });
     }
@@ -189,9 +226,16 @@ export function createChat({
 
   return {
     turn,
+    compactNow,
     get messages() { return messages; },
     get compactCount() { return compactCount; },
     get alwaysApproved() { return [...alwaysApproved]; },
     historyChars,
+    usage() {
+      return { ...usage, byGateway: { ...usage.byGateway } };
+    },
+    resetApprovals() {
+      alwaysApproved.clear();
+    },
   };
 }

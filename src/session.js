@@ -1,8 +1,9 @@
 // session.js — conversation persistence for Buddy Code.
 // Transcripts live in .buddy/sessions/<ts>-<slug>.jsonl (one event per line).
+// Exports (human-readable markdown) go to .buddy/exports/.
 import fs from 'node:fs';
 import path from 'node:path';
-import { SESSIONS_DIR } from './harness/defaults.js';
+import { SESSIONS_DIR, EXPORTS_DIR } from './harness/defaults.js';
 
 function slugify(s, max = 32) {
   return String(s)
@@ -56,7 +57,18 @@ export function listSessions(root) {
 
 /** Load a session file into a compact handoff transcript. */
 export function loadSession(file) {
-  const events = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const events = fs
+    .readFileSync(file, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null; // one corrupt line must not kill the whole session
+      }
+    })
+    .filter(Boolean);
   // Rebuild a light conversation: user turns + buddy replies (tool noise is
   // summarized by the compaction path, not replayed verbatim).
   const pairs = [];
@@ -78,5 +90,95 @@ export function resumeMessages(session) {
     out.push({ role: 'user', content: user });
     out.push({ role: 'assistant', content: JSON.stringify({ tool: 'say', message: buddy }) });
   }
+  return out;
+}
+
+// ── Session introspection + markdown export (/sessions, /export) ───────────
+
+/** Quick metadata for the session picker. */
+export function sessionInfo(file) {
+  const { pairs } = loadSession(file);
+  let firstUser = '(empty)';
+  try {
+    const raw = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    for (const l of raw) {
+      try {
+        const e = JSON.parse(l);
+        if (e.type === 'user' && e.text) {
+          firstUser = e.text;
+          break;
+        }
+      } catch {
+        /* skip */
+      }
+    }
+  } catch {
+    /* unreadable */
+  }
+  let mtime = null;
+  try {
+    mtime = fs.statSync(file).mtime.toISOString();
+  } catch {
+    /* gone */
+  }
+  return { file, name: path.basename(file), firstUser, turns: pairs.length, mtime };
+}
+
+/** Render a saved JSONL transcript as readable markdown. */
+export function exportMarkdown(file, { workspace = '' } = {}) {
+  const events = fs
+    .readFileSync(file, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+  const info = sessionInfo(file);
+  const lines = [
+    `# Buddy Code transcript — ${info.name}`,
+    '',
+    workspace ? `- workspace: \`${workspace}\`` : null,
+    `- exported: ${new Date().toISOString()}`,
+    `- turns: ${info.turns}`,
+    '',
+  ].filter((x) => x !== null);
+  let turn = 0;
+  let pendingUser = null;
+  const toolTally = new Map();
+  const flushTools = () => {
+    if (!toolTally.size) return;
+    const tally = [...toolTally.entries()].map(([t, n]) => `${t}${n > 1 ? `×${n}` : ''}`).join(', ');
+    lines.push(``, `*(${[...toolTally.values()].reduce((a, b) => a + b, 0)} tool call${[...toolTally.values()].reduce((a, b) => a + b, 0) === 1 ? '' : 's'}: ${tally})*`);
+    toolTally.clear();
+  };
+  for (const e of events) {
+    if (e.type === 'user') {
+      if (pendingUser !== null) flushTools();
+      turn += 1;
+      pendingUser = String(e.text ?? '');
+      lines.push(``, `## Turn ${turn}`, '', `**You:** ${pendingUser}`, '');
+    } else if (e.type === 'tool') {
+      toolTally.set(e.tool, (toolTally.get(e.tool) || 0) + 1);
+    } else if (e.type === 'say') {
+      lines.push(`**Buddy:** ${String(e.text ?? '').replace(/\n/g, '  \n')}`, '');
+      pendingUser = null;
+      flushTools();
+    }
+  }
+  flushTools();
+  return lines.join('\n') + '\n';
+}
+
+/** Write a markdown export; returns the written path. */
+export function writeExport(root, file, { workspace = '' } = {}) {
+  const dir = path.join(root, EXPORTS_DIR);
+  fs.mkdirSync(dir, { recursive: true });
+  const out = path.join(dir, `${path.basename(file, '.jsonl')}.md`);
+  fs.writeFileSync(out, exportMarkdown(file, { workspace }), 'utf8');
   return out;
 }

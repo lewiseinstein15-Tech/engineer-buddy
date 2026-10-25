@@ -18,7 +18,7 @@ $ node src/index.js doctor
 3/4 gateways alive. Chain never fails while ≥1 is up.
 ```
 
-## Buddy Code — the terminal coding agent (v0.3)
+## Buddy Code — the terminal coding agent (v0.4)
 
 Like Claude Code, but keyless and $0. Run it in any repo:
 
@@ -28,7 +28,28 @@ buddy -p "fix the flaky login test and run the suite"   # one-shot, autonomous
 buddy init               # scaffold the harness (.buddy/harness/) in a repo
 ```
 
-You type a task. Buddy lists/reads/searches the code, edits files (with your approval per write, or `/yolo`), runs tests and commands, iterates until it works, and reports what changed and what it verified. Slash commands: `/help /learn /memory /experience /tools /yolo /status /new /sessions /quit`.
+You type a task. Buddy plans it with a **todo checklist**, lists/reads/searches the code, edits files (**colored diff preview before every write**), runs tests and commands, iterates until it works, and reports what changed and what it verified. The whole interface is hand-rolled ANSI — zero dependencies, zero install weight.
+
+**The interface, feature for feature:**
+
+| | |
+|---|---|
+| `Ctrl+C` | interrupts the running turn **and kills the running command** (process-group kill); double-tap quits |
+| `!cmd` | run a shell command yourself — trusted passthrough, policy bypassed, output inline |
+| `#note` | remember something in project memory (`.buddy/harness/MEMORY.md`) |
+| trailing `\` | multi-line tasks (like Claude Code's shift+enter) |
+| Tab | completes slash commands |
+| edit gates | `[y]es / [n]o / [a]lways` with a live **unified diff of exactly what will change** |
+
+Slash commands: `/help /new /clear /compact /cost /model /gateways /permissions /todo /tools /memory /experience /learn /review /init /export /sessions /resume /status /yolo /quit` — highlights:
+
+- `/cost` — brain calls, est. tokens, and **$0.00 spend** (keyless)
+- `/model kilo` — pin a gateway first for the session; `/model auto` restores
+- `/gateways` — parallel health probe of the whole keyless chain
+- `/compact` — force a context summarization now (auto-compaction also runs under budget pressure)
+- `/review [staged]` — Buddy reviews your uncommitted diff like a senior engineer
+- `/export` — transcript → readable markdown in `.buddy/exports/`
+- `/resume <n>` — numbered session picker; sessions record tool-call tallies
 
 ### The harness is a directory you own (Harness²)
 
@@ -196,7 +217,8 @@ The tool registry + agent core are generic (see `docs/ARCHITECTURE.md`):
 4. ~~Issue triage~~ ✅
 5. ~~Release notes~~ ✅
 6. ~~Terminal coding agent (Buddy Code + Harness² harness)~~ ✅ v0.3
-7. **Cross-repo chore runner** — "apply this migration to all my repos" (next)
-8. **Local Ollama tier** — fully offline mode for private repos
+7. ~~Complete Claude Code-style interface (diff previews, interrupt, todo plans, /cost, /review, exports)~~ ✅ v0.4
+8. **Cross-repo chore runner** — "apply this migration to all my repos" (next)
+9. **Local Ollama tier** — fully offline mode for private repos
 
 Full design rationale, failover state machine, tool taxonomy, and the safety model: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.

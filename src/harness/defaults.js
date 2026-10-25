@@ -12,6 +12,7 @@
 export const HARNESS_DIR = '.buddy/harness';
 export const EXPERIENCE_DIR = '.buddy/experience';
 export const SESSIONS_DIR = '.buddy/sessions';
+export const EXPORTS_DIR = '.buddy/exports';
 
 export const HARNESS_SURFACE = [
   `${HARNESS_DIR}/systemprompt.md`,
