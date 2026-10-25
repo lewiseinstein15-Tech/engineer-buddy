@@ -131,7 +131,7 @@ export function createInputBox({
   const handlers = {};
   let spinTimer = null;
 
-  const cols = () => Math.max(40, Math.min(process.stdout.columns || 80, 120));
+  const cols = () => Math.max(38, Math.min(process.stdout.columns || 80, 120) - 2); // 2-col safety margin: never touch the last columns
 
   // Internal writes go through this reference. install() rebinds it to the
   // ORIGINAL stdout write so box rendering can never recurse through the
@@ -310,6 +310,7 @@ export function createInputBox({
     if (spinTimer) clearInterval(spinTimer);
     clearForPrint();
     mode = 'closed';
+    write('\x1b[?25h'); // terminal cursor back on
     try { if (process.stdin.isTTY) process.stdin.setRawMode(false); } catch { /* not a tty */ }
     process.stdin.removeListener('keypress', onKeypress);
     process.stdout.removeListener('resize', onResize);
@@ -355,6 +356,7 @@ export function createInputBox({
     };
     rl._origWrite = origWrite;
     redraw();
+    write('\x1b[?25l'); // hide the terminal cursor — the box draws its own block cursor
   };
 
   return rl;

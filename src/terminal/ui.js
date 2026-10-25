@@ -50,13 +50,37 @@ function visibleLen(s) {
   return String(s).replace(/\x1b\[[0-9;]*m/g, '').length;
 }
 
-/** Draw a rounded box around text rows, sized to the widest row. */
-export function box(rows, { width = null, color = null, pad = 1 } = {}) {
+// Hard-cut a styled string to `max` visible columns, ANSI codes preserved.
+function truncateVisible(s, max) {
+  const str = String(s);
+  if (visibleLen(str) <= max) return str;
+  let out = '';
+  let w = 0;
+  for (let i = 0; i < str.length; i++) {
+    if (str[i] === '\x1b') {
+      const m = str.slice(i).match(/^\x1b\[[0-9;]*m/);
+      if (m) { out += m[0]; i += m[0].length - 1; continue; }
+    }
+    if (w >= max - 1) break;
+    out += str[i];
+    w++;
+  }
+  return out + '…';
+}
+
+/** Draw a rounded box around text rows, sized to the widest row.
+ *  Width is capped to the terminal (minus indent + safety margin) so the
+ *  borders can never wrap on narrow terminals — that wrap is what mangled
+ *  the banner on <80-col terminals in v0.5.0. */
+export function box(rows, { width = null, color = null, pad = 1, maxWidth = null } = {}) {
   const paint = color || ((x) => x);
-  const inner = Math.max(width ?? 0, ...rows.map((r) => visibleLen(r))) + pad * 2;
+  const termCap = Math.max(30, (process.stdout.columns || 80) - 4); // 2-space indent + 2-col margin
+  const cap = Math.min(maxWidth ?? Infinity, termCap);
+  const fitted = rows.map((r) => truncateVisible(r, Math.max(10, cap - pad * 2)));
+  const inner = Math.max(width ?? 0, ...fitted.map((r) => visibleLen(r))) + pad * 2;
   const top = paint(`  ╭${'─'.repeat(inner)}╮`);
   const bot = paint(`  ╰${'─'.repeat(inner)}╯`);
-  const mid = rows.map((r) => paint(`  │${' '.repeat(pad)}${r}${' '.repeat(Math.max(0, inner - pad - visibleLen(r)))}│`));
+  const mid = fitted.map((r) => paint(`  │${' '.repeat(pad)}${r}${' '.repeat(Math.max(0, inner - pad - visibleLen(r)))}│`));
   return [top, ...mid, bot].join('\n');
 }
 
