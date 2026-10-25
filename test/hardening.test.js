@@ -222,3 +222,83 @@ test('fs_search: needle is text — "/stats" searches instead of throwing unsafe
   assert.throws(() => scope.search('   '), /needle required/);
   fs.rmSync(root, { recursive: true, force: true });
 });
+
+// ── v0.9.6: raw-quote recovery (kilo v0.9.5 live failure) ────────────────────
+// kilo's exact v0.9.5 shape: a say whose message QUOTES search results —
+// raw " inside the string value AND raw newlines. extractJson and the
+// control-char pass both derail on the quotes; recoverShapedReply rebuilds it.
+const QUOTED_SAY =
+  '{"tool":"say","message":"Files mentioning the literal string `/stats`:\n\n1. **CHECKLIST.md** — checklist item for a `/stats` usage dashboard\n2. **src/tools/local.js** — old comment mentions \'ERROR: unsafe path "/stats"\'"}';
+const QUOTED_MESSAGE =
+  'Files mentioning the literal string `/stats`:\n\n1. **CHECKLIST.md** — checklist item for a `/stats` usage dashboard\n2. **src/tools/local.js** — old comment mentions \'ERROR: unsafe path "/stats"\'';
+
+test('tryRepairJson: say with raw quotes AND newlines is rebuilt (kilo v0.9.5 live case)', () => {
+  assert.deepEqual(tryRepairJson(QUOTED_SAY), { tool: 'say', message: QUOTED_MESSAGE });
+});
+
+test('tryRepairJson: quote-only sloppiness (no newlines) also recovers', () => {
+  const raw = '{"tool":"say","message":"He said "hi" and left"}';
+  assert.deepEqual(tryRepairJson(raw), { tool: 'say', message: 'He said "hi" and left' });
+});
+
+test('tryRepairJson: raw backslash before a non-escape char survives', () => {
+  const raw = '{"tool":"say","message":"path C:\\stats is raw"}';
+  assert.deepEqual(tryRepairJson(raw), { tool: 'say', message: 'path C:\\stats is raw' });
+});
+
+test('tryRepairJson: exit_plan with quoted plan — summary kept, or derived when missing', () => {
+  const withSummary =
+    '{"tool":"exit_plan","args":{"summary":"Fix /stats search","plan":"1. Read local.js with "quotes"\n2. Patch the guard"}}';
+  assert.deepEqual(tryRepairJson(withSummary), {
+    tool: 'exit_plan',
+    summary: 'Fix /stats search',
+    plan: '1. Read local.js with "quotes"\n2. Patch the guard',
+  });
+  const noSummary = '{"tool":"exit_plan","args":{"plan":"1. Do the "thing"\n2. Verify"}}';
+  assert.deepEqual(tryRepairJson(noSummary), {
+    tool: 'exit_plan',
+    plan: '1. Do the "thing"\n2. Verify',
+    summary: '1. Do the "thing"',
+  });
+});
+
+test('tryRepairJson: never rebuilds non-terminal tools (broken fs_write stays null)', () => {
+  const raw = '{"tool":"fs_write","args":{"path":"x.md","content":"multi\nline "quoted" content"}}';
+  assert.equal(tryRepairJson(raw), null);
+});
+
+test('normal mode: quoted say reaches the user as a say (kilo v0.9.5 transcript)', async () => {
+  const root = tmpRoot();
+  const { tools, harness } = makeBuddy(root);
+  const chat = createChat({ router: fakeRouter([QUOTED_SAY]), tools, harness });
+  const out = await chat.turn('which files mention /stats');
+  assert.equal(out.said, QUOTED_MESSAGE);
+  assert.equal(out.error, undefined);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('plan mode: quoted exit_plan reaches the gate with the real plan', async () => {
+  const root = tmpRoot();
+  const modes = { plan: true };
+  const { tools, harness } = makeBuddy(root, modes);
+  const approvals = [];
+  const quotedPlan =
+    '{"tool":"exit_plan","args":{"summary":"Fix /stats search","plan":"1. Read local.js with "quotes"\n2. Patch the guard"}}';
+  const chat = createChat({
+    router: fakeRouter([quotedPlan, '{"tool":"say","message":"ok"}']),
+    tools,
+    harness,
+    modes,
+    approval: async (p) => {
+      approvals.push(p);
+      return 'yes';
+    },
+  });
+  const out = await chat.turn('plan the fix');
+  assert.equal(approvals.length, 1, 'the gate fired once');
+  assert.match(approvals[0].preview, /Read local\.js with "quotes"/, 'plan text survives the quotes');
+  assert.equal(out.said, 'ok');
+  assert.equal(modes.plan, false);
+  assert.equal(listPlans(root).length, 1);
+  fs.rmSync(root, { recursive: true, force: true });
+});

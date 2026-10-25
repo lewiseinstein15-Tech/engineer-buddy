@@ -126,13 +126,92 @@ export function extractJson(text) {
   return { ok: false, value: null, error: 'no balanced JSON found' };
 }
 
+// Terminal tools whose string payload is safe to rebuild blind: worst case is
+// a slightly mangled message shown to the user — never a mangled file write.
+// fs_write/edit-style tools are deliberately NOT recoverable this way.
+const RECOVERABLE_TOOLS = new Set(['say', 'finish', 'exit_plan']);
+
+/** Decode one sloppy JSON string body: copy existing escape pairs (\n, \",
+ *  \\ …) verbatim, escape raw quotes, raw backslashes and control characters.
+ *  Returns the decoded value or null — never throws. */
+function decodeSloppyString(raw) {
+  let body = '';
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (c === '\\') {
+      const n = raw[i + 1];
+      if (n !== undefined && '"\\/bfnrtu'.includes(n)) { body += c + n; i++; }
+      else body += '\\\\'; // raw backslash — escape it, next char is handled normally
+      continue;
+    }
+    if (c === '"') body += '\\"';
+    else if (c === '\n') body += '\\n';
+    else if (c === '\r') body += '\\r';
+    else if (c === '\t') body += '\\t';
+    else body += c;
+  }
+  try {
+    return JSON.parse(`"${body}"`);
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Repair the classic small-model JSON sneeze that extractJson cannot fix:
- * literal newlines/tabs/CRs INSIDE string values (invalid JSON — kilo's
- * v0.9.3 live test emitted a whole say-message with markdown headers and
- * real newlines). Finds the first balanced {…} candidate (string-aware, like
- * extractJson), escapes control characters inside string regions, parses.
- * Returns the parsed object or null — never throws.
+ * Last-resort shape-aware recovery for TERMINAL replies (say/finish/exit_plan)
+ * whose string payload contains raw quotes — the one sloppiness control-char
+ * escaping cannot fix (kilo's v0.9.5 live test: a say quoting search results,
+ * `ERROR: unsafe path "/stats"`, left stray " inside the message string, so
+ * string-aware scanning derailed and every parse failed). Rebuilds the payload
+ * from the first quote after the known key to the last quote in the text,
+ * re-escaping only what is actually broken. Non-terminal tools return null on
+ * purpose — a broken fs_write goes to the repair retry, never to a silent,
+ * mangled rebuild. Returns the parsed object or null — never throws.
+ */
+export function recoverShapedReply(text) {
+  const s = String(text ?? '');
+  const tm = s.match(/"(?:tool|name)"\s*:\s*"([a-zA-Z_]+)"/);
+  if (!tm || !RECOVERABLE_TOOLS.has(tm[1])) return null;
+  const tool = tm[1];
+  const keyOrder = tool === 'exit_plan' ? ['plan', 'summary'] : ['message', 'summary', 'text'];
+  const out = { tool };
+  let gotPayload = false;
+  for (const key of keyOrder) {
+    const km = new RegExp(`"${key}"\\s*:`).exec(s);
+    if (!km) continue;
+    const open = s.indexOf('"', km.index + km[0].length);
+    if (open === -1) continue;
+    const close = s.lastIndexOf('"');
+    if (close <= open) continue;
+    let inner = s.slice(open + 1, close);
+    // If another "key": follows inside the span (payload listed before other
+    // keys), cut the content at the boundary quote.
+    const nextKey = inner.match(/"\s*,\s*"(?:tool|args|name|message|summary|plan|text|result)"\s*:/);
+    if (nextKey) inner = inner.slice(0, nextKey.index);
+    const value = decodeSloppyString(inner);
+    if (value === null) continue;
+    out[key] = value;
+    if (key !== 'summary') gotPayload = true;
+  }
+  if (!gotPayload) return null;
+  if (tool === 'exit_plan') {
+    if (!out.plan) out.plan = out.summary ?? '';
+    if (!out.summary) out.summary = String(out.plan).split('\n')[0].trim().slice(0, 80) || 'plan';
+  }
+  return out;
+}
+
+/**
+ * Repair the classic small-model JSON sneezes that extractJson cannot fix:
+ * (1) literal newlines/tabs/CRs INSIDE string values (kilo's v0.9.3 live
+ * test: a whole say-message with markdown headers and real newlines), and
+ * (2) raw double quotes inside string values (kilo's v0.9.5 live test: a say
+ * quoting `"/stats"` from search results — string-aware scanning derails, so
+ * the shape-aware recoverShapedReply rebuilds the terminal payload instead).
+ * Finds the first balanced {…} candidate (string-aware, like extractJson),
+ * escapes control characters inside string regions, parses; on any failure
+ * falls back to recoverShapedReply. Returns the parsed object or null —
+ * never throws.
  */
 export function tryRepairJson(text) {
   const s = String(text ?? '');
@@ -162,7 +241,7 @@ export function tryRepairJson(text) {
       }
     }
   }
-  if (end === -1) return null;
+  if (end === -1) return recoverShapedReply(s);
   const body = s.slice(start, end + 1);
   // Walk the candidate and escape raw control chars inside string regions.
   let out = '';
@@ -199,7 +278,7 @@ export function tryRepairJson(text) {
     const v = JSON.parse(out);
     return v && typeof v === 'object' ? v : null;
   } catch {
-    return null;
+    return recoverShapedReply(s);
   }
 }
 

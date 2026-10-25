@@ -168,6 +168,8 @@ Second live-test round (v0.9.4): kilo then emitted a `say`-JSON with **literal n
 
 Third round (v0.9.5) — beating research drift: kilo could still lose the plot on long plan-mode research (seven compactions in one turn dissolved the task, and it planned the wrong thing). Now the **task anchor** pins the user's task into every compaction summary (`CURRENT TASK: …` — short follow-ups like "continue" keep the previous anchor), a **mid-turn nudge at ~step 8** tells Buddy to stop researching and call `exit_plan` (the final-step nudge remains as the last resort), and `fs_search` treats its needle as **text, not a path** — searching `"/stats"` no longer throws `unsafe path`.
 
+Fourth round (v0.9.6) — raw-quote recovery: with the needle fixed, kilo's next live reply quoted the search results — `ERROR: unsafe path "/stats"` — leaving **raw double quotes inside the JSON string**, which derailed every parser (control-char escaping can't fix quotes) and killed the turn. A last-resort **shape-aware recovery** now rebuilds terminal replies (`say`/`finish`/`exit_plan`) whose payload contains raw quotes: it re-escapes only what is actually broken (raw quotes, raw backslashes, control chars) while preserving existing escapes. Deliberately limited to terminal tools — a broken `fs_write` still goes to the repair retry, never to a silent, mangled rebuild.
+
 ```text
 /plan
 ⏸ plan mode ON — Buddy researches read-only, then calls exit_plan
