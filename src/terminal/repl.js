@@ -23,6 +23,7 @@ import { buildTaskTool } from '../tools/task.js';
 import { BackgroundShells, buildBackgroundTools } from '../tools/background.js';
 import { buildSkillTool } from '../tools/skill.js';
 import { fetchDocs } from '../tools/docs.js';
+import { loadPermissions, evaluatePermission } from '../permissions.js';
 import { loadSkills } from '../skills/loader.js';
 import { buildExitPlanTool, listPlans, PLANS_DIR } from '../tools/planmode.js';
 import { listCheckpoints, restoreCheckpoint } from '../agent/checkpoints.js';
@@ -165,13 +166,15 @@ export async function createBuddySession({ root = process.cwd(), router, yolo = 
   // Hooks: the deterministic guarantee layer (.buddy/settings.json). One
   // runner per session — the REPL reads it for /hooks, the loop obeys it.
   const hooks = new HookRunner({ root });
+  // Rules engine (v0.19.0): user → project settings.json under permissions.
+  const { perms, warnings: permissionWarnings } = loadPermissions(root);
   // todoState is shared: the todo tool writes it (local.js), compaction reads
   // it (todo v2 plan anchor) — one object, one truth.
-  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, todoState, hooks, onEvent, repoMap });
+  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, todoState, hooks, permissions: perms, yolo, root, onEvent, repoMap });
   if (resumeFrom) {
     for (const m of resumeMessages(loadSession(resumeFrom))) session.messages.push(m);
   }
-  return { chat: session, tools, todoState, mcp, shells, skills, hooks, userToolWarnings };
+  return { chat: session, tools, todoState, mcp, shells, skills, hooks, userToolWarnings, permissions: perms, permissionWarnings };
 }
 
 function defaultApproval(busy) {
@@ -388,7 +391,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   const turnStart = { at: 0 };
   let lastDocs = null; // /docs result — attached to the next task (v0.17.0)
 
-  const { chat, tools, todoState, mcp, shells, skills: skillCatalog, hooks: hookRunner, userToolWarnings } = await createBuddySession({
+  const { chat, tools, todoState, mcp, shells, skills: skillCatalog, hooks: hookRunner, userToolWarnings, permissions: perms, permissionWarnings } = await createBuddySession({
     root,
     router,
     modes,
@@ -759,9 +762,36 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         if (args === 'reset') {
           chat.resetApprovals();
           say('\n  approvals reset — every risky tool asks again\n');
-        } else {
-          say(`\n  always-approved: ${chat.alwaysApproved.join(', ') || c.dim('—')} · yolo: ${yolo ? c.yellow('ON') : 'off'}\n  ${c.dim('reset: /permissions reset')}\n`);
+          break;
         }
+        if (args.startsWith('test')) {
+          // /permissions test <tool> [json-args] — evaluate a hypothetical call.
+          const rest = args.slice(4).trim();
+          const sp = rest.indexOf(' ');
+          const tName = sp < 0 ? rest : rest.slice(0, sp);
+          let tArgs = {};
+          if (sp >= 0) {
+            try { tArgs = JSON.parse(rest.slice(sp + 1)); } catch { tArgs = { command: rest.slice(sp + 1) }; }
+          }
+          if (!tName) {
+            say(`\n  usage: ${c.bold('/permissions test <tool> [json-args]')}  ${c.dim('— e.g. /permissions test bash {"command":"git status"}')}`);
+            break;
+          }
+          const v = evaluatePermission(perms, tName, tArgs, { yolo });
+          say(`\n  ${tName} ${c.dim(JSON.stringify(tArgs).slice(0, 80))}\n  → ${v === 'deny' ? c.red('DENY') : v === 'allow' ? c.green('ALLOW') : c.yellow('ask')} ${c.dim(`(defaultMode: ${perms?.defaultMode || 'ask'}, yolo: ${yolo ? 'on' : 'off'})`)}\n`);
+          break;
+        }
+        say(
+          `\n${c.bold('Permission rules')} ${c.dim('(user ~/.buddy/settings.json → project .buddy/settings.json)')}` +
+            `\n  defaultMode: ${c.bold(perms?.defaultMode || 'ask')} · yolo: ${yolo ? c.yellow('ON') : 'off'} · always-approved: ${chat.alwaysApproved.join(', ') || c.dim('—')}` +
+            (perms?.deny?.length ? `\n\n  ${c.red('deny')}:\n${perms.deny.map((r) => `    ${r}`).join('\n')}` : '') +
+            (perms?.allow?.length ? `\n\n  ${c.green('allow')}:\n${perms.allow.map((r) => `    ${r}`).join('\n')}` : '') +
+            (permissionWarnings?.length ? `\n\n  ${c.yellow('warnings: ' + permissionWarnings.join(' · '))}` : '') +
+            `\n\n  ${c.dim('rules: deny > allow > defaultMode · yolo only flips ask → allow')}` +
+            `\n  ${c.dim('grammar: Tool(spec) — Bash(git *) · fs_write(docs/**) · WebFetch(domain:github.com) · bare Tool = every call')}` +
+            `\n  ${c.dim('test one: /permissions test bash {"command":"git status"} · reset session approvals: /permissions reset')}` +
+            `\n  ${c.dim('audit trail: .buddy/audit.jsonl (every tool call, who/what/verdict)')}\n`
+        );
         break;
       case 'todo':
         say(todoState.latest ? `\n${renderTodo(todoState.latest)}\n` : '\n  (no plan yet — Buddy builds one with the todo tool when a task has steps)\n');

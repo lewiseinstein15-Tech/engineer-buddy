@@ -12,6 +12,7 @@ import { extractJson, tryRepairJson, debugLog, truncate } from '../util.js';
 import { describeTools } from './agent.js';
 import { describeSkillCatalog } from '../skills/loader.js';
 import { PLAN_TOOLS, planModePrompt } from '../tools/planmode.js';
+import { evaluatePermission, matchingRule, auditTrail } from '../permissions.js';
 import { estimateTokens } from '../brain/usage.js';
 
 export const PROTOCOL_PREAMBLE = [
@@ -93,6 +94,9 @@ export function createChat({
   todoState = null, // shared { latest: [...] | null } — todo v2 state, kept through compaction
   repoMap = null, // () => string | string — aider-style repo map injected into the system prompt
   hooks = null, // HookRunner (src/hooks.js) — user-defined lifecycle commands; null = unconfigured
+  permissions = null, // rules engine (src/permissions.js) — deny/allow/defaultMode policy
+  yolo = false, // /yolo or CLI flag — flips remaining 'ask' verdicts to allow
+  root = process.cwd(), // workspace root — the audit trail lives here
   onEvent = () => {},
 }) {
   const byName = new Map(tools.map((t) => [t.name, t]));
@@ -441,6 +445,7 @@ export function createChat({
         messages.push({ role: 'assistant', content: JSON.stringify({ tool: 'say', message: said }) });
         onEvent({ type: 'say', text: said });
         if (hooks) hooks.fireAndForget('Stop', { said }); // exit 2 is advisory only here (v1)
+        auditTrail(root, { tool, args: truncate(JSON.stringify(args ?? {}), 200), denied: false, verdict: 'said' });
         return { said, steps: step };
       }
 
@@ -479,13 +484,22 @@ export function createChat({
             } catch {
               preview = null; // a broken preview must never block the gate
             }
-            if (impl.risky && approval && !alwaysApproved.has(tool)) {
+            // Rules engine (v0.19.0): deny refuses outright, allow skips the
+            // gate, ask falls through to the interactive approval.
+            const verdict = evaluatePermission(permissions, tool, args, { yolo });
+            if (verdict === 'deny') {
+              const rule = matchingRule(permissions, tool, args, 'deny');
+              observation = `REFUSED by a permissions rule (${rule}) — this is policy from .buddy/settings.json, not a judgment call. Pick a different approach or ask the user to change the rules.`;
+              denied = true;
+            } else if (impl.risky && approval && !alwaysApproved.has(tool) && verdict === 'ask') {
               const decision = await approval({ tool, args, summary: impl.render ? impl.render(args) : truncate(JSON.stringify(args), 200), preview });
               if (decision === 'always') alwaysApproved.add(tool);
               denied = decision === 'no';
             }
             observation = denied
-              ? 'DENIED by the user: the action did NOT run. Ask the user how to proceed or pick another approach.'
+              ? verdict === 'deny'
+                ? observation // the rules-engine refusal already says WHY (which rule)
+                : 'DENIED by the user: the action did NOT run. Ask the user how to proceed or pick another approach.'
               : await impl.run(args, { signal }).catch((e) => `ERROR: ${e.message}`);
             // Loading a skill with allowed-tools arms the restriction for the
             // rest of the turn (the skill tool's success output starts with "SKILL: ").
@@ -519,6 +533,9 @@ export function createChat({
         // OnError: Buddy's extension — deterministic reactions to tool failures.
         if (!denied && String(observation).startsWith('ERROR')) hooks.fireAndForget('OnError', { tool, args, observation: truncate(String(observation), 2000) });
       }
+
+      // Audit trail (v0.19.0): every file/command operation, append-only.
+      auditTrail(root, { tool, args: truncate(JSON.stringify(args ?? {}), 200), denied, verdict: String(observation).startsWith('ERROR') || denied ? 'refused-or-failed' : 'ran' });
 
       // Approved plan → the SAME turn flows into implementation. Grant fresh
       // steps so an approval on the budget's last step isn't stranded.
