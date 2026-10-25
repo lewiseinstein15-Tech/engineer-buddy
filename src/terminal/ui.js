@@ -16,6 +16,7 @@ export const c = {
   blue: wrap('34'),
   magenta: wrap('35'),
   gray: wrap('90'),
+  inverse: wrap('7'),
 };
 
 /** The color set for markdown/diff renderers (safe fallbacks when off-TTY). */

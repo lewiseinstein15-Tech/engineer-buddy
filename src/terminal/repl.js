@@ -10,7 +10,7 @@
 //   \ continuation   multi-line tasks
 //   /compact /cost /model /gateways /permissions /review /export …
 // Headless: `buddy -p "task"` runs one turn autonomously (CI-style).
-import readline from 'node:readline';
+import { createInputBox } from './inputbox.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -222,6 +222,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           if (qToken !== token) return;
           qToken += 1;
           approvalDeny = null;
+          rl.cancelQuestion();
           resolve('no');
         };
         rl.question(`  ${c.dim(`[y] yes · [n] no · [a] always (${tool}) · Ctrl+C deny`)} > `, (ans) => {
@@ -237,7 +238,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       events.push(ev);
       if (ev.type === 'tool') {
         toolCallsThisTurn += 1;
-        spin.setText(`working · ${toolCallsThisTurn} tool call${toolCallsThisTurn === 1 ? '' : 's'}`);
+        rl.setBusy(`working · ${toolCallsThisTurn} tool call${toolCallsThisTurn === 1 ? '' : 's'}`);
         lastGateway = ev.gateway || lastGateway;
         try {
           recorder?.append({ type: 'tool', tool: ev.tool, args: { _preview: truncate(JSON.stringify(ev.args), 160) }, observation: truncate(ev.observation, 160), denied: ev.denied });
@@ -259,22 +260,26 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     return recorder;
   };
 
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    prompt: c.cyan('buddy❯ '),
-    historySize: 400,
+  const rl = createInputBox({
+    title: 'Buddy',
+    placeholder: 'type a task…   (/help commands · ! shell · # remember)',
+    hint: 'enter send · \\ wrap · ↑↓ history · esc stop · ctrl+c quit',
+    statusRight: () => {
+      try {
+        const ctxK = (chat.historyChars() / 1000).toFixed(1);
+        return `v${VERSION} · ${lastGateway || router.order[0]} · ${ctxK}k ctx`;
+      } catch { return `v${VERSION} · ${lastGateway || router.order[0]}`; }
+    },
     completer: (line) => {
       if (line.startsWith('/')) {
-        const hits = SLASH_COMMANDS.filter((n) => `/${n}`.startsWith(line)).map((n) => `/${n}`);
-        return [hits, line];
+        return SLASH_COMMANDS.filter((n) => `/${n}`.startsWith(line)).map((n) => `/${n}`);
       }
-      return [[], line];
+      return [];
     },
   });
+  rl.install();
 
   const say = (s) => console.log(s);
-  const spin = spinner('Buddy working');
 
   // ── Slash command handlers ────────────────────────────────────────────────
 
@@ -606,6 +611,11 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     rl.prompt(true);
   });
 
+  // ── Esc routing: interrupt a running turn (Claude Code style) ──────────────
+  rl.on('escape', () => {
+    if (busy && aborter) aborter.abort();
+  });
+
   // ── Input pipeline ─────────────────────────────────────────────────────────
   rl.prompt();
   rl.on('line', async (line) => {
@@ -716,10 +726,10 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     turnStart.at = Date.now();
     aborter = new AbortController();
     ensureRecorder(input).append({ type: 'user', text: input });
-    spin.setText('Buddy working');
+    rl.setBusy('Buddy working…');
     try {
       const out = await chat.turn(input, { signal: aborter.signal });
-      spin.stop();
+      rl.setBusy(null);
       recorder.append({ type: 'say', text: out.said ?? '' });
       lastTask.events = events;
       // Claude-Code-style turn footer.
@@ -729,7 +739,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       console.log(c.gray(`  ⏱ ${secs.toFixed(1)}s · ${toolCallsThisTurn} tool call${toolCallsThisTurn === 1 ? '' : 's'} · ${ctxK}k ctx${out.steps ? c.gray(` · ${out.steps} steps`) : ''}${gw ? c.gray(` · ${gw}`) : ''}`));
       debugLog(`turn done: steps=${out.steps} said=${out.said ? 'yes' : 'no'}`);
     } catch (e) {
-      spin.stop();
+      rl.setBusy(null);
       console.log(`  ${c.red('turn failed')}: ${truncate(e.message, 300)}`);
     }
     aborter = null;
