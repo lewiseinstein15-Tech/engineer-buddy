@@ -33,6 +33,7 @@ import { SessionRecorder, listSessions, loadSession, sessionInfo, resumeMessages
 import { reflect, recentLessons, experiencePath } from '../learn.js';
 import { c, PALETTE, logoBanner, spinner, renderToolCall, renderToolEvent, renderTodo, renderTable, formatMs, renderContextBar } from './ui.js';
 import { renderMarkdown } from './markdown.js';
+import { expandMentions } from './mentions.js';
 import { truncate, debugLog } from '../util.js';
 
 // Version always comes from package.json so the banner can never drift from the release.
@@ -237,7 +238,15 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
     },
   });
   if (hooks?.size) hooks.fireAndForget('SessionStart', { mode: 'one-shot' });
-  const out = await chat.turn(task);
+  // @file mentions work headless too: `buddy -p "explain @src/app.js"`.
+  let taskText = task;
+  try {
+    const ex = expandMentions(task, { root });
+    if (ex.attached.length) taskText = ex.text + ex.block;
+  } catch {
+    /* mentions are best effort — the raw task still runs */
+  }
+  const out = await chat.turn(taskText);
   return { ...out, events };
 }
 
@@ -437,6 +446,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
             `  ${c.bold('type a task')}      give Buddy work ("add input validation to X")`,
             `  ${c.bold('\\ at line end')}   continue on the next line (multi-line tasks)`,
             `  ${c.bold('!cmd')}            run a shell command yourself (trusted, no gate)`,
+            `  ${c.bold('@path')}           attach a file to the task (e.g. explain @src/app.js)`,
             `  ${c.bold('#note')}           remember a note in project memory (${HARNESS_DIR}/MEMORY.md)`,
             `  ${c.bold('Ctrl+C')}          interrupt the running task · twice to quit`,
             '',
@@ -1045,12 +1055,34 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       return;
     }
 
-    // A real task for Buddy.
-    await runTask(input);
+    // A real task for Buddy. @file mentions attach the referenced files as
+    // read-only context (Claude Code style) — refused paths degrade to a note.
+    // The transcript/anchor keep the RAW task; only the model sees the block.
+    let taskText = input;
+    let taskOpts = {};
+    try {
+      const ex = expandMentions(input, { root });
+      if (ex.attached.length) {
+        for (const a of ex.attached) {
+          say(
+            `  ${a.ok ? c.green('+') : c.yellow('!')} ${a.path}${
+              a.ok
+                ? c.gray(a.kind === 'dir' ? ` (${a.entries} entr${a.entries === 1 ? 'y' : 'ies'})` : ` (${a.lines} lines${a.bytes ? `, ${(a.bytes / 1024).toFixed(1)}kb` : ''})`)
+                : c.gray(` (${a.error})`)
+            }`
+          );
+        }
+        taskText = ex.text + ex.block;
+        taskOpts = { recordAs: ex.text, anchor: ex.text };
+      }
+    } catch {
+      /* mentions are best effort — the raw input still runs */
+    }
+    await runTask(taskText, taskOpts);
   }
 
   /** One Buddy turn (shared by plain tasks and /<skill-name> invocations). */
-  async function runTask(inputText, { skill = null, recordAs = null } = {}) {
+  async function runTask(inputText, { skill = null, recordAs = null, anchor = null } = {}) {
     if (busy) {
       say('  (Buddy is still working — one task at a time, Ctrl+C to interrupt)');
       rl.prompt();
@@ -1066,7 +1098,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     ensureRecorder(recorded).append({ type: 'user', text: recorded });
     rl.setBusy(skill ? `Buddy working · /${skill.name}…` : 'Buddy working…');
     try {
-      const out = await chat.turn(inputText, { signal: aborter.signal, skill });
+      const out = await chat.turn(inputText, { signal: aborter.signal, skill, anchor });
       rl.setBusy(null);
       recorder.append({ type: 'say', text: out.said ?? '' });
       lastTask.events = events;

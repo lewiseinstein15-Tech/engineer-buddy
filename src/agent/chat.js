@@ -215,7 +215,7 @@ export function createChat({
    * Run one user turn to completion.
    * @returns {{said:string|null, steps:number}}
    */
-  async function turn(userText, { signal = null, skill = null } = {}) {
+  async function turn(userText, { signal = null, skill = null, anchor = null } = {}) {
     // UserPromptSubmit hook: exit 2 refuses the prompt BEFORE it enters the
     // conversation or costs a brain call (deterministic gatekeeper).
     if (hooks) {
@@ -229,7 +229,10 @@ export function createChat({
     onEvent({ type: 'user', text: String(userText) });
     // Task anchor: real tasks pin/replace; short follow-ups ("continue",
     // "go on", "yes") keep the previous anchor so compaction keeps the goal.
-    const taskText = String(userText).trim();
+    // The anchor can be overridden (@file mentions: anchor the RAW task, not
+    // the message with the whole attachment block — otherwise every compaction
+    // summary would re-embed thousands of chars of attached file).
+    const taskText = String(anchor ?? userText).trim();
     if (taskText.length > 20 || !currentTask) currentTask = taskText;
     const callCounts = new Map();
     const lastArgs = new Map(); // research-repeat guard: tool -> JSON of last args
