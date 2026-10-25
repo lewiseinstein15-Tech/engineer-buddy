@@ -55,7 +55,7 @@ Slash commands: `/help /new /clear /compact /cost /model /gateways /permissions 
 - `/cost` — brain calls, est. tokens, and **$0.00 spend** (keyless)
 - `/model kilo` — pin a gateway first for the session; `/model auto` restores
 - `/gateways` — parallel health probe of the whole keyless chain
-- `/compact` — force a context summarization now (auto-compaction also runs under budget pressure)
+- `/compact` — force a context summarization now (auto-compaction also runs at ~80% of the budget, see below)
 - `/review [staged]` — Buddy reviews your uncommitted diff like a senior engineer
 - `/agents` — the sub-agent crew: what each one can touch, and how to add your own
 - `/mcp` — MCP servers + their tools (from `.buddy/mcp.json`)
@@ -236,6 +236,10 @@ The gate is a human decision; hooks are machine law. Put shell commands in `.bud
     "pre_edit":   "node scripts/require-test-first.js"
 }}
 ```
+
+### Auto-compact — the loop shrinks context BEFORE the wall (v0.12.0)
+
+Compaction used to wait until history hit **100%** of the char budget — the turn that hit the wall paid for the full window first, and the free gateways' token caps punished the biggest turns the most. Now the loop compacts **proactively at ~80%** (`↺ context near budget — auto-compacted`), keeping the 100% wall as a backstop that bypasses every guard. An anti-churn guard stops the opposite failure (v0.9.4's live lesson: seven compactions in one turn dissolving the task) — a soft over-80% state with fewer than six fresh messages waits, the hard wall never does. `/context` shows where the trigger sits (`auto-compact at ~38.4k chars (80% of budget)`), and manual `/compact` still forces a pass anytime.
 
 ### Safety model (terminal mode)
 

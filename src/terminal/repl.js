@@ -166,7 +166,11 @@ function makeRenderer({ quiet = false, toolByName = new Map() } = {}) {
     } else if (ev.type === 'interrupted') {
       console.log(`\n  ${c.yellow('⏸')} interrupted — nothing lost, say "continue" to resume\n`);
     } else if (ev.type === 'compaction') {
-      console.log(c.gray(`  ↺ context compacted (${ev.dropped} messages summarized)`));
+      console.log(
+        ev.auto
+          ? c.gray(`  ↺ context near budget — auto-compacted (${ev.dropped} messages summarized; /context for the window)`)
+          : c.gray(`  ↺ context compacted (${ev.dropped} messages summarized)`)
+      );
     } else if (ev.type === 'subagent') {
       if (ev.phase === 'step') console.log(c.gray(`  ↳ ${ev.agent} · ${ev.tool}`));
       else if (ev.phase === 'done') console.log(c.gray(`  ↳ ${ev.agent} finished`));

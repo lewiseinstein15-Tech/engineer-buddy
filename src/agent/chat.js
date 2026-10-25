@@ -27,6 +27,13 @@ export const PROTOCOL_PREAMBLE = [
 // observation instead of silently returning the same result again.
 const REPEAT_HINT_TOOLS = new Set(['fs_search', 'fs_read', 'fs_list', 'web_search', 'web_fetch']);
 
+// Auto-compact threshold (P1): compaction used to wait until the history hit
+// 100% of the budget — the turn that hit the wall paid for the FULL window
+// before shrinking, and gateway token caps punished the biggest turns the
+// most. Now the loop compacts proactively at ~80% and keeps the hard wall as
+// a backstop. Exported for tests and the /context surface.
+export const AUTO_COMPACT_AT = 0.8;
+
 export function buildSystemPrompt({ harness, tools, skills = [], planMode = false }) {
   // Plan mode swaps the visible tool list right here: only research tools +
   // exit_plan stay; normal mode hides exit_plan so the model never sees a
@@ -85,6 +92,10 @@ export function createChat({
   const alwaysApproved = new Set(); // tools the user said "always" for
   let messages = []; // {role, content}; system prompt inserted lazily
   let compactCount = 0;
+  // Anti-churn guard: auto-compaction needs a few fresh messages since the
+  // last one (the v0.9.4 live test saw SEVEN compactions churn one turn).
+  // The hard wall (>100%) and /compact bypass it.
+  let lastCompactLen = 0;
   // Task anchor: long compaction churn can dissolve the user's task into a
   // summary-of-summaries (v0.9.4 live test: seven compactions in one turn and
   // kilo planned the WRONG task). The current task is pinned into every
@@ -104,7 +115,15 @@ export function createChat({
   const historyChars = () => messages.reduce((n, m) => n + m.content.length, 0);
 
   async function maybeCompact(force = false) {
-    if (!force && historyChars() <= charBudget) return;
+    const chars = historyChars();
+    if (force) {
+      // /compact — always tries.
+    } else {
+      const soft = chars > charBudget * AUTO_COMPACT_AT;
+      const hard = chars > charBudget; // backstop: never refuse relief at 100%
+      if (!soft) return;
+      if (!hard && messages.length - lastCompactLen < 6) return;
+    }
     // PreCompact hook: a user command can veto compaction this round (exit 2).
     if (hooks) {
       const r = await hooks.run('PreCompact', { chars: historyChars(), forced: Boolean(force) });
@@ -151,8 +170,9 @@ export function createChat({
         ...tail,
       ];
       compactCount++;
-      onEvent({ type: 'compaction', kept: tail.length, dropped: head.length });
-      debugLog(`chat: compacted ${head.length} messages into a summary`);
+      lastCompactLen = messages.length;
+      onEvent({ type: 'compaction', kept: tail.length, dropped: head.length, auto: !force });
+      debugLog(`chat: compacted ${head.length} messages into a summary (auto=${!force})`);
     } catch (e) {
       debugLog(`chat: compaction skipped (${e.message})`);
     }
@@ -460,6 +480,7 @@ export function createChat({
       system,
       conversation: historyChars(),
       budget: charBudget,
+      autoAt: Math.round(charBudget * AUTO_COMPACT_AT),
       turns: messages.length,
       planMode: plan,
     };

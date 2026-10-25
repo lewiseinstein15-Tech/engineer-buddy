@@ -143,7 +143,7 @@ export function renderFilePreview({ path, op, bytes }) {
 }
 
 /** Context budget bar — where the window actually goes (/context). */
-export function renderContextBar({ parts, system, conversation, budget, turns, planMode }, { indent = '  ' } = {}) {
+export function renderContextBar({ parts, system, conversation, budget, turns, planMode, autoAt }, { indent = '  ' } = {}) {
   const k = (n) => `${(n / 1000).toFixed(1)}k`;
   const tok = (n) => `~${Math.round(n / 4 / 100) / 10}k tok`;
   const width = 26;
@@ -162,6 +162,9 @@ export function renderContextBar({ parts, system, conversation, budget, turns, p
     `${indent}${c.gray('system prompt (always loaded)')}`,
     renderTable(rows, { indent: indent + '  ' }),
     `${indent}${c.gray('system total')} ${c.bold(k(system))} chars ${c.gray(tok(system))} · ${c.gray('compaction keeps the last 4 messages and summarizes the rest')}`,
+    ...(autoAt
+      ? [`${indent}${c.gray(`auto-compact at ~${k(autoAt)} chars (80% of budget) — the loop summarizes BEFORE the wall, /compact forces it anytime`)}`]
+      : []),
     '',
   ].join('\n');
 }
