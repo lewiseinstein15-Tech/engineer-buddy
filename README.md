@@ -218,6 +218,10 @@ Buddy's plan list grew up: items can now declare **dependencies** (`blocked_by`)
   ○ #3 run the suite · after #2
 ```
 
+### The glob tool — path questions answered directly (v0.10.1)
+
+Small models keep asking path questions with the content search. Now they have the right tool: `glob {"pattern":"src/**/*.js"}` — pure-JS, zero-dep matching with `**` globstars, `?`, `[abc]` classes and `{a,b}` braces, walking the same ignore list as `fs_list` (node_modules, .git, dot-dirs are invisible). Results are sorted, capped at 200 with a hint to narrow the pattern, and the tool is read-only — so it is allowed in plan mode too.
+
 ### Safety model (terminal mode)
 
 - **Approval gates** — writes, edits, and shell commands ask `[y]es / [n]o / [a]lways` unless you `/yolo`. One-shot mode (`-p`) is autonomous; add `--safe` to deny all writes. Plan mode (above) is the strongest gate: **nothing mutates until the plan itself is approved**.

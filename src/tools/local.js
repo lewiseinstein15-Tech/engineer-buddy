@@ -189,6 +189,14 @@ export class LocalScope {
     return this.repo.search(q, { max: 15, ...opts });
   }
 
+  /** Glob file matching (path question, not a content search). */
+  glob(pattern) {
+    const p = String(pattern ?? '').trim();
+    if (!p) throw new BuddyError('glob: pattern required (e.g. "src/**/*.js")', { code: 'BAD_PATTERN' });
+    if (p.includes('..')) throw new BuddyError(`unsafe glob pattern "${p}"`, { code: 'UNSAFE_PATH' });
+    return this.repo.globFiles(p);
+  }
+
   /** Snapshot a file into .buddy/checkpoints BEFORE the agent mutates it.
    *  Best effort — a checkpoint failure must never block the write. */
   _snap(rel, tool) {
@@ -339,6 +347,24 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
       run: async ({ needle, regex = false } = {}) => {
         const hits = scope.search(String(needle), { regex: Boolean(regex) });
         return hits.map((h) => `${h.file}:${h.line}: ${h.text}`).join('\n') || '(no matches)';
+      },
+    },
+    {
+      name: 'glob',
+      description:
+        'Find files by path pattern (NO content search — use fs_search for that). Supports ** globstars, *, ?, [abc] and {a,b} braces: "src/**/*.js", "test/**/*.{test,spec}.js".',
+      args: '{"pattern":"src/**/*.js"}',
+      render: (a) => `glob ${a?.pattern}`,
+      run: async ({ pattern } = {}) => {
+        let hits;
+        try {
+          hits = scope.glob(pattern);
+        } catch (e) {
+          return `ERROR: ${e.message}`;
+        }
+        if (!hits.length) return `(no files match ${String(pattern).trim()})`;
+        const shown = hits.slice(0, 200);
+        return `${hits.length} file(s):\n${shown.join('\n')}${hits.length > shown.length ? `\n… (+${hits.length - shown.length} more — narrow the pattern)` : ''}`;
       },
     },
     {

@@ -22,6 +22,7 @@ export const PLAN_TOOLS = new Set([
   'fs_list', // research
   'fs_read',
   'fs_search',
+  'glob', // path matching (read-only)
   'web_search', // docs lookup (read-only, safe-flagged)
   'web_fetch',
   'skill', // loading a playbook is read-only; its allowed-tools still bind
@@ -34,7 +35,7 @@ export const PLANS_DIR = '.buddy/plans';
 export function planModePrompt() {
   return [
     '## Plan mode (READ-ONLY)',
-    'Plan mode is ON. You may ONLY use these tools: fs_search, fs_read, fs_list, web_search, web_fetch, todo, skill, exit_plan.',
+    'Plan mode is ON. You may ONLY use these tools: fs_search, fs_read, fs_list, glob, web_search, web_fetch, todo, skill, exit_plan.',
     'Everything else (fs_write, fs_replace, fs_append, bash, task, MCP tools, background shells) is blocked until the user approves your plan.',
     'Workflow: research the code until you understand the change, then IMMEDIATELY call exit_plan. Do not research for more than ~8 steps — a good plan now beats a perfect plan never.',
     'Deliver the plan ONLY through the exit_plan tool: {"tool":"exit_plan","args":{"summary":"one line","plan":"markdown"}}. NEVER write the plan as a plain-text reply — it will be lost.',
