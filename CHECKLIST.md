@@ -86,7 +86,7 @@ Sources: Claude Code official docs (code.claude.com/docs), the full 18-tool syst
 
 ## 6. P2 — Version Control (Buddy's extended wishlist)
 
-- [ ] **Full git tool suite** — dedicated `git` tool wrapping diff, log, blame, branch, merge, rebase, push, stash — parsed and summarized for the model (not raw shell soup).
+- [x] **Full git tool suite** — dedicated `git` tool wrapping diff, log, blame, branch, merge, rebase, push, stash — parsed and summarized for the model (not raw shell soup). **✅ shipped v0.20.0 (read-only half)** — one `git` tool, seven READ-ONLY ops with parsed output: `status` (porcelain → human table: branch + new/modified/deleted tags), `diff` (stat), `diff_patch` (capped -U3), `log` (oneline, -n 1-100), `blame`, `branch` (-a -v), `show` (stat+message); caps + honest errors (`not a git repository`, unknown paths); **write ops (commit/push/merge/rebase/reset) are refused by design** with a pointer to the bash approval gate — mutations stay human-gated; read-only → no approval gate, added to PLAN_TOOLS. Merge/rebase/stash helpers stay open (they are writes; the refusal message routes them to bash). 6 tests on real git fixtures.
 - [ ] **GitHub/GitLab API tool** — PR creation, review comments, CI status checks (via `gh` CLI or REST with the user's token — never Buddy's own keys); `/ci` shows latest run status per branch.
 - [ ] **Conflict resolution assistance** — on merge/rebase conflict, present both sides + base to the model, propose a resolution, apply after approval gate.
 

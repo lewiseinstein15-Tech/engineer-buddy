@@ -23,6 +23,7 @@ export const PLAN_TOOLS = new Set([
   'fs_read',
   'fs_search',
   'glob', // path matching (read-only)
+  'git', // read-only ops: status/diff/log/blame/branch/show (v0.20.0)
   'symbol_search', // code navigation (read-only, v0.16.0)
   'go_to_def',
   'find_refs',

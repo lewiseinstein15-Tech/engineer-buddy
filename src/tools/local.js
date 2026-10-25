@@ -14,6 +14,7 @@ import { isAgentDeniedPath } from '../harness/scaffold.js';
 import { renderTextDiff, renderDiff, diffLines } from '../terminal/difflib.js';
 import { createTestTool } from './testrunner.js';
 import { createSymbolIndexProvider, searchDefs, formatDef, findRefsIn } from '../agent/symbols.js';
+import { buildGitTool } from './gittool.js';
 import { createLspHub, lspExtFor, formatDiagnostics } from '../agent/lsp.js';
 import { snapshotPaths } from '../agent/checkpoints.js';
 
@@ -408,6 +409,7 @@ function fmtResult(r) {
  */
 export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { latest: null }, symbolIndex = null, lspEnabled = true } = {}) {
   const testTool = createTestTool({ root: scope.root });
+  const gitTool = buildGitTool({ root: scope.root });
   // Symbol index (v0.16.0) — lazy provider, shared TTL cache; read-only.
   const syms = symbolIndex || createSymbolIndexProvider(scope.root);
   // LSP hub (v0.17.0) — lazy per-language connections to the repo's own
@@ -429,6 +431,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     : DIAG_OFF;
   return [
     testTool,
+    gitTool,
     {
       name: 'todo',
       description:
