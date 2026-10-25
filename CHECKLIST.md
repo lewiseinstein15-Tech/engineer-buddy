@@ -4,7 +4,9 @@
 
 How to use: tick `- [ ]` → `- [x]` as things ship. Priority order: P0 (core parity) → P1 (important) → P2 (polish) → P3 (nice-to-have). Every "impl hint" respects the zero-dep + keyless constraints.
 
-Sources: Claude Code official docs (code.claude.com/docs), the full 18-tool system-prompt dump (Dec 2025), 33 hook events reference, plus best ideas from opencode, Gemini CLI, aider, Codex CLI.
+Sources: Claude Code official docs (code.claude.com/docs), the full 18-tool system-prompt dump (Dec 2025), 33 hook events reference, best ideas from opencode / Gemini CLI / aider / Codex CLI, plus Buddy's own extended wishlist (v0.6 session, preserved verbatim categories).
+
+**North star (Buddy's integration vision):** MCP servers are the plugin runtime. Subagents use MCP tools. Narration streams from all levels. One unified protocol.
 
 ---
 
@@ -16,7 +18,7 @@ Sources: Claude Code official docs (code.claude.com/docs), the full 18-tool syst
 - [x] Bottom input box, `/` command palette, busy footer with live timer + "esc to interrupt"
 - [x] Agent loop: JSON tool protocol, protocol-repair retry, per-turn tool caps
 - [x] Tools: `todo, fs_list, fs_read, fs_search, fs_write, fs_replace, fs_append, bash, say`
-- [x] Approval gates (yes / no / always) for risky tools + `/yolo` bypass
+- [x] Approval gates (yes / no / always) for risky tools + `/yolo` bypass — human-in-the-loop
 - [x] Session persistence: `.buddy/sessions/*.jsonl`, `/sessions`, `/resume`, `/export`
 - [x] `/compact` context summarization, `/clear`, `/new`
 - [x] Harness² file surface: `.buddy/harness/` (systemprompt, guardrails, MEMORY.md, tool_guidance, skills/SKILL.md)
@@ -29,16 +31,17 @@ Sources: Claude Code official docs (code.claude.com/docs), the full 18-tool syst
 
 ## 1. P0 — Core agent parity (the things that make Claude Code feel like Claude Code)
 
-- [ ] **Subagents (`task` tool)** — spawn child agent loops with their own context; return one final report. Custom agents as `.buddy/agents/*.md` (name, description, tool allowlist). Built-in `explore` (fast codebase search) + `plan` (read-only architect) agent types. Parallel launch (several tasks in one step). *Impl: reuse the existing chat loop with a fresh message array + tool subset; kill on turn end.*
-- [ ] **MCP client** — hand-rolled JSON-RPC 2.0 over stdio transport (+ Streamable HTTP later); config in `.buddy/mcp.json` (local / project scopes); `/mcp` command (list, status, reconnect); discovered tools surfaced to the model as `mcp__<server>__<tool>`; server prompts become slash commands. *Impl: ~300 lines of zero-dep stdio JSON-RPC; do stdio first — most community servers support it.*
+- [ ] **Subagents (`task` tool)** — spawn child agent loops with scoped context; return one final report. Custom agents as `.buddy/agents/*.md` (name, description, tool allowlist). Built-in `explore` (fast codebase search) + `plan` (read-only architect) types. Parallel launch (several tasks in one step). Specialized presets: `test-writer`, `refactorer`, `doc-generator`, `security-auditor`. Parent orchestrates: decompose → delegate → aggregate. Shared fs workspace + structured message bus. **Budget limits** (max tokens / max time / max file edits per subagent), **failure isolation** (subagent crash never kills the parent), **recursive delegation with depth limit**. *Impl: reuse the existing chat loop with a fresh message array + tool subset.*
+- [ ] **MCP client** — hand-rolled JSON-RPC 2.0; config in `.buddy/mcp.json` (local / project scopes); `/mcp` command (list, status, reconnect); discovered tools surfaced to the model as `mcp__<server>__<tool>`; server prompts become slash commands; capability negotiation at connect time; JSON Schema tool definitions. Transports: **stdio first** (most community servers), then Streamable HTTP, then SSE / WebSocket. *Impl: ~300 lines of zero-dep stdio JSON-RPC.*
 - [ ] **Skills v2 (SKILL.md open standard)** — frontmatter (`name`, `description`, `allowed-tools`, `disable-model-invocation`); model auto-triggers from the description; user invokes via `/skill-name`; supporting files next to SKILL.md; migrate the 5 hardcoded JS skills to SKILL.md; auto-discover in `.buddy/harness/skills/` + `~/.buddy/skills/`.
-- [ ] **Web tools** — `web_fetch` (URL → readable text, HTML→text conversion, size cap, timeout) and `web_search` (keyless endpoint — DuckDuckGo HTML/lite or pollinations search; title+snippet results). Domain allow/deny rules in permissions. *This closes the biggest capability gap — the model itself declined web work in your live test.*
-- [ ] **Background bash** — `run_in_background` on the `bash` tool, shell registry, `bash_output` (incremental polling), `kill_shell`, `/tasks` command listing live shells. *Impl: `child_process.spawn` unref'd + ring buffer of output.*
+- [ ] **Web tools** — `web_fetch` (URL → readable text, HTML→text, size cap, timeout) and `web_search` (keyless endpoint — DuckDuckGo HTML/lite or pollinations search; title+snippet results). Domain allow/deny rules in permissions. *This closes the biggest capability gap — the model itself declined web work in your live test.*
+- [ ] **Background bash with output streaming** — `run_in_background` on the `bash` tool, shell registry, `bash_output` (incremental polling / streamed tails for dev servers + watch mode), `kill_shell`, `/tasks` command listing live shells. *Impl: `child_process.spawn` unref'd + ring buffer of output.*
 - [ ] **Plan mode** — read-only mode (todo/read/search/list only) until a plan is approved; shift+tab cycles normal → auto-accept → plan; `exit_plan` tool asks approval with the plan text; plans saved under `.buddy/plans/`.
-- [ ] **Checkpoints & `/rewind`** — automatic snapshot of every file the agent touches (content-addressed store under `.buddy/checkpoints/`); `/rewind` restores code / conversation / both; double-Esc opens rewind menu. *Impl: store full file contents before first edit per file per turn — a few hundred lines total.*
-- [ ] **Hooks engine** — user-defined shell commands at lifecycle points: `SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, PreCompact, SessionEnd`. Matchers on tool name; exit 0 = allow, exit 2 = block (stderr fed back to the model); JSON on stdin; config in settings; `/hooks` command. *This is CC's "deterministic guarantee" layer — formatters, command guards, completion gates.*
+- [ ] **Checkpoints & `/rewind`** — automatic snapshot of every file the agent touches (content-addressed store under `.buddy/checkpoints/`); `/rewind` restores code / conversation / both; double-Esc opens rewind menu; rollback for multi-step edits. *Impl: store full file contents before first edit per file per turn.*
+- [ ] **Hooks engine** — user-defined shell commands at lifecycle points: `SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, PreCompact, SessionEnd` (aliases: pre_edit / post_edit / pre_command / post_command / on_error). Matchers on tool name; exit 0 = allow, exit 2 = block (stderr fed back to the model); JSON on stdin; config in settings; `/hooks` command. *This is CC's "deterministic guarantee" layer.*
 - [ ] **`glob` tool** — recursive `**` pattern file matching (pure JS), separate from content search; plus a tree-style `ls` view. *The model currently abuses fs_search for path questions.*
 - [ ] **`multi_edit` + fs_replace hardening** — batch several edits to one file atomically; `replace_all` flag; uniqueness enforcement with helpful error; file-freshness check (reject edit if file changed since last read — CC's "file modified" guard).
+- [ ] **Todo v2 — dependency-aware plans** — structured plan items with `blocked_by` dependencies (DAG, not a linear list), per-item notes, auto-promotion of unblocked items, todo state preserved through compaction.
 
 ## 2. P1 — Context & memory (do big things with a small context window)
 
@@ -50,15 +53,52 @@ Sources: Claude Code official docs (code.claude.com/docs), the full 18-tool syst
 - [ ] **Image input** — paste screenshot → base64 → vision-capable gateway (pollinations vision) so Buddy can do UI work from a screenshot.
 - [ ] **MEMORY.md imports** — `@path` syntax to pull other files into memory; `# note` one-line quick-append from the input line.
 
-## 3. P1 — Extensibility (plugins, commands, the ecosystem layer)
+## 3. P1 — Extensibility (plugins, tools, the ecosystem layer)
 
 - [ ] **Custom slash commands** — markdown files in `.buddy/commands/*.md` + `~/.buddy/commands/` become `/name`; `$ARGUMENTS`, `$1`-style substitution; frontmatter: `allowed-tools`, `description`, `argument-hint`. (CC merged these into skills — keep both paths working.)
-- [ ] **Plugins** — one folder bundling skills + hooks + agents + mcp.json fragments; `/plugin add <owner>/<repo>` installs from a git repo; `/plugin` list / enable / disable. *Zero-dep loader: plain files + git clone, no npm.*
+- [ ] **User-defined tools from `.buddy/tools/`** — each tool is a folder: `tools/<name>/manifest.json` (name, description, JSON Schema args, version) + `index.js` (zero-dep ESM, loaded at startup); user tools appear in the tool registry alongside built-ins.
+- [ ] **Tool versioning + deprecation policy** — manifest carries `version`; registry logs deprecation warnings to the model; v1 contract frozen early so plugins don't break.
+- [ ] **Tool sandboxing** — user tools run in an isolated child process (or WASM later) with resource + fs scope; a crashing tool never kills the REPL.
+- [ ] **Tool composition** — simple pipe syntax so one tool's output feeds another (model-driven chaining first; explicit composition syntax later).
+- [ ] **MCP server mode** — Buddy also *exposes* its own capabilities (read repo, run tests, apply patch, todo state) as an MCP stdio server so other agents (Claude Code, opencode) can drive Buddy. *Symmetry with the MCP client; stdio only at first.*
+- [ ] **Plugins** — one folder bundling skills + hooks + agents + mcp.json fragments + tools; `/plugin add <owner>/<repo>` installs from a git repo; `/plugin` list / enable / disable. *Zero-dep loader: plain files + git clone, no npm.*
 - [ ] **Plugin marketplace** — a curated git repo (or GitHub topic `engineer-buddy-plugin`) listing community plugins; `/plugin browse`.
+- [ ] **Language packs** — TS/Python/Go/Rust analyzer plugins (wire into the LSP/symbol tools below per language).
+- [ ] **Framework packs** — React, Next.js, Django, Rails convention packs (MEMORY.md templates + guardrails + skill recipes).
+- [ ] **Custom reporters** — Slack, Linear, Jira, Notion notification/report plugins (via the HTTP tool + hooks).
 - [ ] **Output styles** — `/output-style` (default / explanatory / learning + custom .md file) that swaps the system-prompt wrapper.
 - [ ] **Statusline customization** — `/statusline` template or script: branch, gateway, ctx %, session cost, todo count.
 
-## 4. P2 — UX & TUI polish (feel identical to Claude Code)
+## 4. P1 — Code Intelligence (Buddy's extended wishlist)
+
+- [ ] **LSP integration** — full client over stdio JSON-RPC to the repo's own language servers: go-to-definition, find-references, rename, **diagnostics after every edit** (errors feed back to the model automatically), completions for the model's context. *Zero-dep: spawn `typescript-language-server` / `pylsp` / `gopls` if present. The single highest-leverage item here — catches breakage without running the test suite.*
+- [ ] **Symbol index** — persistent cross-file index of defs/references (rebuilt on fs events) powering fast navigation tools: `symbol_search`, `find_refs`, `go_to_def` without a language server. *Pairs with the repo map.*
+- [ ] **Call graph / dependency analysis** — from the symbol index: callers/callees of a function, import graph, impact analysis ("what breaks if I change this?").
+- [ ] **Type-aware edits** — use LSP/type info to validate edits before applying (signature mismatches, unknown symbols flagged), not just text replacement.
+- [ ] **Documentation lookup** — `/docs <lib>` fetches official docs (devdocs.io / official sites) into context, cached.
+
+## 5. P1 — Execution & Testing (Buddy's extended wishlist)
+
+- [ ] **Test debugging suite** — run a single test (`test <file>::<name>` detection per framework), rerun only failures, structured pass/fail/skip output parsed for the model.
+- [ ] **Coverage reports** — run coverage tooling if present (`c8`/`istanbul`/`pytest-cov`), summarize uncovered files into the turn report.
+- [ ] **Performance profiling integration** — run profilers (`node --prof`, `py-spy`) and summarize hotspots on request.
+- [ ] **Time-travel debugging / replay** — replay a session's tool calls deterministically against checkpoints (P0 checkpoints make this possible); "replay from step 7 with this one edit changed".
+
+## 6. P2 — Version Control (Buddy's extended wishlist)
+
+- [ ] **Full git tool suite** — dedicated `git` tool wrapping diff, log, blame, branch, merge, rebase, push, stash — parsed and summarized for the model (not raw shell soup).
+- [ ] **GitHub/GitLab API tool** — PR creation, review comments, CI status checks (via `gh` CLI or REST with the user's token — never Buddy's own keys); `/ci` shows latest run status per branch.
+- [ ] **Conflict resolution assistance** — on merge/rebase conflict, present both sides + base to the model, propose a resolution, apply after approval gate.
+
+## 7. P2 — Chat Narration (Buddy's extended wishlist)
+
+- [ ] **Streaming thought process** — render the model's reasoning/gateway deltas live as they arrive, not just the final answer. *Depends on gateway streaming support; pollinations/kilo partially stream today.*
+- [ ] **Collapsible thinking blocks** — structured reasoning blocks the TUI can fold/expand (renderer already owns the frame — fold state is cheap).
+- [ ] **Decision rationale per step** — log why this file / why this edit next to each tool card in the session JSONL.
+- [ ] **Configurable verbosity** — `silent → summary → verbose` narration levels (`/verbosity`), stored per project.
+- [ ] **Replayable narration** — replay any past session step-by-step (feeds the time-travel item above).
+
+## 8. P2 — UX & TUI polish (feel identical to Claude Code)
 
 - [ ] **Themes** — `/theme` dark / light / high-contrast; palette-driven renderer colors.
 - [ ] **Vim mode** — `/vim`: normal/insert, hjkl, dd/yy/p on the input line.
@@ -71,21 +111,37 @@ Sources: Claude Code official docs (code.claude.com/docs), the full 18-tool syst
 - [ ] **Better tool cards** — collapse long outputs (expand hint), diff rendering already exists; add copy-to-clipboard affordance.
 - [ ] **`/pr-comments`** — pull PR review comments locally for the bot side to act on.
 
-## 5. P2 — Sessions, headless & automation (agent as a platform)
+## 9. P2 — Sessions, headless, observability & automation (agent as a platform)
 
 - [ ] **`buddy -p` headless mode** — print mode (run one prompt, output, exit); stdin pipe support; `--output-format text|json|stream-json`; proper exit codes. *Unlocks CI, cron, and scripting without a TTY.*
 - [ ] **`buddy -c` / resume by name** — continue most recent session in this directory; `-r <name|id>`; `/rename` named sessions.
 - [ ] **`/branch` + `/fork`** — branch the conversation to try a direction and switch back; fork a session into a background copy.
-- [ ] **Share links** — `/share` produces a self-contained single-file HTML transcript (zero-dep), optional gist upload.
+- [ ] **Session export/import** — `/share` produces a self-contained single-file HTML transcript (zero-dep), optional gist upload; **import** restores a session JSONL so context can be shared between machines/teammates.
 - [ ] **Permission rules engine** — `.buddy/settings.json` hierarchy (user `~/.buddy/` → project → local); `permissions.allow / deny / ask` patterns like `Bash(git:*)`, `fs_write(docs/**)`; `defaultMode`; `additionalDirectories`; `/permissions` UI reads them. *Replaces the flat yes/always gate with policy.*
 - [ ] **`/add-dir`** — additional working directories for monorepos.
-- [ ] **LSP-style diagnostics** — after each edit, run the project's own `tsc` / `eslint` / `ruff` if present and feed errors back automatically. *Zero-dep: spawn binaries the repo already has. Catches breakage without running the whole test suite.*
+- [ ] **Structured logging / tracing of agent actions** — every tool call, gateway call, and decision written as structured JSON events; optional OpenTelemetry export. *Debugging a 10-agent cascade failure will thank you.*
+- [ ] **Audit trail of all file/command operations** — append-only `.buddy/audit.jsonl`: who (tool), what (exact args), when, gate verdict. Exportable per task.
+- [ ] **Cost/token tracking per task** — extend `/cost` with per-task and per-subagent token/token/$ breakdown (Buddy's $0 story: show the savings).
 - [ ] **Auto-format after edit** — PostToolUse hook default: prettier/black/go fmt when configured.
 - [ ] **Git-native commits & PRs** — generated commit messages from the diff, co-authored-by trailer, PR creation flow, `--worktree` flag to isolate an agent run in its own worktree.
 - [ ] **`/code-review` + `/security-review` bundled skills** — severity-table review of the current diff; `--fix` applies findings. (Bot side already reviews PRs — bring it to the local CLI.)
 - [ ] **Sandbox mode** — `/sandbox`: bash runs with network off + restricted HOME; document a docker/podman profile as the strong option.
 
-## 6. P3 — Nice-to-have
+## 10. P3 — Infrastructure & specialized domains (Buddy's extended wishlist)
+
+- [ ] **HTTP client tool with auth** — cookies, sessions, bearer/API-key auth, retries — beyond plain web_fetch; powers the custom reporters.
+- [ ] **API schema fetching** — pull OpenAPI specs / GraphQL introspection into context and generate typed client stubs.
+- [ ] **Browser automation** — Playwright/Puppeteer via an MCP server (not bundled — zero-dep core stays clean); screenshots feed the image-input path.
+- [ ] **Container orchestration** — docker compose up/down/logs tooling; local k8s (kind/minikube) status + deploy helpers via MCP.
+- [ ] **Database tools** — query, migrate, seed, inspect schemas (sqlite/pg/mysql via the repo's own drivers; read-only by default with an approval gate for writes).
+- [ ] **Cloud resource management** — AWS/GCP/Azure via the repos' own SDKs or MCP servers; `cloud` tool lists/inspects, never mutates without a gate.
+- [ ] **Secrets vault integration** — read secrets from 1Password CLI / `pass` / env refs at run time; never logged, never in transcripts.
+- [ ] **Mobile** — iOS/Android build/test tooling detection (xcodebuild, gradle) as a language-pack-style plugin.
+- [ ] **WASM / edge runtime support** — run and test wasm/edge targets (workerd, wasmtime) as an execution backend.
+- [ ] **ML model helpers** — inference/fine-tune task templates (the repo's own python env; keyless inference can lean on the brain gateways).
+- [ ] **Hardware/embedded** — flash, serial monitor, JTAG wrappers as plugins for embedded workflows.
+
+## 11. P3 — Nice-to-have
 
 - [ ] **Notebook support** — `nb_edit` tool for `.ipynb` cells.
 - [ ] **Voice input** — hold-a-key dictation via a keyless STT endpoint.
@@ -97,8 +153,9 @@ Sources: Claude Code official docs (code.claude.com/docs), the full 18-tool syst
 - [ ] **`/stats`** — usage dashboard: turns, tokens, gateway mix, per-project history.
 - [ ] **Goals & scheduled runs** — long-running objective that wakes on a schedule (bot side can run it in GitHub Actions cron).
 - [ ] **Channels** — push external events (webhook → live session message).
+- [ ] **MCP auth hardening** — OAuth/mTLS for remote MCP transports; rate limits per server.
 
-## 7. Beyond Claude Code — Buddy's unfair advantages (lean into these)
+## 12. Beyond Claude Code — Buddy's unfair advantages (lean into these)
 
 - [x] **$0 forever** — keyless brain with automatic failover; CC needs a $20+/mo subscription.
 - [x] **Zero dependencies** — the whole agent is readable in an afternoon; CC is a compiled black box.
@@ -108,3 +165,4 @@ Sources: Claude Code official docs (code.claude.com/docs), the full 18-tool syst
 - [ ] **Self-healing routing** — persist `/gateways` probe history; the router learns live latencies and reorders the chain.
 - [ ] **Offline-first mode** — auto-detect ollama when every keyless gateway fails; Buddy keeps working on a plane.
 - [ ] **Radical transparency** — `/why`: show exactly which gateway, which prompt, which tool results produced the last answer (auditable agent).
+- [ ] **Unified protocol end-state** — MCP as plugin runtime, subagents on MCP tools, narration streaming from every level — the architecture Buddy sketched, shipped.
