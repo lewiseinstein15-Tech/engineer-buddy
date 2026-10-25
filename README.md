@@ -1,7 +1,10 @@
 # Engineer Buddy 🤖🔧
 
 **A keyless AI engineering agent. Zero API keys. Zero monthly cost.**
-**Buddy Code** — a Claude Code-style coding agent in your terminal (chat, explore, edit, run, verify) — **plus five GitHub skills** (autonomous PR review, issue → fix PR, dependency auditing, issue triage, release notes).
+
+> **Created and built by [Lewis](https://github.com/lewiseinstein15-Tech)** — sole creator, designer & developer of Engineer Buddy.
+
+**Buddy Code** — a Claude Code-style coding agent in your terminal (chat, explore, edit, run, verify, **search the web**) — **plus five GitHub skills** (autonomous PR review, issue → fix PR, dependency auditing, issue triage, release notes).
 
 ```
 $ node src/index.js doctor
@@ -18,7 +21,7 @@ $ node src/index.js doctor
 3/4 gateways alive. Chain never fails while ≥1 is up.
 ```
 
-## Buddy Code — the terminal coding agent (v0.4)
+## Buddy Code — the terminal coding agent (v0.7)
 
 Like Claude Code, but keyless and $0. Run it in any repo:
 
@@ -28,7 +31,7 @@ buddy -p "fix the flaky login test and run the suite"   # one-shot, autonomous
 buddy init               # scaffold the harness (.buddy/harness/) in a repo
 ```
 
-You type a task. Buddy plans it with a **todo checklist**, lists/reads/searches the code, edits files (**colored diff preview before every write**), runs tests and commands, iterates until it works, and reports what changed and what it verified. The whole interface is hand-rolled ANSI — zero dependencies, zero install weight.
+You type a task. Buddy plans it with a **todo checklist**, lists/reads/searches the code, edits files (**colored diff preview before every write**), runs tests and commands, **searches the web and reads docs** (`web_search` + `web_fetch`, keyless, SSRF-guarded), iterates until it works, and reports what changed and what it verified. The whole interface is hand-rolled ANSI — zero dependencies, zero install weight.
 
 **The TUI is a real renderer, not a readline prompt.** v0.6 rebuilt the terminal layer on the same model Claude Code uses (Ink): the screen is split into a **static region** (replies, tool cards — printed once into scrollback, never touched again) and a **dynamic region** (the bottom input box + status footer, redrawn in place by erasing exactly the wrapped, CJK-aware screen rows the previous frame occupied). One writer owns the cursor, so the box can't ghost, duplicate or scroll away. The frame is a pure function of state: `state → buildFrame() → renderer.render()`.
 

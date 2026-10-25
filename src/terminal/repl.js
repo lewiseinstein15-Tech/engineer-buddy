@@ -16,6 +16,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { createChat } from '../agent/chat.js';
 import { LocalScope, buildLocalTools, runBash } from '../tools/local.js';
+import { buildWebTools } from '../tools/web.js';
 import { ensureHarness, loadHarness, harnessContext } from '../harness/scaffold.js';
 import { HARNESS_DIR } from '../harness/defaults.js';
 import { SessionRecorder, listSessions, loadSession, sessionInfo, resumeMessages, writeExport } from '../session.js';
@@ -74,7 +75,7 @@ export function parseSlash(input) {
 function makeScopeAndTools(root) {
   const scope = new LocalScope(root);
   const todoState = { latest: null };
-  const tools = buildLocalTools({ scope, todoState });
+  const tools = [...buildLocalTools({ scope, todoState }), ...buildWebTools()];
   return { scope, tools, todoState };
 }
 

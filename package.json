@@ -1,6 +1,6 @@
 {
   "name": "engineer-buddy",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Keyless, $0/month AI engineering agent. Buddy Code: a Claude Code-style terminal coding agent with diff-preview approval gates, Ctrl+C interrupt, todo plans, sessions, /cost, and a self-improving Harness² harness. Plus five GitHub skills. Zero API keys, zero npm dependencies.",
   "type": "module",
   "main": "src/index.js",
@@ -28,5 +28,6 @@
   "engines": {
     "node": ">=20"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "author": "Lewis (lewiseinstein15-Tech) — creator & sole developer"
 }
