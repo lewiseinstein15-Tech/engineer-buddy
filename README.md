@@ -21,7 +21,7 @@ $ node src/index.js doctor
 3/4 gateways alive. Chain never fails while ≥1 is up.
 ```
 
-## Buddy Code — the terminal coding agent (v0.7)
+## Buddy Code — the terminal coding agent (v0.8)
 
 Like Claude Code, but keyless and $0. Run it in any repo:
 
@@ -31,7 +31,7 @@ buddy -p "fix the flaky login test and run the suite"   # one-shot, autonomous
 buddy init               # scaffold the harness (.buddy/harness/) in a repo
 ```
 
-You type a task. Buddy plans it with a **todo checklist**, lists/reads/searches the code, edits files (**colored diff preview before every write**), runs tests and commands, **searches the web and reads docs** (`web_search` + `web_fetch`, keyless, SSRF-guarded), iterates until it works, and reports what changed and what it verified. The whole interface is hand-rolled ANSI — zero dependencies, zero install weight.
+You type a task. Buddy plans it with a **todo checklist**, lists/reads/searches the code, edits files (**colored diff preview before every write**), runs tests and commands, **searches the web and reads docs** (`web_search` + `web_fetch`, keyless, SSRF-guarded), **delegates to sub-agents** (`task` tool — explore / plan / test-writer / refactorer / doc-generator / security-auditor, or your own in `.buddy/agents/*.md`), **connects MCP servers** (`.buddy/mcp.json` → tools arrive as `mcp__<server>__<tool>`), iterates until it works, and reports what changed and what it verified. The whole interface is hand-rolled ANSI — zero dependencies, zero install weight.
 
 **The TUI is a real renderer, not a readline prompt.** v0.6 rebuilt the terminal layer on the same model Claude Code uses (Ink): the screen is split into a **static region** (replies, tool cards — printed once into scrollback, never touched again) and a **dynamic region** (the bottom input box + status footer, redrawn in place by erasing exactly the wrapped, CJK-aware screen rows the previous frame occupied). One writer owns the cursor, so the box can't ghost, duplicate or scroll away. The frame is a pure function of state: `state → buildFrame() → renderer.render()`.
 
@@ -49,13 +49,15 @@ You type a task. Buddy plans it with a **todo checklist**, lists/reads/searches 
 | ↑↓ | history with draft restore |
 | edit gates | `[y]es / [n]o / [a]lways` with a live **unified diff of exactly what will change** |
 
-Slash commands: `/help /new /clear /compact /cost /model /gateways /permissions /todo /tools /memory /experience /learn /review /init /export /sessions /resume /status /yolo /quit` — highlights:
+Slash commands: `/help /new /clear /compact /cost /model /gateways /permissions /todo /tools /agents /mcp /memory /experience /learn /review /init /export /sessions /resume /status /yolo /quit` — highlights:
 
 - `/cost` — brain calls, est. tokens, and **$0.00 spend** (keyless)
 - `/model kilo` — pin a gateway first for the session; `/model auto` restores
 - `/gateways` — parallel health probe of the whole keyless chain
 - `/compact` — force a context summarization now (auto-compaction also runs under budget pressure)
 - `/review [staged]` — Buddy reviews your uncommitted diff like a senior engineer
+- `/agents` — the sub-agent crew: what each one can touch, and how to add your own
+- `/mcp` — MCP servers + their tools (from `.buddy/mcp.json`)
 - `/export` — transcript → readable markdown in `.buddy/exports/`
 - `/resume <n>` — numbered session picker; sessions record tool-call tallies
 
@@ -82,6 +84,38 @@ After a task, `/learn` runs the Harness² recursion adapted to free, rate-limite
 2. **Propose** at most one harness edit (systemprompt, guardrails, MEMORY, tool guidance, or a new skill). The validator enforces the surface (markdown only), size caps, the grader-marker tripwire, and Harness²'s **triggered-skills rule**; invalid proposals get one verbatim-error retry, then **KEEP_BASE** — the safe default. Every applied edit leaves a timestamped backup.
 
 Lessons flow forward: recent lessons are injected into future sessions' project memory.
+
+### Sub-agents — one Buddy, a whole crew (v0.8)
+
+Buddy can delegate mid-task through the `task` tool. Each sub-agent runs on the same bounded ReAct loop with its **own context**, a **tool allowlist**, and a **step budget**, then returns one report to the main loop. Six presets ship built-in — `explore` (read-only code scout), `plan` (read-only architect), `test-writer`, `refactorer`, `doc-generator`, `security-auditor` — and you can define your own as plain markdown:
+
+```markdown
+<!-- .buddy/agents/scout.md -->
+---
+name: scout
+description: Fast read-only code scout
+tools: fs_list, fs_read, fs_search
+maxSteps: 8
+---
+You are Scout. Find where things live. Cite file:line. Be brief.
+```
+
+Safety rails, structural not hopeful: a sub-agent **never receives the `task` tool** (no recursive spawning), a crashed sub-agent degrades to an ERROR report (the main loop keeps working), dispatch is capped per turn, and risky tools inside a sub-agent still hit your approval gate with "always" remembered for the session.
+
+### MCP — Buddy speaks the Model Context Protocol (v0.8)
+
+Drop a `.buddy/mcp.json` in the workspace and Buddy becomes an MCP **host**: servers connect at startup (stdio JSON-RPC 2.0, zero dependencies) and every tool they expose is registered as `mcp__<server>__<tool>` — callable like any native tool.
+
+```json
+{
+  "mcpServers": {
+    "fetch":  { "command": "uvx", "args": ["mcp-server-fetch"] },
+    "memory": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-memory"] }
+  }
+}
+```
+
+First use of each MCP tool asks for approval (answer `a` to always-allow for the session). Timeouts are capped per request; a dead server shows up in `/mcp` and its tools return clean ERROR observations — one bad server never blocks startup or kills a turn.
 
 ### Safety model (terminal mode)
 

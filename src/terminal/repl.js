@@ -15,8 +15,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { createChat } from '../agent/chat.js';
+import { loadAgents } from '../agent/subagents.js';
 import { LocalScope, buildLocalTools, runBash } from '../tools/local.js';
 import { buildWebTools } from '../tools/web.js';
+import { buildTaskTool } from '../tools/task.js';
+import { connectMcpServers, buildMcpTools, describeMcpServers, MCP_CONFIG_PATH } from '../tools/mcp.js';
 import { ensureHarness, loadHarness, harnessContext } from '../harness/scaffold.js';
 import { HARNESS_DIR } from '../harness/defaults.js';
 import { SessionRecorder, listSessions, loadSession, sessionInfo, resumeMessages, writeExport } from '../session.js';
@@ -32,7 +35,7 @@ export const VERSION = createRequire(import.meta.url)('../../package.json').vers
 
 export const SLASH_COMMANDS = [
   'help', 'new', 'clear', 'screen', 'compact', 'model', 'gateways', 'cost',
-  'permissions', 'todo', 'tools', 'memory', 'experience', 'learn', 'review',
+  'permissions', 'todo', 'tools', 'agents', 'mcp', 'memory', 'experience', 'learn', 'review',
   'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit',
 ];
 
@@ -49,6 +52,8 @@ export const SLASH_DESCRIPTIONS = {
   permissions: 'Show session approvals',
   todo: "Show Buddy's current plan",
   tools: "List Buddy's tools",
+  agents: 'List sub-agents (task tool) — and how to add your own',
+  mcp: 'Show MCP servers + their tools (.buddy/mcp.json)',
   memory: 'Show project memory (edit it to teach Buddy)',
   experience: 'Lessons from past tasks',
   learn: 'Reflect on the last task → harness refinement',
@@ -72,11 +77,18 @@ export function parseSlash(input) {
 
 // ── Session factory ──────────────────────────────────────────────────────────
 
-function makeScopeAndTools(root) {
+async function makeScopeAndTools({ root, router = null, onEvent = () => {}, approval = null } = {}) {
   const scope = new LocalScope(root);
   const todoState = { latest: null };
-  const tools = [...buildLocalTools({ scope, todoState }), ...buildWebTools()];
-  return { scope, tools, todoState };
+  const base = [...buildLocalTools({ scope, todoState }), ...buildWebTools()];
+  // Sub-agents (task tool) — loadAgents never throws; invalid files degrade
+  // to warnings. Sub-agents see every base tool except task itself.
+  const { agents } = loadAgents(root);
+  const taskTool = buildTaskTool({ router, tools: base, agents, approval, onSubEvent: onEvent });
+  // MCP servers — optional, timeout-capped, never blocks startup on failure.
+  const mcp = await connectMcpServers(root).catch(() => ({ connected: [], failed: [] }));
+  const tools = [...base, taskTool, ...buildMcpTools(mcp.connected)];
+  return { scope, tools, todoState, mcp };
 }
 
 function makeHarness(root) {
@@ -90,14 +102,14 @@ function makeHarness(root) {
 }
 
 /** Create a chat session bound to a workspace root. */
-export function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, onEvent = () => {} } = {}) {
-  const { tools, todoState } = makeScopeAndTools(root);
+export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, onEvent = () => {} } = {}) {
+  const { tools, todoState, mcp } = await makeScopeAndTools({ root, router, onEvent, approval });
   const harness = makeHarness(root);
   const session = createChat({ router, tools, harness, charBudget, approval, onEvent });
   if (resumeFrom) {
     for (const m of resumeMessages(loadSession(resumeFrom))) session.messages.push(m);
   }
-  return { chat: session, tools, todoState };
+  return { chat: session, tools, todoState, mcp };
 }
 
 function defaultApproval(busy) {
@@ -128,6 +140,10 @@ function makeRenderer({ quiet = false, toolByName = new Map() } = {}) {
       console.log(`\n  ${c.yellow('⏸')} interrupted — nothing lost, say "continue" to resume\n`);
     } else if (ev.type === 'compaction') {
       console.log(c.gray(`  ↺ context compacted (${ev.dropped} messages summarized)`));
+    } else if (ev.type === 'subagent') {
+      if (ev.phase === 'step') console.log(c.gray(`  ↳ ${ev.agent} · ${ev.tool}`));
+      else if (ev.phase === 'done') console.log(c.gray(`  ↳ ${ev.agent} finished`));
+      else console.log(c.gray(`  ↳ ${ev.agent} hit a problem (report returned to Buddy)`));
     }
   };
 }
@@ -174,7 +190,7 @@ export function appendMemoryNote(root, note) {
 export async function runOneShot({ router, root = process.cwd(), task, safe = false, yolo = false, quiet = false, config = {} } = {}) {
   const events = [];
   const render = makeRenderer({ quiet });
-  const { chat } = createBuddySession({
+  const { chat } = await createBuddySession({
     root,
     router,
     yolo,
@@ -221,6 +237,15 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     })
   );
 
+  // MCP status (best effort — never blocks the session).
+  if (mcp.connected.length) {
+    const toolCount = mcp.connected.reduce((n, x) => n + (x.tools || []).length, 0);
+    console.log(c.gray(`  mcp: ${mcp.connected.map((x) => x.name).join(', ')} connected (${toolCount} tool${toolCount === 1 ? '' : 's'}) — /mcp for details`));
+  }
+  if (mcp.failed.length) {
+    console.log(c.yellow(`  mcp failed: ${mcp.failed.map((x) => x.name).join(', ')} — /mcp for details`));
+  }
+
   const initialOrder = [...router.order];
   let yolo = Boolean(yoloFlag);
   let events = [];
@@ -237,7 +262,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   let toolCallsThisTurn = 0;
   const turnStart = { at: 0 };
 
-  const { chat, tools, todoState } = createBuddySession({
+  const { chat, tools, todoState, mcp } = await createBuddySession({
     root,
     router,
     approval: async ({ tool, summary, preview }) => {
@@ -354,6 +379,8 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
             `  ${c.bold(c.cyan('Safety & tools'))}`,
             ...[
               ['/tools', "list Buddy's tools"],
+              ['/agents', 'list sub-agents (task tool) — add your own in .buddy/agents/'],
+              ['/mcp', 'MCP servers + tools (from .buddy/mcp.json)'],
               ['/permissions', 'show session approvals · /permissions reset'],
               ['/review [staged]', 'Buddy reviews your uncommitted diff'],
               ['/yolo', 'toggle auto-approval (careful)'],
@@ -453,6 +480,42 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           )}\n`
         );
         break;
+      case 'agents': {
+        const { agents, warnings } = loadAgents(root);
+        const rows = agents.map((a) => [
+          c.bold(a.name),
+          a.source === 'builtin' ? c.dim('built-in') : c.green('yours'),
+          a.tools ? a.tools.join(', ') : c.dim('all tools'),
+          a.description || c.dim('—'),
+        ]);
+        say(
+          `\n${renderTable(rows, { headers: ['agent', 'source', 'tools', 'what it does'] })}` +
+            `\n${c.dim('  dispatch: Buddy calls the task tool itself — or ask it to ("use the plan agent to …")')}` +
+            `\n${c.dim('  add your own: .buddy/agents/<name>.md with frontmatter (name, description, tools, maxSteps) + a persona body')}\n` +
+            (warnings.length ? c.yellow(`  skipped: ${warnings.join(' · ')}\n`) : '')
+        );
+        break;
+      }
+      case 'mcp': {
+        if (!mcp.connected.length && !mcp.failed.length) {
+          say(
+            `\n  no MCP servers configured — add ${c.bold(MCP_CONFIG_PATH || '.buddy/mcp.json')}:\n` +
+              c.dim('    { "mcpServers": { "fetch": { "command": "uvx", "args": ["mcp-server-fetch"] } } }\n') +
+              c.dim('  servers connect at startup; their tools appear as mcp__<server>__<tool> (also in /tools)\n')
+          );
+          break;
+        }
+        const rows = describeMcpServers(mcp.connected, mcp.failed);
+        const toolRows = mcp.connected.flatMap((x) =>
+          (x.tools || []).map((t) => [c.bold(`mcp__${x.name}__${t.name}`), truncate(String(t.description || ''), 60)])
+        );
+        say(
+          `\n${renderTable(rows, { headers: ['alive', 'server', 'tools', 'info'] })}` +
+            (toolRows.length ? `\n${renderTable(toolRows, { headers: ['tool', 'description'] })}\n` : '\n') +
+            c.dim('  first use of each tool asks for approval — answer "a" to always allow it this session\n')
+        );
+        break;
+      }
       case 'permissions':
         if (args === 'reset') {
           chat.resetApprovals();
