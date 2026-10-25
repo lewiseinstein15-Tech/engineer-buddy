@@ -142,6 +142,30 @@ export function renderFilePreview({ path, op, bytes }) {
   return `  ${c.green(op === 'create' ? '+' : '~')} ${c.bold(path)} ${c.gray(`(${op}, ${bytes ?? '?'} bytes)`)}`;
 }
 
+/** Context budget bar — where the window actually goes (/context). */
+export function renderContextBar({ parts, system, conversation, budget, turns, planMode }, { indent = '  ' } = {}) {
+  const k = (n) => `${(n / 1000).toFixed(1)}k`;
+  const tok = (n) => `~${Math.round(n / 4 / 100) / 10}k tok`;
+  const width = 26;
+  const used = conversation;
+  const frac = Math.max(0, Math.min(1, used / Math.max(budget, 1)));
+  const filled = Math.round(frac * width);
+  const barColor = frac > 0.8 ? c.red : frac > 0.6 ? c.yellow : c.green;
+  const bar = barColor('█'.repeat(filled)) + c.gray('░'.repeat(width - filled));
+  const rows = Object.entries(parts)
+    .filter(([, n]) => n > 0)
+    .map(([name, n]) => [name, `${k(n)} chars`, tok(n)]);
+  return [
+    '',
+    `${indent}${c.bold('Context')} ${c.dim(`— ${turns} message${turns === 1 ? '' : 's'}${planMode ? ' · plan mode' : ''}`)}`,
+    `${indent}${c.gray('conversation')} ${bar} ${c.bold(k(used))} / ${k(budget)} chars ${c.gray(`(${Math.round(frac * 100)}%) · est. ${tok(used)}`)}`,
+    `${indent}${c.gray('system prompt (always loaded)')}`,
+    renderTable(rows, { indent: indent + '  ' }),
+    `${indent}${c.gray('system total')} ${c.bold(k(system))} chars ${c.gray(tok(system))} · ${c.gray('compaction keeps the last 4 messages and summarizes the rest')}`,
+    '',
+  ].join('\n');
+}
+
 /** Todo checklist — Claude Code's signature plan UI (v2: ids + blocked_by). */
 export function renderTodo(items, { indent = '  ' } = {}) {
   const ICON = { done: c.green('✓'), in_progress: c.cyan('▸'), pending: c.gray('○') };

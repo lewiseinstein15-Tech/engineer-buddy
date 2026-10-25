@@ -45,7 +45,7 @@ Sources: Claude Code official docs (code.claude.com/docs), the full 18-tool syst
 
 ## 2. P1 — Context & memory (do big things with a small context window)
 
-- [ ] **`/context` visualization** — token budget breakdown bar: system prompt, harness files, conversation, tool defs, free space. per-gateway limit.
+- [x] **`/context` visualization** — token budget breakdown bar: system prompt, harness files, conversation, tool defs, free space. per-gateway limit. **✅ shipped v0.11.1** — `chat.contextBreakdown()` measures the REAL system prompt once and splits it into named sections (systemprompt, memory, toolGuidance, guardrails, skills catalog, one `toolsAndProtocol` remainder — the sections always sum to the exact byte count, no estimates); the conversation bar shows used/budget chars with a green→yellow→red color ramp and the chars÷4 token estimate; plan mode shows the swapped tool list honestly (different remainder). `/context` in the palette + help. Per-gateway real token limits (usage-reported) remain open — the bar is honest about being a chars÷4 estimate. 4 tests.
 - [ ] **Auto-compact** — trigger compaction automatically at ~80% of the gateway's context limit; custom compact instructions; preserve todo state through compaction.
 - [ ] **Real token accounting** — gateway-reported usage (or chars/4 estimate) per turn; enforce per-gateway context limits in the router; surface in `/cost`.
 - [ ] **Repo map (aider-style)** — zero-dep symbol extraction (regex-based for JS/TS/Python: functions, classes, exports), def→reference graph, top-N most-referenced symbols with signatures appended to system prompt. *The single biggest win for large-codebase work without tree-sitter.*

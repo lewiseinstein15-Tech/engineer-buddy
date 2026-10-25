@@ -30,7 +30,7 @@ import { ensureHarness, loadHarness, harnessContext } from '../harness/scaffold.
 import { HARNESS_DIR } from '../harness/defaults.js';
 import { SessionRecorder, listSessions, loadSession, sessionInfo, resumeMessages, writeExport } from '../session.js';
 import { reflect, recentLessons, experiencePath } from '../learn.js';
-import { c, PALETTE, logoBanner, spinner, renderToolCall, renderToolEvent, renderTodo, renderTable, formatMs } from './ui.js';
+import { c, PALETTE, logoBanner, spinner, renderToolCall, renderToolEvent, renderTodo, renderTable, formatMs, renderContextBar } from './ui.js';
 import { renderMarkdown } from './markdown.js';
 import { truncate, debugLog } from '../util.js';
 
@@ -40,7 +40,7 @@ export const VERSION = createRequire(import.meta.url)('../../package.json').vers
 // ── Slash commands (pure, testable) ──────────────────────────────────────────
 
 export const SLASH_COMMANDS = [
-  'help', 'new', 'clear', 'screen', 'compact', 'model', 'gateways', 'cost',
+  'help', 'new', 'clear', 'screen', 'compact', 'context', 'model', 'gateways', 'cost',
   'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'hooks', 'memory', 'experience', 'learn', 'review',
   'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit',
 ];
@@ -52,6 +52,7 @@ export const SLASH_DESCRIPTIONS = {
   clear: 'Clear screen and conversation',
   screen: 'Clear the screen',
   compact: 'Summarize old context to free space',
+  context: 'Show the context budget: what fills the window, chars + est. tokens',
   model: 'Pin a gateway first (e.g. /model kilo)',
   gateways: 'Health-probe the keyless chain',
   cost: 'Usage: brain calls, est. tokens, $0.00',
@@ -442,6 +443,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
             `  ${c.bold(c.cyan('Brain & context'))}`,
             ...[
               ['/compact', 'summarize old context now to free space'],
+              ['/context', 'token budget breakdown — system prompt, harness, conversation'],
               ['/cost', 'usage: brain calls, est. tokens, $0.00'],
               ['/model <name>', 'pin a gateway first (e.g. /model kilo) · /model auto restores'],
               ['/gateways', 'health-probe the keyless chain'],
@@ -502,6 +504,9 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         }
         break;
       }
+      case 'context':
+        say(renderContextBar(chat.contextBreakdown()));
+        break;
       case 'cost': {
         const u = chat.usage();
         const estK = ((u.charsIn + u.charsOut) / 4 / 1000).toFixed(1);

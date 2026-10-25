@@ -437,6 +437,34 @@ export function createChat({
     return { said: null, steps: maxStepsPerTurn, error: false };
   }
 
+  /** Context breakdown for /context — where the window actually goes. */
+  function contextBreakdown() {
+    const plan = modes?.plan === true;
+    const systemprompt = harness.systemprompt?.length || 0;
+    const memory = harness.memory?.length || 0;
+    const toolGuidance = harness.toolGuidance?.length || 0;
+    const guardrails = harness.guardrails?.length || 0;
+    const skillsBlock = describeSkillCatalog(skills).length;
+    const system = buildSystemPrompt({ harness, tools, skills, planMode: plan }).length;
+    return {
+      parts: {
+        systemprompt,
+        memory,
+        toolGuidance,
+        guardrails,
+        skillsBlock,
+        // protocol preamble + tool definitions + plan-protocol/plan-mode
+        // sections — measured as one remainder so the sum is always exact.
+        toolsAndProtocol: system - systemprompt - memory - toolGuidance - guardrails - skillsBlock,
+      },
+      system,
+      conversation: historyChars(),
+      budget: charBudget,
+      turns: messages.length,
+      planMode: plan,
+    };
+  }
+
   return {
     turn,
     compactNow,
@@ -444,6 +472,7 @@ export function createChat({
     get compactCount() { return compactCount; },
     get alwaysApproved() { return [...alwaysApproved]; },
     historyChars,
+    contextBreakdown,
     usage() {
       return { ...usage, byGateway: { ...usage.byGateway } };
     },
