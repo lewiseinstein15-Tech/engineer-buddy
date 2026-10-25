@@ -19,6 +19,7 @@ import { loadAgents } from '../agent/subagents.js';
 import { LocalScope, buildLocalTools, runBash } from '../tools/local.js';
 import { buildWebTools } from '../tools/web.js';
 import { buildTaskTool } from '../tools/task.js';
+import { BackgroundShells, buildBackgroundTools } from '../tools/background.js';
 import { connectMcpServers, buildMcpTools, describeMcpServers, MCP_CONFIG_PATH } from '../tools/mcp.js';
 import { ensureHarness, loadHarness, harnessContext } from '../harness/scaffold.js';
 import { HARNESS_DIR } from '../harness/defaults.js';
@@ -35,7 +36,7 @@ export const VERSION = createRequire(import.meta.url)('../../package.json').vers
 
 export const SLASH_COMMANDS = [
   'help', 'new', 'clear', 'screen', 'compact', 'model', 'gateways', 'cost',
-  'permissions', 'todo', 'tools', 'agents', 'mcp', 'memory', 'experience', 'learn', 'review',
+  'permissions', 'todo', 'tools', 'agents', 'mcp', 'tasks', 'memory', 'experience', 'learn', 'review',
   'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit',
 ];
 
@@ -54,6 +55,7 @@ export const SLASH_DESCRIPTIONS = {
   tools: "List Buddy's tools",
   agents: 'List sub-agents (task tool) — and how to add your own',
   mcp: 'Show MCP servers + their tools (.buddy/mcp.json)',
+  tasks: 'List background shells (bash_bg / bash_output / kill_shell)',
   memory: 'Show project memory (edit it to teach Buddy)',
   experience: 'Lessons from past tasks',
   learn: 'Reflect on the last task → harness refinement',
@@ -80,7 +82,8 @@ export function parseSlash(input) {
 async function makeScopeAndTools({ root, router = null, onEvent = () => {}, approval = null } = {}) {
   const scope = new LocalScope(root);
   const todoState = { latest: null };
-  const base = [...buildLocalTools({ scope, todoState }), ...buildWebTools()];
+  const shells = new BackgroundShells({ cwd: root });
+  const base = [...buildLocalTools({ scope, todoState }), ...buildWebTools(), ...buildBackgroundTools({ shells })];
   // Sub-agents (task tool) — loadAgents never throws; invalid files degrade
   // to warnings. Sub-agents see every base tool except task itself.
   const { agents } = loadAgents(root);
@@ -88,7 +91,7 @@ async function makeScopeAndTools({ root, router = null, onEvent = () => {}, appr
   // MCP servers — optional, timeout-capped, never blocks startup on failure.
   const mcp = await connectMcpServers(root).catch(() => ({ connected: [], failed: [] }));
   const tools = [...base, taskTool, ...buildMcpTools(mcp.connected)];
-  return { scope, tools, todoState, mcp };
+  return { scope, tools, todoState, mcp, shells };
 }
 
 function makeHarness(root) {
@@ -103,13 +106,13 @@ function makeHarness(root) {
 
 /** Create a chat session bound to a workspace root. */
 export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, onEvent = () => {} } = {}) {
-  const { tools, todoState, mcp } = await makeScopeAndTools({ root, router, onEvent, approval });
+  const { tools, todoState, mcp, shells } = await makeScopeAndTools({ root, router, onEvent, approval });
   const harness = makeHarness(root);
   const session = createChat({ router, tools, harness, charBudget, approval, onEvent });
   if (resumeFrom) {
     for (const m of resumeMessages(loadSession(resumeFrom))) session.messages.push(m);
   }
-  return { chat: session, tools, todoState, mcp };
+  return { chat: session, tools, todoState, mcp, shells };
 }
 
 function defaultApproval(busy) {
@@ -270,7 +273,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   let toolCallsThisTurn = 0;
   const turnStart = { at: 0 };
 
-  const { chat, tools, todoState, mcp } = await createBuddySession({
+  const { chat, tools, todoState, mcp, shells } = await createBuddySession({
     root,
     router,
     approval: async ({ tool, summary, preview }) => {
@@ -541,6 +544,22 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       case 'todo':
         say(todoState.latest ? `\n${renderTodo(todoState.latest)}\n` : '\n  (no plan yet — Buddy builds one with the todo tool when a task has steps)\n');
         break;
+      case 'tasks': {
+        const list = shells.list();
+        if (!list.length) {
+          say(`\n  no background shells — Buddy can start one: ${c.bold('bash_bg')} {"command":"npm run dev"} · poll with ${c.bold('bash_output')} · stop with ${c.bold('kill_shell')}\n`);
+          break;
+        }
+        const rows = list.map((s) => [
+          s.status === 'running' ? c.green('●') : c.dim('○'),
+          `#${s.id}`,
+          s.status === 'running' ? c.green(`running ${(s.durationMs / 1000).toFixed(1)}s`) : `${s.status}${s.exitCode != null ? ` (${s.exitCode})` : ''}`,
+          truncate(s.command, 44),
+          `${s.bytes}b`,
+        ]);
+        say(`\n${renderTable(rows, { headers: ['', 'shell', 'status', 'command', 'output'] })}\n${c.dim('  read output: bash_output {"id":N} · stop: kill_shell {"id":N}\n')}`);
+        break;
+      }
       case 'memory': {
         const memPath = path.join(root, HARNESS_DIR, 'MEMORY.md');
         say(`\n${c.bold('Project memory')}: ${memPath}`);

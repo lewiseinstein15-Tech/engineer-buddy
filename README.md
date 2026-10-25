@@ -49,7 +49,7 @@ You type a task. Buddy plans it with a **todo checklist**, lists/reads/searches 
 | ↑↓ | history with draft restore |
 | edit gates | `[y]es / [n]o / [a]lways` with a live **unified diff of exactly what will change** |
 
-Slash commands: `/help /new /clear /compact /cost /model /gateways /permissions /todo /tools /agents /mcp /memory /experience /learn /review /init /export /sessions /resume /status /yolo /quit` — highlights:
+Slash commands: `/help /new /clear /compact /cost /model /gateways /permissions /todo /tools /agents /mcp /tasks /memory /experience /learn /review /init /export /sessions /resume /status /yolo /quit` — highlights:
 
 - `/cost` — brain calls, est. tokens, and **$0.00 spend** (keyless)
 - `/model kilo` — pin a gateway first for the session; `/model auto` restores
@@ -58,6 +58,7 @@ Slash commands: `/help /new /clear /compact /cost /model /gateways /permissions 
 - `/review [staged]` — Buddy reviews your uncommitted diff like a senior engineer
 - `/agents` — the sub-agent crew: what each one can touch, and how to add your own
 - `/mcp` — MCP servers + their tools (from `.buddy/mcp.json`)
+- `/tasks` — live background shells (started with `bash_bg`), with output sizes and status
 - `/export` — transcript → readable markdown in `.buddy/exports/`
 - `/resume <n>` — numbered session picker; sessions record tool-call tallies
 
@@ -140,6 +141,19 @@ use the mcp__demo__echo tool to say "hello", then ask mcp__demo__now for the tim
 ```
 
 `echo`, `now` (IANA timezones) and `word_count` ride the full stack: spawn → initialize handshake → `tools/list` → approval gate → `tools/call`. See `examples/echo-mcp.js` — it is also a template for writing your own servers (~150 lines, stdio JSON-RPC only).
+
+### Background shells — long-running work without blocking the turn (v0.9)
+
+Dev servers, watchers, builds — Buddy starts them with `bash_bg`, polls output with `bash_output` (tail ring buffer, per-shell cap), and stops them with `kill_shell` (whole process tree). `/tasks` shows every shell: status, runtime, output size. Same hard policy as `bash` (one simple command, no pipes/sudo/network/git-write), own process group per shell, and everything is reaped when Buddy exits.
+
+```text
+> start the dev server in the background and tell me when it's up
+⏺ bash_bg npm run dev
+  ⎿ OK shell #1 started (pid 4123)
+⏺ bash_output {"id":1}
+  ⎿ shell #1 — running (3.2s)
+  ⎿ ready on http://localhost:3000
+```
 
 ### Safety model (terminal mode)
 
