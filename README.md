@@ -30,15 +30,20 @@ buddy init               # scaffold the harness (.buddy/harness/) in a repo
 
 You type a task. Buddy plans it with a **todo checklist**, lists/reads/searches the code, edits files (**colored diff preview before every write**), runs tests and commands, iterates until it works, and reports what changed and what it verified. The whole interface is hand-rolled ANSI — zero dependencies, zero install weight.
 
+**The TUI is a real renderer, not a readline prompt.** v0.6 rebuilt the terminal layer on the same model Claude Code uses (Ink): the screen is split into a **static region** (replies, tool cards — printed once into scrollback, never touched again) and a **dynamic region** (the bottom input box + status footer, redrawn in place by erasing exactly the wrapped, CJK-aware screen rows the previous frame occupied). One writer owns the cursor, so the box can't ghost, duplicate or scroll away. The frame is a pure function of state: `state → buildFrame() → renderer.render()`.
+
 **The interface, feature for feature:**
 
 | | |
 |---|---|
+| rounded input box | bottom-anchored, `>` prompt, inverse block cursor, dim placeholder, live `v · gateway · ctx` status |
+| `/` palette | typing `/` opens the command menu above the box — descriptions, ↑↓ select, tab accept, esc dismiss |
+| busy footer | spinner · task label · `esc to interrupt · Ns` while Buddy works |
 | `Ctrl+C` | interrupts the running turn **and kills the running command** (process-group kill); double-tap quits |
 | `!cmd` | run a shell command yourself — trusted passthrough, policy bypassed, output inline |
 | `#note` | remember something in project memory (`.buddy/harness/MEMORY.md`) |
 | trailing `\` | multi-line tasks (like Claude Code's shift+enter) |
-| Tab | completes slash commands |
+| ↑↓ | history with draft restore |
 | edit gates | `[y]es / [n]o / [a]lways` with a live **unified diff of exactly what will change** |
 
 Slash commands: `/help /new /clear /compact /cost /model /gateways /permissions /todo /tools /memory /experience /learn /review /init /export /sessions /resume /status /yolo /quit` — highlights:

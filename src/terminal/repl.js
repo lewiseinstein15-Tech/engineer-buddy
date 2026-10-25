@@ -35,6 +35,33 @@ export const SLASH_COMMANDS = [
   'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit',
 ];
 
+// Descriptions shown in the slash-command palette (Claude Code style menu).
+export const SLASH_DESCRIPTIONS = {
+  help: 'Show every command',
+  new: 'Fresh conversation (memory + experience persist)',
+  clear: 'Clear screen and conversation',
+  screen: 'Clear the screen',
+  compact: 'Summarize old context to free space',
+  model: 'Pin a gateway first (e.g. /model kilo)',
+  gateways: 'Health-probe the keyless chain',
+  cost: 'Usage: brain calls, est. tokens, $0.00',
+  permissions: 'Show session approvals',
+  todo: "Show Buddy's current plan",
+  tools: "List Buddy's tools",
+  memory: 'Show project memory (edit it to teach Buddy)',
+  experience: 'Lessons from past tasks',
+  learn: 'Reflect on the last task → harness refinement',
+  review: 'Review your uncommitted diff',
+  init: 'Scaffold .buddy/harness/',
+  export: 'Write the transcript to markdown',
+  sessions: 'List saved transcripts',
+  resume: 'Resume a saved session',
+  status: 'Session stats',
+  yolo: 'Toggle auto-approval (careful)',
+  quit: 'Leave',
+  exit: 'Leave',
+};
+
 export function parseSlash(input) {
   const s = String(input || '').trim();
   if (!s.startsWith('/')) return null;
@@ -262,22 +289,24 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
 
   const rl = createInputBox({
     title: 'Buddy',
-    placeholder: 'type a task…   (/help commands · ! shell · # remember)',
-    hint: 'enter send · \\ wrap · ↑↓ history · esc stop · ctrl+c quit',
+    placeholder: 'type a task…   (/ for commands · ! shell · # remember)',
+    hint: '? shortcuts · tab complete · ↑↓ history · esc stop · ctrl+c quit',
     statusRight: () => {
       try {
         const ctxK = (chat.historyChars() / 1000).toFixed(1);
         return `v${VERSION} · ${lastGateway || router.order[0]} · ${ctxK}k ctx`;
       } catch { return `v${VERSION} · ${lastGateway || router.order[0]}`; }
     },
-    completer: (line) => {
-      if (line.startsWith('/')) {
-        return SLASH_COMMANDS.filter((n) => `/${n}`.startsWith(line)).map((n) => `/${n}`);
-      }
-      return [];
-    },
+    commands: SLASH_COMMANDS.map((n) => ({ name: `/${n}`, desc: SLASH_DESCRIPTIONS[n] || '' })),
   });
   rl.install();
+
+  // Interactive-path spinner: drives the box busy footer instead of writing
+  // raw cursor sequences that would fight the renderer for the screen.
+  const busySpinner = (label) => {
+    rl.setBusy(label);
+    return { stop: () => rl.setBusy(null), setText: (l) => rl.setBusy(l) };
+  };
 
   const say = (s) => console.log(s);
 
@@ -351,7 +380,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         say('\n  (conversation reset — memory and experience persist)\n');
         break;
       case 'compact': {
-        const s = spinner('compacting context');
+        const s = busySpinner('compacting context');
         try {
           const r = await chat.compactNow();
           s.stop();
@@ -394,7 +423,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         break;
       }
       case 'gateways': {
-        const s = spinner('probing gateways (parallel)');
+        const s = busySpinner('probing gateways (parallel)');
         const rows = await Promise.all(
           router.order.map(async (name) => {
             const gw = router.gateways.get(name);
@@ -469,7 +498,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           say(`\n  ${staged ? 'nothing staged' : 'working tree clean'} — nothing to review\n`);
           break;
         }
-        const s = spinner('reviewing your diff');
+        const s = busySpinner('reviewing your diff');
         try {
           const out = await router.chat(
             [
@@ -557,7 +586,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           say('\n  nothing learned yet this session — give Buddy a task first\n');
           break;
         }
-        const s = spinner('reflecting (Harness² propose → validate → compose)');
+        const s = busySpinner('reflecting (Harness² propose → validate → compose)');
         try {
           const out = await reflect({ router, root, task: lastTask.task, events: lastTask.events });
           s.stop();
@@ -597,7 +626,6 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     }
     if (pendingBuf !== null) {
       pendingBuf = null;
-      rl.setPrompt(c.cyan('buddy❯ '));
       console.log(c.dim('\n  (multi-line input cleared)'));
       rl.prompt(true);
       return;
@@ -629,7 +657,6 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       }
       const combined = pendingBuf.join('\n').trim();
       pendingBuf = null;
-      rl.setPrompt(c.cyan('buddy❯ '));
       if (combined) await dispatch(combined);
       else rl.prompt();
       return;
@@ -642,7 +669,6 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     }
     if (input.endsWith('\\') && input.length > 1) {
       pendingBuf = [input.slice(0, -1)];
-      rl.setPrompt(c.dim('·······❯ '));
       rl.prompt();
       return;
     }

@@ -1,7 +1,7 @@
 // Tests for the zero-dependency Claude Code-style input box (inputbox.js)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { charWidth, strWidth, wrapContent, applyKey, createInputBox } from '../src/terminal/inputbox.js';
+import { charWidth, strWidth, wrapContent, applyKey, filterCommands, buildFrame, createInputBox } from '../src/terminal/inputbox.js';
 
 test('charWidth: CJK ideographs are double width', () => {
   assert.equal(charWidth('中'), 2);
@@ -140,4 +140,74 @@ test('createInputBox: slash completer completes unique command and stops at spac
   assert.deepEqual(complete('/he'), ['/help']);
   assert.deepEqual(complete('/help'), ['/help']);
   assert.deepEqual(complete('help me'), []);
+});
+
+// ── v0.6 palette + frame painter ─────────────────────────────────────────────
+
+test('applyKey: palette context switches up/down to palette navigation', () => {
+  assert.equal(applyKey({ name: 'up' }, { paletteOpen: true }).action, 'palette-prev');
+  assert.equal(applyKey({ name: 'down' }, { paletteOpen: true }).action, 'palette-next');
+  assert.equal(applyKey({ name: 'up' }, {}).action, 'history-prev');
+  assert.equal(applyKey({ name: 'down' }, {}).action, 'history-next');
+});
+
+test('filterCommands: prefix matching, whitespace closes the palette, / shows all', () => {
+  const cmds = [{ name: '/help', desc: 'a' }, { name: '/new', desc: 'b' }];
+  assert.deepEqual(filterCommands(cmds, '/').map((x) => x.name), ['/help', '/new']);
+  assert.deepEqual(filterCommands(cmds, '/h').map((x) => x.name), ['/help']);
+  assert.deepEqual(filterCommands(cmds, '/help me'), []);
+  assert.deepEqual(filterCommands(cmds, 'hello'), []);
+  assert.deepEqual(filterCommands(cmds, ''), []);
+});
+
+const BASE_STATE = {
+  text: '',
+  cursor: 0,
+  placeholder: 'type a task',
+  hint: '? shortcuts',
+  busy: null,
+  statusRight: 'v0.6.0 · kilo',
+  palette: null,
+};
+
+test('buildFrame: every line fits the terminal width (the ghost-box killer)', () => {
+  const lines = buildFrame(
+    { ...BASE_STATE, text: 'x'.repeat(300), cursor: 300, statusRight: 'v0.6.0 · kilo · 999.9k ctx' },
+    60
+  );
+  for (const l of lines) {
+    assert.ok(strWidth(l) <= 60, `line too wide (${strWidth(l)}): ${JSON.stringify(l)}`);
+  }
+});
+
+test('buildFrame: prompt, placeholder, borders and footer status', () => {
+  const joined = buildFrame(BASE_STATE, 80).join('\n');
+  assert.ok(joined.includes('>'));
+  assert.ok(joined.includes('type a task'));
+  assert.ok(joined.includes('v0.6.0 · kilo'));
+  assert.ok(joined.includes('? shortcuts'));
+  assert.ok(joined.includes('╭') && joined.includes('╰'));
+});
+
+test('buildFrame: busy footer shows spinner, esc-to-interrupt and seconds', () => {
+  const joined = buildFrame({ ...BASE_STATE, busy: { label: 'Buddy working', secs: 4, glyph: '⠋' } }, 80).join('\n');
+  assert.ok(joined.includes('⠋'));
+  assert.ok(joined.includes('Buddy working'));
+  assert.ok(joined.includes('esc to interrupt'));
+  assert.ok(joined.includes('4s'));
+});
+
+test('buildFrame: palette popup renders above the box with items and descriptions', () => {
+  const items = [{ name: '/help', desc: 'Show every command' }, { name: '/new', desc: 'Fresh conversation' }];
+  const lines = buildFrame({ ...BASE_STATE, text: '/', cursor: 1, palette: { items, sel: 0 } }, 80);
+  const joined = lines.join('\n');
+  assert.ok(joined.includes('/help'));
+  assert.ok(joined.includes('/new'));
+  assert.ok(joined.includes('Show every command'));
+  assert.equal(joined.split('╭').length - 1, 2, 'palette + input = two boxes');
+});
+
+test('buildFrame: CJK text is measured double-width and never overflows', () => {
+  const lines = buildFrame({ ...BASE_STATE, text: '修'.repeat(120), cursor: 120 }, 50);
+  for (const l of lines) assert.ok(strWidth(l) <= 50, `line too wide: ${strWidth(l)}`);
 });
