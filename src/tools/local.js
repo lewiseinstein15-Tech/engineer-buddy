@@ -4,7 +4,7 @@
 //   hard block  — non-negotiable, never runs (destructive shell, secret reads)
 //   soft gate   — risky tools (writes, bash) go through an approval callback
 //   budget      — per-turn call caps live in agent/chat.js
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -17,6 +17,7 @@ import { createSymbolIndexProvider, searchDefs, formatDef, findRefsIn } from '..
 import { buildGitTool } from './gittool.js';
 import { createLspHub, lspExtFor, formatDiagnostics } from '../agent/lsp.js';
 import { snapshotPaths } from '../agent/checkpoints.js';
+import { getChatSetting } from '../settings.js';
 
 // ── Edit previews (shown before approval, Claude-Code style) ────────────────
 
@@ -416,19 +417,43 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
   // language servers; diagnostics ride along on every edit (best-effort).
   const lsp = lspEnabled ? createLspHub(scope.root) : null;
   const DIAG_OFF = () => Promise.resolve('');
-  const postEditDiagnostics = lsp
+  // Auto-format after edit (v0.23.0): chat.autoFormat in .buddy/settings.json
+  // maps file extensions to formatter commands, e.g.
+  //   { ".js": "prettier --write", ".py": "black -q" }
+  // Runs after every successful edit; best-effort — a missing formatter
+  // surfaces as a note in the observation, never a failure.
+  let autoFmtMap = null;
+  try { autoFmtMap = getChatSetting(scope.root, 'autoFormat', null); } catch { /* settings unreadable */ }
+  const autoFormatFile = (rel) => {
+    if (!autoFmtMap || typeof autoFmtMap !== 'object') return '';
+    const cmd = autoFmtMap[path.extname(String(rel))];
+    if (typeof cmd !== 'string' || !cmd.trim()) return '';
+    const parts = cmd.trim().split(/\s+/);
+    try {
+      const r = spawnSync(parts[0], [...parts.slice(1), path.resolve(scope.root, String(rel))], { cwd: scope.root, timeout: 15000, encoding: 'utf8' });
+      if (r.error) return `\n[fmt] ${cmd}: ${truncate(r.error.message, 160)} (formatter not installed?)`;
+      return r.status === 0 ? `\n[fmt] ${cmd} ok` : `\n[fmt] ${cmd} exited ${r.status}: ${truncate(String(r.stderr || '').trim(), 200)}`;
+    } catch (e) {
+      return `\n[fmt] failed: ${truncate(e.message, 160)}`;
+    }
+  };
+  const postEditNotes = lsp
     ? async (rel) => {
         try {
-          if (!rel || !lspExtFor(rel)) return '';
+          if (!rel) return '';
+          const fmt = autoFormatFile(rel);
+          if (!lspExtFor(rel)) return fmt;
           const out = await lsp.diagnosticsFor(String(rel), { waitMs: 900 });
-          if (!out.length) return '';
+          if (!out.length) return fmt;
           const errs = out.filter((d) => d.severity === 1).length;
-          return `\n[LSP] ${out.length} diagnostic${out.length === 1 ? '' : 's'}${errs ? ` — ${errs} ERROR${errs === 1 ? '' : 'S'}` : ''}:\n${formatDiagnostics(out, String(rel), { maxItems: 8 })}`;
+          return `${fmt}\n[LSP] ${out.length} diagnostic${out.length === 1 ? '' : 's'}${errs ? ` — ${errs} ERROR${errs === 1 ? '' : 'S'}` : ''}:\n${formatDiagnostics(out, String(rel), { maxItems: 8 })}`;
         } catch {
           return ''; // LSP is a bonus — never blocks the edit
         }
       }
-    : DIAG_OFF;
+    : (rel) => {
+        try { return Promise.resolve(rel ? autoFormatFile(rel) : ''); } catch { return Promise.resolve(''); }
+      };
   return [
     testTool,
     gitTool,
@@ -662,7 +687,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
       run: async ({ path: p, content }) => {
         if (typeof content !== 'string' || !content.trim()) return 'ERROR: content required';
         const r = scope.write(p, content);
-        const diag = await postEditDiagnostics(r.path);
+        const diag = await postEditNotes(r.path);
         return `OK ${r.op} ${r.path} (${r.bytes} bytes)${diag}`;
       },
     },
@@ -677,7 +702,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
       run: async ({ path: p, find, replace, replace_all = false }) => {
         if (typeof find !== 'string' || !find) return 'ERROR: find required';
         const r = scope.replace(p, find, String(replace ?? ''), { replace_all: Boolean(replace_all) });
-        const diag = await postEditDiagnostics(r.path);
+        const diag = await postEditNotes(r.path);
         return `OK replaced ${r.count > 1 ? `${r.count} occurrences` : 'snippet'} in ${r.path}${diag}`;
       },
     },
@@ -692,7 +717,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
       preview: (a) => previewMultiEdit(scope, a?.path, a?.edits),
       run: async ({ path: p, edits }) => {
         const r = scope.multiReplace(p, edits);
-        const diag = await postEditDiagnostics(r.path);
+        const diag = await postEditNotes(r.path);
         return `OK multi_edit ${r.path}: ${r.edits} edit${r.edits === 1 ? '' : 's'} applied (${r.bytes} bytes now)${diag}`;
       },
     },
@@ -706,7 +731,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
       run: async ({ path: p, content }) => {
         if (typeof content !== 'string' || !content.trim()) return 'ERROR: content required';
         const r = scope.append(p, content);
-        const diag = await postEditDiagnostics(r.path);
+        const diag = await postEditNotes(r.path);
         return `OK ${r.op} ${r.path}${diag}`;
       },
     },

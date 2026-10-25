@@ -191,6 +191,35 @@ export function formatTestReport(res, { target = null, note = null } = {}) {
 
 const TEST_OBS_TAIL = 6000;
 
+/**
+ * Parse `node --test --experimental-test-coverage` tables (v0.23.0).
+ * Both dialects: TTY spec lines start with ℹ, piped TAP lines with #.
+ * Returns { all: {line, branch, funcs} | null, files: [{file, line, branch, funcs, uncovered}] }.
+ */
+export function parseCoverageTable(stdout) {
+  const rows = [];
+  let all = null;
+  for (const raw of String(stdout || '').split('\n')) {
+    const line = raw.replace(/^[ℹ#]\s?/, '').trim();
+    // file | line % | branch % | funcs % | uncovered lines
+    const m = /^(all files|.+?\.[cm]?js|.+?\.ts)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*(.*)$/i.exec(line);
+    if (!m) continue;
+    const row = { file: m[1].trim(), line: Number(m[2]), branch: Number(m[3]), funcs: Number(m[4]), uncovered: m[5].trim() };
+    if (/^all files$/i.test(row.file)) all = { line: row.line, branch: row.branch, funcs: row.funcs };
+    else rows.push(row);
+  }
+  return { all, files: rows };
+}
+
+/** The coverage verdict the model sees: totals + the least-covered files first. */
+export function formatCoverageReport(coverage, { maxFiles = 8 } = {}) {
+  if (!coverage?.files?.length) return 'COVERAGE: the run produced no coverage table (are there any test files at all?).';
+  const total = coverage.all ? `COVERAGE (all files): lines ${coverage.all.line}% · branch ${coverage.all.branch}% · funcs ${coverage.all.funcs}%` : 'COVERAGE (totals unavailable in this node version):';
+  const worst = [...coverage.files].sort((a, b) => a.line - b.line).slice(0, maxFiles);
+  const lines = worst.map((f) => `  ${f.file} — lines ${f.line}%${f.uncovered ? ` (uncovered: ${f.uncovered})` : ''}`);
+  return `${total}\nleast-covered files:\n${lines.join('\n')}${coverage.files.length > maxFiles ? `\n  … +${coverage.files.length - maxFiles} more` : ''}\nWrite tests for the top gaps, then rerun with {"coverage":true}.`;
+}
+
 /** Create the `test` tool. Failure memory lives in the closure (per session). */
 export function createTestTool({ root = process.cwd(), timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   let lastFailures = null; // [{file, name} | {file, name: null}] for rerun_failures
@@ -199,12 +228,24 @@ export function createTestTool({ root = process.cwd(), timeoutMs = DEFAULT_TIMEO
     name: 'test',
     description:
       'Run the project tests with per-framework detection (node --test / pytest / go / npm). args: {"target":"test/app.test.js::test name"} for one file/test, {"rerun_failures":true} to rerun only the last failures, {} for the whole suite. Prefer this over bash npm test.',
-    args: '{"target":"test/app.test.js::name | file | (empty)","rerun_failures":false}',
-    render: (a) => `test ${a?.target ? a.target : a?.rerun_failures ? '(rerun failures)' : '(suite)'}`,
+    args: '{"target":"test/app.test.js::name | file | (empty)","rerun_failures":false,"coverage":false}',
+    render: (a) => `test ${a?.coverage ? '(coverage)' : a?.target ? a.target : a?.rerun_failures ? '(rerun failures)' : '(suite)'}`,
     maxCalls: 4,
-    run: async ({ target = '', rerun_failures = false } = {}) => {
+    run: async ({ target = '', rerun_failures = false, coverage = false } = {}) => {
       if (!runner) {
         return 'ERROR: no test runner detected (no test/ dir with *.test.js, no package.json test script, no pytest/go markers).';
+      }
+      // Coverage (v0.23.0): zero-dep via node's built-in --experimental-test-coverage.
+      if (coverage) {
+        if (runner.kind !== 'node') {
+          return `ERROR: zero-dep coverage supports the node runner today (detected: ${runner.kind}). For python/go, ask me to run pytest --cov / go test -cover via bash instead.`;
+        }
+        const childEnvC = { ...process.env };
+        delete childEnvC.NODE_TEST_CONTEXT;
+        const r = spawnSync(runner.cmd, ['--test', '--test-concurrency=4', '--experimental-test-coverage'], { cwd: root, encoding: 'utf8', timeout: timeoutMs, env: childEnvC });
+        const out = `${r.stdout || ''}\n${r.stderr || ''}`;
+        const cov = parseCoverageTable(out);
+        return formatCoverageReport(cov);
       }
       const { file, name } = parseTarget(target);
       let rerunFiles = null;
