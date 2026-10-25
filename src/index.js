@@ -28,6 +28,7 @@ import { runIssueTriage } from './skills/issue-triage.js';
 import { runReleaseNotes } from './skills/release-notes.js';
 import { startRepl, runOneShot, VERSION } from './terminal/repl.js';
 import { latestSession, findSession } from './session.js';
+import { importSession } from './session.js';
 import { startMcpServer } from './mcpserver.js';
 import { ensureHarness } from './harness/scaffold.js';
 import { log, warn, setVerbose, truncate, BuddyError } from './util.js';
@@ -64,6 +65,7 @@ GitHub skills (CI):
   engineer-buddy doctor
   engineer-buddy ask "prompt"
   engineer-buddy mcp-serve [--allow-writes]   expose Buddy as an MCP stdio server
+  engineer-buddy import <session.jsonl>       restore a shared session (then -r <name>)
 
 Environment:
   GITHUB_TOKEN / BUDDY_GITHUB_TOKEN   GitHub token (auto-provided by Actions)
@@ -344,6 +346,25 @@ async function cmdInit(argv) {
   return 0;
 }
 
+async function cmdImport(argv) {
+  const { values, positionals } = parseArgs({ args: argv, options: { dir: { type: 'string' } }, allowPositionals: true });
+  const src = positionals[0];
+  if (!src) {
+    console.error('usage: buddy import <session.jsonl> — restores a shared session into .buddy/sessions/ (then buddy -r <name>)');
+    return 2;
+  }
+  const root = values.dir ? path.resolve(values.dir) : process.cwd();
+  try {
+    const r = importSession(root, src);
+    console.error(`imported ${r.events} events → ${r.target}${r.renamed ? ' (name conflict — stamped copy)' : ''}`);
+    console.error(`resume it:  buddy -r ${path.basename(r.target, '.jsonl')}`);
+    return 0;
+  } catch (e) {
+    console.error(`buddy: import failed — ${e.message}`);
+    return 2;
+  }
+}
+
 async function cmdMcpServe(argv) {
   const { values } = parseArgs({
     args: argv,
@@ -386,6 +407,7 @@ async function cmdMcpServe(argv) {
     if (cmd === 'doctor') process.exit(await cmdDoctor(argv));
     if (cmd === 'ask') process.exit(await cmdAsk(argv));
     if (cmd === 'mcp-serve') process.exit(await cmdMcpServe(argv));
+    if (cmd === 'import') process.exit(await cmdImport(argv));
     usage();
     process.exit(2);
   } catch (e) {

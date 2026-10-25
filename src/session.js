@@ -215,3 +215,120 @@ export function writeExport(root, file, { workspace = '' } = {}) {
   fs.writeFileSync(out, exportMarkdown(file, { workspace }), 'utf8');
   return out;
 }
+
+// ── Branch / fork / share / import (v0.21.0) ─────────────────────────────────
+
+/** Escape a string for safe interpolation into HTML. */
+function esc(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/**
+ * Self-contained single-file HTML transcript (zero-dep, /share): every event
+ * of a session, inline CSS, no external resources — open it anywhere.
+ */
+export function exportHtml(file, { title = '', workspace = '' } = {}) {
+  let events = [];
+  try {
+    events = fs
+      .readFileSync(file, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => {
+        try { return JSON.parse(l); } catch { return null; }
+      })
+      .filter(Boolean);
+  } catch {
+    /* unreadable → empty transcript */
+  }
+  const name = title || path.basename(file, '.jsonl');
+  const rows = events
+    .map((e) => {
+      const at = e.at ? new Date(e.at).toLocaleTimeString() : '';
+      if (e.type === 'user') return `<div class="row user"><span class="who">you</span><div class="bubble">${esc(e.text)}</div><span class="at">${at}</span></div>`;
+      if (e.type === 'say') return `<div class="row buddy"><span class="who">buddy</span><div class="bubble">${esc(e.text)}</div><span class="at">${at}</span></div>`;
+      if (e.type === 'tool') return `<div class="row tool"><span class="who">tool</span><div class="bubble"><code>${esc(e.tool)} ${esc(e.args?._preview || JSON.stringify(e.args || {}).slice(0, 160))}</code>${e.observation ? `<pre>${esc(String(e.observation).slice(0, 400))}</pre>` : ''}</div><span class="at">${at}</span></div>`;
+      if (e.type === 'shell') return `<div class="row tool"><span class="who">shell</span><div class="bubble"><code>! ${esc(e.command)}</code></div><span class="at">${at}</span></div>`;
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><title>${esc(name)}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 860px; margin: 0 auto; padding: 24px; background: #111612; color: #e6e6e6; }
+  h1 { font-size: 18px; border-bottom: 1px solid #2a2f2a; padding-bottom: 8px; }
+  .meta { color: #8a8f8a; font-size: 12px; margin-bottom: 20px; }
+  .row { display: flex; gap: 10px; margin: 10px 0; align-items: flex-start; }
+  .who { flex: 0 0 52px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: #8a8f8a; padding-top: 8px; }
+  .user .who { color: #7fc97f; }
+  .buddy .who { color: #79b8ff; }
+  .bubble { flex: 1; background: #1b201b; border: 1px solid #2a2f2a; border-radius: 8px; padding: 8px 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .tool .bubble { opacity: .85; font-size: 13px; }
+  .bubble pre { margin: 6px 0 0; font-size: 12px; color: #b8bdb8; max-height: 160px; overflow: hidden; }
+  .bubble code { color: #d7ba7d; font-size: 12px; }
+  .at { flex: 0 0 auto; font-size: 10px; color: #565b56; padding-top: 10px; }
+</style></head>
+<body>
+<h1>${esc(name)}</h1>
+<div class="meta">Engineer Buddy session · ${events.length} events${workspace ? ` · ${esc(workspace)}` : ''} · exported ${new Date().toISOString()}</div>
+${rows || '<p class="meta">(empty session)</p>'}
+</body></html>`;
+}
+
+/** /share — write the HTML export; returns the written path. */
+export function writeHtmlExport(root, file, opts = {}) {
+  const dir = path.join(root, EXPORTS_DIR);
+  fs.mkdirSync(dir, { recursive: true });
+  const out = path.join(dir, `${path.basename(file, '.jsonl')}.html`);
+  fs.writeFileSync(out, exportHtml(file, opts), 'utf8');
+  return out;
+}
+
+/** /fork — copy a session file to a new name; returns the new path. */
+export function forkSession(root, file, name = '') {
+  const dir = sessionsDir(root);
+  fs.mkdirSync(dir, { recursive: true });
+  const clean = String(name || '').trim().replace(/[^\w-]+/g, '-').replace(/^-+|-+$/g, '');
+  const base = path.basename(file, '.jsonl');
+  let target = path.join(dir, `${clean || `${base}-fork`}.jsonl`);
+  let n = 2;
+  while (fs.existsSync(target)) {
+    target = path.join(dir, `${clean || `${base}-fork`}-${n}.jsonl`);
+    n += 1;
+  }
+  fs.copyFileSync(file, target);
+  return target;
+}
+
+/** buddy import <file> — validate a session JSONL and copy it into .buddy/sessions/. */
+export function importSession(root, srcPath) {
+  const abs = path.resolve(String(srcPath || ''));
+  // Identity check first: re-importing something already in sessions/ is a
+  // caller mistake even when the file is empty (a fresh recorder writes '' ).
+  const dir = sessionsDir(root);
+  if (path.dirname(abs) === path.resolve(dir)) throw new Error('source is already in .buddy/sessions');
+  let raw;
+  try {
+    raw = fs.readFileSync(abs, 'utf8');
+  } catch (e) {
+    throw new Error(`cannot read ${abs}: ${e.message}`);
+  }
+  const lines = raw.split('\n').filter(Boolean);
+  let good = 0;
+  for (const l of lines) {
+    try { JSON.parse(l); good += 1; } catch { /* tolerate junk lines like loadSession */ }
+  }
+  if (!good) throw new Error('not a session file — no JSONL lines parsed');
+  fs.mkdirSync(dir, { recursive: true });
+  const target = path.join(dir, path.basename(abs).endsWith('.jsonl') ? path.basename(abs) : `${path.basename(abs)}.jsonl`);
+  if (path.resolve(target) === abs) throw new Error('source is already in .buddy/sessions');
+  if (fs.existsSync(target)) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    fs.writeFileSync(path.join(dir, `${stamp}-${path.basename(target)}`), raw, 'utf8');
+    return { target: path.join(dir, `${stamp}-${path.basename(target)}`), events: good, renamed: true };
+  }
+  fs.writeFileSync(target, raw, 'utf8');
+  return { target, events: good, renamed: false };
+}

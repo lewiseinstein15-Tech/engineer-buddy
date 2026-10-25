@@ -32,7 +32,7 @@ import { HookRunner } from '../hooks.js';
 import { connectMcpServers, buildMcpTools, describeMcpServers, MCP_CONFIG_PATH } from '../tools/mcp.js';
 import { ensureHarness, loadHarness, harnessContext } from '../harness/scaffold.js';
 import { HARNESS_DIR } from '../harness/defaults.js';
-import { SessionRecorder, listSessions, loadSession, sessionInfo, resumeMessages, writeExport, latestSession, findSession, renameSession } from '../session.js';
+import { SessionRecorder, listSessions, loadSession, sessionInfo, resumeMessages, writeExport, latestSession, findSession, renameSession, forkSession, writeHtmlExport, importSession } from '../session.js';
 import { reflect, recentLessons, experiencePath } from '../learn.js';
 import { c, PALETTE, logoBanner, spinner, renderToolCall, renderToolEvent, renderTodo, renderTable, formatMs, renderContextBar } from './ui.js';
 import { renderMarkdown } from './markdown.js';
@@ -53,7 +53,7 @@ export function fmtTok(n) {
 
 export const SLASH_COMMANDS = [
   'help', 'new', 'clear', 'screen', 'compact', 'context', 'map', 'model', 'gateways', 'cost',
-  'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'diff', 'hooks', 'docs', 'rename', 'memory', 'experience', 'learn', 'review',
+  'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'diff', 'hooks', 'docs', 'rename', 'branch', 'fork', 'share', 'memory', 'experience', 'learn', 'review',
   'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit',
 ];
 
@@ -77,6 +77,9 @@ export const SLASH_DESCRIPTIONS = {
   mcp: 'Show MCP servers + their tools (.buddy/mcp.json)',
   docs: 'Fetch official docs (/docs react hooks) — attaches to your next task',
   rename: 'Name the current session (/rename fix-auth) — resume later with buddy -r fix-auth',
+  branch: 'Save/restore conversation snapshots in memory (/branch save try-x · /branch try-x · /branch)',
+  fork: 'Copy this session to a new file and keep going (/fork experiment)',
+  share: 'Export the current session as one self-contained HTML file',
   tasks: 'List background shells (bash_bg / bash_output / kill_shell)',
   plan: 'Toggle plan mode — read-only research until the plan is approved',
   plans: 'List approved plans saved under .buddy/plans/',
@@ -390,6 +393,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   let toolCallsThisTurn = 0;
   const turnStart = { at: 0 };
   let lastDocs = null; // /docs result — attached to the next task (v0.17.0)
+  const branches = new Map(); // /branch save <name> → in-memory conversation snapshots (v0.21.0)
 
   const { chat, tools, todoState, mcp, shells, skills: skillCatalog, hooks: hookRunner, userToolWarnings, permissions: perms, permissionWarnings } = await createBuddySession({
     root,
@@ -954,6 +958,66 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           say(`\n  ${c.green('✓ renamed')} → ${c.bold(path.basename(target, '.jsonl'))} ${c.dim('— resume with: buddy -r ' + args.trim())}\n`);
         } catch (e) {
           say(`\n  ${c.red('rename failed')}: ${e.message}\n`);
+        }
+        break;
+      }
+      case 'branch': {
+        // In-memory conversation snapshots: save before an experiment,
+        // restore to switch back. Lives only in this REPL process.
+        const [sub, ...nameParts] = args.trim().split(/\s+/);
+        const name = nameParts.join('-').replace(/[^\w-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+        if (!sub || sub === 'list') {
+          say(
+            `\n${c.bold('Conversation branches')} (in-memory, this session)` +
+              (branches.size ? `\n${[...branches.keys()].map((k) => `  · ${k} (${branches.get(k).length} messages)`).join('\n')}` : '\n  (none saved)') +
+              `\n  ${c.dim('save the current line:   /branch save <name>')}` +
+              `\n  ${c.dim('switch back to a line:   /branch <name>')}` +
+              '\n'
+          );
+          break;
+        }
+        if (sub === 'save') {
+          if (!name) { say(`\n  usage: ${c.bold('/branch save <name>')}\n`); break; }
+          branches.set(name, JSON.parse(JSON.stringify(chat.messages)));
+          say(`\n  ${c.green('✓ branch saved')}: ${c.bold(name)} (${chat.messages.length} messages) — keep working, or return with ${c.dim(`/branch ${name}`)}\n`);
+          break;
+        }
+        if (!branches.has(sub)) {
+          say(`\n  no branch named "${sub}" — /branch lists what is saved\n`);
+          break;
+        }
+        // Auto-park the current line so nothing is lost when switching back.
+        const parked = `auto-${new Date().toISOString().slice(11, 19).replace(/:/g, '')}`;
+        branches.set(parked, JSON.parse(JSON.stringify(chat.messages)));
+        chat.messages.length = 0;
+        for (const m of branches.get(sub)) chat.messages.push(m);
+        say(`\n  ${c.green('✓ switched to branch')} ${c.bold(sub)} (${chat.messages.length} messages)` +
+            `\n  ${c.dim(`your previous line is parked as "${parked}" — /branch ${parked} to go back`)}\n`);
+        break;
+      }
+      case 'fork': {
+        if (!recorder) {
+          say('\n  no session to fork yet — send a task first\n');
+          break;
+        }
+        try {
+          const target = forkSession(root, recorder.path, args.trim());
+          say(`\n  ${c.green('✓ forked')} → ${c.bold(path.basename(target, '.jsonl'))} ${c.dim('— the copy is on disk; this session keeps running live')}\n`);
+        } catch (e) {
+          say(`\n  ${c.red('fork failed')}: ${e.message}\n`);
+        }
+        break;
+      }
+      case 'share': {
+        if (!recorder) {
+          say('\n  no session to share yet — send a task first\n');
+          break;
+        }
+        try {
+          const out = writeHtmlExport(root, recorder.path, { title: args.trim() || undefined });
+          say(`\n  ${c.green('✓ shared')} → ${c.bold(out)} ${c.dim('— one self-contained HTML file, no external resources')}\n`);
+        } catch (e) {
+          say(`\n  ${c.red('share failed')}: ${e.message}\n`);
         }
         break;
       }
