@@ -418,6 +418,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
         if (!Array.isArray(items)) return 'ERROR: items must be an array of {"id":..., "text":..., "status":"pending|in_progress|done", "blocked_by":["<id>"]}';
         if (!items.length) {
           todoState.latest = null;
+          try { fs.rmSync(path.join(scope.root, '.buddy', 'todo.json'), { force: true }); } catch { /* best effort */ }
           return 'PLAN cleared — send a new plan whenever you need one.';
         }
         const norm = items.slice(0, 8).map((it, i) => ({
@@ -449,6 +450,14 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
           return `ERROR: blocked_by violated — a blocked item cannot start or finish until every blocker is done. ${violations.slice(0, 3).join('; ')}. Fix the statuses or the blocked_by lists.`;
         }
         todoState.latest = norm;
+        // v0.15.0 — persist the plan so `buddy mcp-serve` (and future
+        // processes) can read it: the shared todo state becomes a durable
+        // cross-agent surface. Best-effort — never block the tool on it.
+        try {
+          const todoFile = path.join(scope.root, '.buddy', 'todo.json');
+          fs.mkdirSync(path.dirname(todoFile), { recursive: true });
+          fs.writeFileSync(todoFile, JSON.stringify({ savedAt: new Date().toISOString(), items: norm }, null, 2));
+        } catch { /* persistence is a bonus, not a requirement */ }
         const mark = (s) => (s === 'done' ? 'x' : s === 'in_progress' ? '~' : ' ');
         const lines = norm.map((it) => {
           let line = `- [${mark(it.status)}] #${it.id} ${it.text}`;

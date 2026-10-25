@@ -27,6 +27,7 @@ import { runDepAudit } from './skills/dep-auditor.js';
 import { runIssueTriage } from './skills/issue-triage.js';
 import { runReleaseNotes } from './skills/release-notes.js';
 import { startRepl, runOneShot, VERSION } from './terminal/repl.js';
+import { startMcpServer } from './mcpserver.js';
 import { ensureHarness } from './harness/scaffold.js';
 import { log, warn, setVerbose, truncate, BuddyError } from './util.js';
 import { parseArgs } from 'node:util';
@@ -56,6 +57,7 @@ GitHub skills (CI):
   engineer-buddy release-notes --repo OWNER/NAME [--since TAG] [--dry-run] [--post-issue N]
   engineer-buddy doctor
   engineer-buddy ask "prompt"
+  engineer-buddy mcp-serve [--allow-writes]   expose Buddy as an MCP stdio server
 
 Environment:
   GITHUB_TOKEN / BUDDY_GITHUB_TOKEN   GitHub token (auto-provided by Actions)
@@ -287,7 +289,32 @@ async function cmdInit(argv) {
   return 0;
 }
 
-async function main() {
+async function cmdMcpServe(argv) {
+  const { values } = parseArgs({
+    args: argv,
+    options: { dir: { type: 'string' }, 'allow-writes': { type: 'boolean', default: false } },
+    allowPositionals: true,
+  });
+  const root = values.dir ? path.resolve(values.dir) : process.cwd();
+  startMcpServer(root, { writes: Boolean(values['allow-writes']), version: VERSION });
+  console.error(`[buddy] MCP stdio server up — root ${root}, writes ${values['allow-writes'] ? 'ENABLED' : 'disabled (--allow-writes to enable)'}`);
+  // The stdio loop owns the process until stdin closes (the parent agent's
+  // transport closes the pipe when it shuts us down).
+  return new Promise((resolve) => {
+    const done = () => resolve(0);
+    if (process.stdin.isTTY) {
+      // No parent transport (someone ran it by hand) — idle forever is a
+      // mistake; wait 3s then bail with a hint.
+      setTimeout(() => {
+        console.error('[buddy] no MCP transport on stdin (TTY) — run me from an MCP client, e.g. .buddy/mcp.json: {"command":"buddy","args":["mcp-serve"]}');
+        resolve(2);
+      }, 3000);
+      return;
+    }
+    process.stdin.once('end', done);
+    process.stdin.once('close', done);
+  });
+}async function main() {
   const [cmd, ...argv] = process.argv.slice(2);
   try {
     if (cmd === undefined || cmd === 'chat') {
@@ -303,6 +330,7 @@ async function main() {
     if (cmd === 'release-notes') process.exit(await cmdReleaseNotes(argv));
     if (cmd === 'doctor') process.exit(await cmdDoctor(argv));
     if (cmd === 'ask') process.exit(await cmdAsk(argv));
+    if (cmd === 'mcp-serve') process.exit(await cmdMcpServe(argv));
     usage();
     process.exit(2);
   } catch (e) {
