@@ -17,6 +17,7 @@ import { createRequire } from 'node:module';
 import { createChat } from '../agent/chat.js';
 import { loadAgents } from '../agent/subagents.js';
 import { LocalScope, buildLocalTools, runBash } from '../tools/local.js';
+import { loadUserTools } from '../tools/usertools.js';
 import { buildWebTools } from '../tools/web.js';
 import { buildTaskTool } from '../tools/task.js';
 import { BackgroundShells, buildBackgroundTools } from '../tools/background.js';
@@ -133,8 +134,14 @@ async function makeScopeAndTools({ root, router = null, onEvent = () => {}, appr
   // Plan mode (interactive only): exit_plan is registered so the model has a
   // door out — but it is hidden from the prompt unless plan mode is ON.
   const exitPlanTool = modes ? buildExitPlanTool({ modes, root, onApproved: onPlanApproved }) : null;
-  const tools = [...base, taskTool, skillTool, ...(exitPlanTool ? [exitPlanTool] : []), ...buildMcpTools(mcp.connected)];
-  return { scope, tools, todoState, mcp, shells, skills };
+  const mcpTools = buildMcpTools(mcp.connected);
+  // User-defined tools (.buddy/tools/<name>/) — sandboxed child-process tools
+  // (v0.14.0). They can never shadow built-ins, task, skills or MCP tools.
+  const { tools: userTools, warnings: userToolWarnings } = loadUserTools(root, {
+    extraNames: new Set([...base, taskTool, skillTool, ...mcpTools, ...(exitPlanTool ? [exitPlanTool] : [])].map((t) => t.name)),
+  });
+  const tools = [...base, taskTool, skillTool, ...(exitPlanTool ? [exitPlanTool] : []), ...mcpTools, ...userTools];
+  return { scope, tools, todoState, mcp, shells, skills, userToolWarnings };
 }
 
 function makeHarness(root) {
@@ -150,7 +157,7 @@ function makeHarness(root) {
 
 /** Create a chat session bound to a workspace root. */
 export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {}, repoMap = null } = {}) {
-  const { tools, todoState, mcp, shells, skills } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved });
+  const { tools, todoState, mcp, shells, skills, userToolWarnings } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved });
   const harness = makeHarness(root);
   // Hooks: the deterministic guarantee layer (.buddy/settings.json). One
   // runner per session — the REPL reads it for /hooks, the loop obeys it.
@@ -161,7 +168,7 @@ export async function createBuddySession({ root = process.cwd(), router, yolo = 
   if (resumeFrom) {
     for (const m of resumeMessages(loadSession(resumeFrom))) session.messages.push(m);
   }
-  return { chat: session, tools, todoState, mcp, shells, skills, hooks };
+  return { chat: session, tools, todoState, mcp, shells, skills, hooks, userToolWarnings };
 }
 
 function defaultApproval(busy) {
@@ -343,7 +350,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   let toolCallsThisTurn = 0;
   const turnStart = { at: 0 };
 
-  const { chat, tools, todoState, mcp, shells, skills: skillCatalog, hooks: hookRunner } = await createBuddySession({
+  const { chat, tools, todoState, mcp, shells, skills: skillCatalog, hooks: hookRunner, userToolWarnings } = await createBuddySession({
     root,
     router,
     modes,
@@ -645,7 +652,10 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           `\n${renderTable(
             tools.map((t) => [c.bold(t.name), t.risky ? c.yellow('gate') : c.green('safe'), t.description]),
             { headers: ['tool', 'gate', 'what it does'] }
-          )}\n`
+          )}` +
+            `\n${c.dim('  add your own: .buddy/tools/<name>/ with manifest.json (name, description, version, argsSchema, safe) + index.js exporting run(args, ctx) — each call runs sandboxed in a child process')}` +
+            (userToolWarnings?.length ? `\n${c.yellow(`  skipped: ${userToolWarnings.join(' · ')}`)}` : '') +
+            '\n'
         );
         break;
       case 'agents': {
