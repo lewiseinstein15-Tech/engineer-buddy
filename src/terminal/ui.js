@@ -24,6 +24,49 @@ export const PALETTE = useColor
   ? c
   : { dim: (x) => x, bold: (x) => x, italic: (x) => x, underline: (x) => x, cyan: (x) => x, green: (x) => x, yellow: (x) => x, red: (x) => x, blue: (x) => x, magenta: (x) => x, gray: (x) => x };
 
+// ── Themes (v0.22.0) — /theme dark|light|high-contrast|mono ─────────────────
+// c is a mutable registry: setTheme swaps the painters in place, so every
+// renderer (markdown, diffs, tables, banners) re-themes on the next paint.
+
+export const THEMES = {
+  dark: {}, // the built-in default — nothing to change
+  light: { gray: wrap('90'), dim: wrap('2') }, // light bg: keep hues, avoid faint-on-light gray text
+  'high-contrast': { cyan: wrap('96'), green: wrap('92'), yellow: wrap('93'), red: wrap('91'), blue: wrap('94'), magenta: wrap('95'), gray: wrap('97') },
+  mono: {}, // filled with identity painters below — zero color anywhere
+};
+
+const DARK_DEFAULTS = {
+  dim: wrap('2'), bold: wrap('1'), italic: wrap('3'), underline: wrap('4'),
+  cyan: wrap('36'), green: wrap('32'), yellow: wrap('33'), red: wrap('31'),
+  blue: wrap('34'), magenta: wrap('35'), gray: wrap('90'), inverse: wrap('7'),
+};
+
+const identity = (s) => String(s);
+
+let activeTheme = 'dark';
+
+/** Switch the global palette. Returns the applied name or null if unknown. */
+export function setTheme(name) {
+  const t = String(name || '').toLowerCase().trim();
+  if (!(t in THEMES)) return null;
+  if (t === 'mono') {
+    for (const k of Object.keys(DARK_DEFAULTS)) c[k] = identity;
+  } else {
+    for (const [k, fn] of Object.entries(DARK_DEFAULTS)) c[k] = fn;
+    for (const [k, fn] of Object.entries(THEMES[t])) c[k] = fn;
+  }
+  activeTheme = t;
+  return t;
+}
+
+export function currentTheme() {
+  return activeTheme;
+}
+
+export function themeNames() {
+  return Object.keys(THEMES);
+}
+
 export const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /** Interval spinner with live label updates. stop() clears the line. */

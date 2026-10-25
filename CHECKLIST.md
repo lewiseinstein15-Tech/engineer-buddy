@@ -66,8 +66,8 @@ Sources: Claude Code official docs (code.claude.com/docs), the full 18-tool syst
 - [ ] **Language packs** — TS/Python/Go/Rust analyzer plugins (wire into the LSP/symbol tools below per language).
 - [ ] **Framework packs** — React, Next.js, Django, Rails convention packs (MEMORY.md templates + guardrails + skill recipes).
 - [ ] **Custom reporters** — Slack, Linear, Jira, Notion notification/report plugins (via the HTTP tool + hooks).
-- [ ] **Output styles** — `/output-style` (default / explanatory / learning + custom .md file) that swaps the system-prompt wrapper.
-- [ ] **Statusline customization** — `/statusline` template or script: branch, gateway, ctx %, session cost, todo count.
+- [x] **Output styles** — `/output-style` (default / explanatory / learning + custom .md file) that swaps the system-prompt wrapper. **✅ shipped v0.22.0** — styles are markdown files in `.buddy/harness/output-styles/` (project) + `~/.buddy/output-styles/` (personal, project wins); the file body REPLACES the harness systemprompt (frontmatter stripped, `description:` feeds the lister); `/output-style <name>` persists to `chat.outputStyle` and applies from the next session (the harness is captured once), `/output-style default` restores; `/output-style` lists everything with sources.
+- [x] **Statusline customization** — `/statusline` template or script: branch, gateway, ctx %, session cost, todo count. **✅ shipped v0.22.0** — template string with placeholders `{branch} {gateway} {ctx} {session} {todo} {cwd}` (unknown/empty placeholders vanish, whitespace squeezed); rendered under the turn footer every turn; persisted under `chat.statusline`; `/statusline off` clears. Script mode stays open (template covers the 95% case).
 
 ## 4. P1 — Code Intelligence (Buddy's extended wishlist)
 
@@ -95,12 +95,12 @@ Sources: Claude Code official docs (code.claude.com/docs), the full 18-tool syst
 - [ ] **Streaming thought process** — render the model's reasoning/gateway deltas live as they arrive, not just the final answer. *Depends on gateway streaming support; pollinations/kilo partially stream today.*
 - [ ] **Collapsible thinking blocks** — structured reasoning blocks the TUI can fold/expand (renderer already owns the frame — fold state is cheap).
 - [ ] **Decision rationale per step** — log why this file / why this edit next to each tool card in the session JSONL.
-- [ ] **Configurable verbosity** — `silent → summary → verbose` narration levels (`/verbosity`), stored per project.
+- [x] **Configurable verbosity** — `silent → summary → verbose` narration levels (`/verbosity`), stored per project. **✅ shipped v0.22.0** — `silent` = replies + errors only (tool chatter gone), `summary` = the default tool cards, `verbose` = cards PLUS the first line of each observation; live ref means the change applies mid-session; persisted in `.buddy/settings.json` under `chat.verbosity` (deep-merged — UI tweaks can never wipe hooks/permissions).
 - [ ] **Replayable narration** — replay any past session step-by-step (feeds the time-travel item above).
 
 ## 8. P2 — UX & TUI polish (feel identical to Claude Code)
 
-- [ ] **Themes** — `/theme` dark / light / high-contrast; palette-driven renderer colors.
+- [x] **Themes** — `/theme` dark / light / high-contrast; palette-driven renderer colors. **✅ shipped v0.22.0** — `c` is a mutable painter registry: `setTheme` swaps every painter in place so markdown, diffs, tables and banners re-theme on the next paint; `dark` (default), `light`, `high-contrast` (bright ANSI variants), `mono` (zero color); persisted under `chat.theme`; `NO_COLOR` still always wins.
 - [ ] **Vim mode** — `/vim`: normal/insert, hjkl, dd/yy/p on the input line.
 - [ ] **Shift+Enter newline** — `/terminal-setup` helper; alt+enter / `\`+enter fallback.
 - [x] **Queued messages** — type while a turn is running; queued prompts dispatch after the turn ends (not swallowed like today). **✅ shipped v0.12.4** — busy tasks push to a visible queue (`⌁ queued — I'll run it when this turn ends (N waiting)`), the busy footer shows the depth (`· N queued`), and the queue drains in order after the turn with a `▶ running queued task` announce per item; Ctrl+C interrupts the turn AND clears the queue; slash commands still refuse while busy (only real tasks queue). 5 tests (source tripwires — the REPL needs a TTY).

@@ -34,7 +34,9 @@ import { ensureHarness, loadHarness, harnessContext } from '../harness/scaffold.
 import { HARNESS_DIR } from '../harness/defaults.js';
 import { SessionRecorder, listSessions, loadSession, sessionInfo, resumeMessages, writeExport, latestSession, findSession, renameSession, forkSession, writeHtmlExport, importSession } from '../session.js';
 import { reflect, recentLessons, experiencePath } from '../learn.js';
-import { c, PALETTE, logoBanner, spinner, renderToolCall, renderToolEvent, renderTodo, renderTable, formatMs, renderContextBar } from './ui.js';
+import { c, PALETTE, logoBanner, spinner, renderToolCall, renderToolEvent, renderTodo, renderTable, formatMs, renderContextBar, setTheme, themeNames, currentTheme } from './ui.js';
+import { getChatSetting, setChatSetting } from '../settings.js';
+import { listOutputStyles, loadOutputStyle } from '../harness/outputstyles.js';
 import { renderMarkdown } from './markdown.js';
 import { expandMentions } from './mentions.js';
 import { loadCustomCommands, applyCustomCommand, renderCustomCommandHelp } from './customcommands.js';
@@ -53,7 +55,7 @@ export function fmtTok(n) {
 
 export const SLASH_COMMANDS = [
   'help', 'new', 'clear', 'screen', 'compact', 'context', 'map', 'model', 'gateways', 'cost',
-  'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'diff', 'hooks', 'docs', 'rename', 'branch', 'fork', 'share', 'memory', 'experience', 'learn', 'review',
+  'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'diff', 'hooks', 'docs', 'rename', 'branch', 'fork', 'share', 'verbosity', 'theme', 'output-style', 'statusline', 'memory', 'experience', 'learn', 'review',
   'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit',
 ];
 
@@ -80,6 +82,10 @@ export const SLASH_DESCRIPTIONS = {
   branch: 'Save/restore conversation snapshots in memory (/branch save try-x · /branch try-x · /branch)',
   fork: 'Copy this session to a new file and keep going (/fork experiment)',
   share: 'Export the current session as one self-contained HTML file',
+  verbosity: 'silent | summary | verbose — how much of the work is shown (/verbosity silent)',
+  theme: 'dark | light | high-contrast | mono — terminal palette (/theme mono)',
+  'output-style': 'Swap the system-prompt wrapper (/output-style <name>; files in .buddy/harness/output-styles/)',
+  statusline: 'Template for the post-turn status line (/statusline "{branch} · {gateway} · {ctx}%")',
   tasks: 'List background shells (bash_bg / bash_output / kill_shell)',
   plan: 'Toggle plan mode — read-only research until the plan is approved',
   plans: 'List approved plans saved under .buddy/plans/',
@@ -99,6 +105,19 @@ export const SLASH_DESCRIPTIONS = {
   quit: 'Leave',
   exit: 'Leave',
 };
+
+/** /statusline — fill a template: {branch} {gateway} {ctx} {session} {todo} {cwd}. Pure. */
+export function renderStatusline(template, ctx = {}) {
+  const t = String(template || '').trim();
+  if (!t) return '';
+  return t
+    .replace(/\{(\w+)\}/g, (_, k) => {
+      const v = ctx[k];
+      return v === undefined || v === null || v === '' ? '' : String(v);
+    })
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 export function parseSlash(input) {
   const s = String(input || '').trim();
@@ -155,6 +174,13 @@ function makeHarness(root) {
   ensureHarness(root);
   // root passed → MEMORY.md @path imports are expanded at assembly time.
   const hctx = harnessContext(loadHarness(root), root);
+  // /output-style (v0.22.0): a style file REPLACES the systemprompt section.
+  // Takes effect next session (the harness is captured once per session).
+  const styleName = getChatSetting(root, 'outputStyle');
+  if (styleName && styleName !== 'default') {
+    const style = loadOutputStyle(root, styleName);
+    if (style) hctx.systemprompt = `${style.body}\n\n(Using output style "${style.name}" — /output-style default returns to the built-in prompt.)`;
+  }
   const lessons = recentLessons(root);
   if (lessons.length) {
     hctx.memory += `\n\n## Lessons from past tasks\n${lessons.map((l) => `- ${l}`).join('\n')}`;
@@ -188,9 +214,13 @@ function defaultApproval(busy) {
 
 // ── Event rendering (shared by REPL and one-shot) ────────────────────────────
 
-function makeRenderer({ quiet = false, toolByName = new Map() } = {}) {
+function makeRenderer({ quiet = false, toolByName = new Map(), verbosity = 'summary' } = {}) {
+  // verbosity may be a live ref object ({level}) so /verbosity changes apply mid-session.
+  const level = () => (typeof verbosity === 'object' && verbosity !== null ? verbosity.level : verbosity);
   return function renderEvent(ev) {
     if (quiet && ev.type !== 'say' && ev.type !== 'error') return;
+    // /verbosity silent — replies and errors only, no tool chatter.
+    if (level() === 'silent' && ev.type !== 'say' && ev.type !== 'error') return;
     if (ev.type === 'say') {
       console.log(`\n${c.bold(c.cyan('●'))} ${c.bold('Buddy')}`);
       console.log(renderMarkdown(ev.text, { color: PALETTE }));
@@ -202,6 +232,10 @@ function makeRenderer({ quiet = false, toolByName = new Map() } = {}) {
         return;
       }
       console.log(renderToolEvent(ev, { preview: !quiet }));
+      // /verbosity verbose — observations follow their tool cards.
+      if (level() === 'verbose' && ev.observation && !ev.denied) {
+        console.log(c.gray(`  ↳ ${String(ev.observation).split('\n')[0].slice(0, 160)}${String(ev.observation).length > 160 ? '…' : ''}`));
+      }
       if (ev.salvaged) console.log(c.gray('  ↺ prose reply salvaged as the plan — approve at the gate or deny to refine'));
     } else if (ev.type === 'error') {
       console.log(`  ${c.red('!')} ${ev.text}`);
@@ -394,6 +428,11 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   const turnStart = { at: 0 };
   let lastDocs = null; // /docs result — attached to the next task (v0.17.0)
   const branches = new Map(); // /branch save <name> → in-memory conversation snapshots (v0.21.0)
+  // UX/narration config (v0.22.0): theme now, verbosity live, statusline template.
+  const themeSetting = getChatSetting(root, 'theme');
+  if (themeSetting) setTheme(themeSetting);
+  const verbosityRef = { level: getChatSetting(root, 'verbosity', 'summary') };
+  const statuslineRef = { template: getChatSetting(root, 'statusline', '') };
 
   const { chat, tools, todoState, mcp, shells, skills: skillCatalog, hooks: hookRunner, userToolWarnings, permissions: perms, permissionWarnings } = await createBuddySession({
     root,
@@ -456,7 +495,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     }
   }
 
-  const render = makeRenderer({ toolByName: new Map(tools.map((t) => [t.name, t])) });
+  const render = makeRenderer({ toolByName: new Map(tools.map((t) => [t.name, t])), verbosity: verbosityRef.level });
 
   const ensureRecorder = (firstMsg) => {
     if (!recorder) {
@@ -1021,6 +1060,78 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         }
         break;
       }
+      case 'verbosity': {
+        const v = args.trim().toLowerCase();
+        if (!['silent', 'summary', 'verbose'].includes(v)) {
+          say(`\n  usage: ${c.bold('/verbosity silent|summary|verbose')}${c.dim('  — silent: replies only · summary: tool cards · verbose: cards + observations')}\n  current: ${c.bold(verbosityRef.level)} (persisted per project in .buddy/settings.json)\n`);
+          break;
+        }
+        verbosityRef.level = v;
+        try { setChatSetting(root, 'verbosity', v); } catch { /* persistence is best effort */ }
+        say(`\n  ${c.green('✓ verbosity:')} ${c.bold(v)} — takes effect on the next turn\n`);
+        break;
+      }
+      case 'theme': {
+        const t = args.trim().toLowerCase();
+        if (!t) {
+          say(`\n  usage: ${c.bold(`/theme ${themeNames().join('|')}`)}\n  current: ${c.bold(currentTheme())} (persisted; NO_COLOR always wins)\n`);
+          break;
+        }
+        const applied = setTheme(t);
+        if (!applied) {
+          say(`\n  unknown theme "${args.trim()}" — available: ${themeNames().join(', ')}\n`);
+          break;
+        }
+        try { setChatSetting(root, 'theme', applied); } catch { /* best effort */ }
+        say(`\n  ${c.green('✓ theme:')} ${c.bold(applied)} — every render from now on uses it\n`);
+        break;
+      }
+      case 'output-style': {
+        const name = args.trim();
+        if (!name) {
+          const styles = listOutputStyles(root);
+          const current = getChatSetting(root, 'outputStyle', 'default');
+          say(
+            `\n${c.bold('Output styles')} ${c.dim('(a style REPLACES the system prompt — takes effect next /new)')}` +
+              `\n  current: ${c.bold(current)}` +
+              (styles.length ? `\n${styles.map((s) => `  · ${c.bold(s.name)} ${c.dim(`(${s.source})`)} ${s.description || ''}`).join('\n')}` : '\n  (no custom styles yet)') +
+              `\n  ${c.dim('add one: .buddy/harness/output-styles/<name>.md (markdown body = the whole system prompt)')}` +
+              `\n  ${c.dim('apply: /output-style <name> · back to normal: /output-style default')}\n`
+          );
+          break;
+        }
+        if (name !== 'default' && !loadOutputStyle(root, name)) {
+          say(`\n  no style "${name}" — /output-style lists what exists (.buddy/harness/output-styles/ + ~/.buddy/output-styles/)\n`);
+          break;
+        }
+        try {
+          setChatSetting(root, 'outputStyle', name);
+          say(`\n  ${c.green('✓ output style:')} ${c.bold(name)} — ${name === 'default' ? 'built-in prompt restored' : 'applies from the NEXT /new (this session keeps its prompt)'}\n`);
+        } catch (e) {
+          say(`\n  ${c.red('could not save')}: ${e.message}\n`);
+        }
+        break;
+      }
+      case 'statusline': {
+        const t = args.trim();
+        if (!t) {
+          say(`\n  usage: ${c.bold('/statusline "{branch} · {gateway} · {ctx}% ctx · #{todo} todo"')}` +
+              `\n  ${c.dim('placeholders: {branch} {gateway} {ctx} {session} {todo} {cwd} — off with /statusline off')}` +
+              (statuslineRef.template ? `\n  current: ${c.bold(statuslineRef.template)}` : '\n  current: (off)') +
+              '\n');
+          break;
+        }
+        if (t === 'off') {
+          statuslineRef.template = '';
+          try { setChatSetting(root, 'statusline', ''); } catch { /* best effort */ }
+          say(`\n  ${c.green('✓ statusline off')}\n`);
+          break;
+        }
+        statuslineRef.template = t;
+        try { setChatSetting(root, 'statusline', t); } catch { /* best effort */ }
+        say(`\n  ${c.green('✓ statusline set')} — rendered after every turn:\n  ${renderStatusline(t, { branch: 'main', gateway: 'kilo', ctx: '12', session: 'my-session', todo: '2/5', cwd: path.basename(root) })}\n`);
+        break;
+      }
       case 'memory': {
         const memPath = path.join(root, HARNESS_DIR, 'MEMORY.md');
         say(`\n${c.bold('Project memory')}: ${memPath}`);
@@ -1405,6 +1516,16 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           const ctxK = (chat.historyChars() / 1000).toFixed(1);
           const gw = lastGateway || router.order[0];
           console.log(c.gray(`  ⏱ ${secs.toFixed(1)}s · ${toolCallsThisTurn} tool call${toolCallsThisTurn === 1 ? '' : 's'} · ${ctxK}k ctx${out.steps ? c.gray(` · ${out.steps} steps`) : ''}${gw ? c.gray(` · ${gw}`) : ''}`));
+          // /statusline (v0.22.0) — one configured line under the footer.
+          const statusLine = renderStatusline(statuslineRef.template, {
+            branch: (git || '').replace(/^on\s+/, ''),
+            gateway: lastGateway || '',
+            ctx: `${ctxK}k`,
+            session: recorder ? path.basename(recorder.path, '.jsonl') : '',
+            todo: todoState.latest ? `${todoState.latest.filter((t) => t.status === 'done').length}/${todoState.latest.length}` : '',
+            cwd: path.basename(root),
+          });
+          if (statusLine) console.log(c.gray(`  ${statusLine}`));
           debugLog(`turn done: steps=${out.steps} said=${out.said ? 'yes' : 'no'}`);
         } catch (e) {
           console.log(`  ${c.red('turn failed')}: ${truncate(e.message, 300)}`);
