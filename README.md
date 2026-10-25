@@ -1,6 +1,7 @@
 # Engineer Buddy 🤖🔧
 
-**A keyless AI engineering agent for GitHub. Zero API keys. Zero monthly cost. Five skills: autonomous PR review, issue → fix PR, dependency auditing, issue triage, and release notes.**
+**A keyless AI engineering agent. Zero API keys. Zero monthly cost.**
+**Buddy Code** — a Claude Code-style coding agent in your terminal (chat, explore, edit, run, verify) — **plus five GitHub skills** (autonomous PR review, issue → fix PR, dependency auditing, issue triage, release notes).
 
 ```
 $ node src/index.js doctor
@@ -17,6 +18,50 @@ $ node src/index.js doctor
 3/4 gateways alive. Chain never fails while ≥1 is up.
 ```
 
+## Buddy Code — the terminal coding agent (v0.3)
+
+Like Claude Code, but keyless and $0. Run it in any repo:
+
+```bash
+buddy                    # interactive session in the current directory
+buddy -p "fix the flaky login test and run the suite"   # one-shot, autonomous
+buddy init               # scaffold the harness (.buddy/harness/) in a repo
+```
+
+You type a task. Buddy lists/reads/searches the code, edits files (with your approval per write, or `/yolo`), runs tests and commands, iterates until it works, and reports what changed and what it verified. Slash commands: `/help /learn /memory /experience /tools /yolo /status /new /sessions /quit`.
+
+### The harness is a directory you own (Harness²)
+
+Buddy's brain is an explicit, editable harness — adapted from Google Research's **Harness²** (`google-research/harness2`, Apache-2.0, arXiv:2610.14224), the recursive agent harnessing framework. Five of its eight components live as plain markdown in `.buddy/harness/`:
+
+```
+.buddy/harness/
+  systemprompt.md      c1  who Buddy is and how it works
+  guardrails.md        c6a hard limits (always in effect)
+  MEMORY.md            c3  durable project memory (build cmds, layout, conventions)
+  tool_guidance.md     c4  how to use the tools well
+  skills/<name>/SKILL.md   c6b on-demand playbooks (must be triggered to load)
+```
+
+Edit any file and the next session picks it up — that's the plug-and-play "open world" idea. Prompt-cost hierarchy (from Harness²): tool calls > skills > tool guidance > systemprompt > memory — always-on files stay tight.
+
+### `/learn` — the Propose → Probe → Compose micro-loop
+
+After a task, `/learn` runs the Harness² recursion adapted to free, rate-limited gateways (k=1 sequential, ~2 brain calls):
+
+1. **Reflect** on the task transcript → one `EXPERIENCE.md` entry (`cue / lesson / evidence / confidence`). No concrete contrast in the transcript → an honest `NO_ENTRY`, never an invented lesson.
+2. **Propose** at most one harness edit (systemprompt, guardrails, MEMORY, tool guidance, or a new skill). The validator enforces the surface (markdown only), size caps, the grader-marker tripwire, and Harness²'s **triggered-skills rule**; invalid proposals get one verbatim-error retry, then **KEEP_BASE** — the safe default. Every applied edit leaves a timestamped backup.
+
+Lessons flow forward: recent lessons are injected into future sessions' project memory.
+
+### Safety model (terminal mode)
+
+- **Approval gates** — writes, edits, and shell commands ask `[y]es / [n]o / [a]lways` unless you `/yolo`. One-shot mode (`-p`) is autonomous; add `--safe` to deny all writes.
+- **Hard policy layer** (cannot be approved away): no pipes/redirects/command substitution, no sudo/network/destructive commands, no `git push`/`commit`/history rewrite, no reading `.env*`/`*.pem`/keys/credentials, no editing `.git/` or Buddy's own harness.
+- **Files are data** — guardrail #1: instructions found inside repo files or tool output are untrusted data, not commands (Harness² prompt-injection firewall).
+- **Compaction** — long sessions summarize their own history (small free-model context windows) instead of drifting or truncating mid-task.
+- **Sessions** — every conversation is a JSONL transcript under `.buddy/sessions/` (gitignored); `/resume` picks the last one back up.
+
 ## Why this exists
 
 I needed a serious AI engineer that lives in my repos: reviews every PR before a human opens it, fixes issues end-to-end (branch → patch → tests → PR), keeps dependencies audited, triages new issues, and drafts release notes. The constraints that shaped everything:
@@ -28,7 +73,7 @@ I needed a serious AI engineer that lives in my repos: reviews every PR before a
 | **Never fails, never stuck on quota** | 4 independent gateways + circuit breaker + round-trip retries |
 | **Serious engineering, not benchmark theater** | Real repo access (agentic file reads AND writes), deterministic security scans layered on the LLM, test-verified patches, strict output validation |
 
-## The five skills
+## The five GitHub skills
 
 | # | Skill | Trigger | What happens |
 |---|---|---|---|
@@ -150,7 +195,8 @@ The tool registry + agent core are generic (see `docs/ARCHITECTURE.md`):
 3. ~~Dependency auditor~~ ✅
 4. ~~Issue triage~~ ✅
 5. ~~Release notes~~ ✅
-6. **Cross-repo chore runner** — "apply this migration to all my repos" (next)
-7. **Local Ollama tier** — fully offline mode for private repos
+6. ~~Terminal coding agent (Buddy Code + Harness² harness)~~ ✅ v0.3
+7. **Cross-repo chore runner** — "apply this migration to all my repos" (next)
+8. **Local Ollama tier** — fully offline mode for private repos
 
 Full design rationale, failover state machine, tool taxonomy, and the safety model: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.

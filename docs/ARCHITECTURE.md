@@ -1,6 +1,6 @@
 # Engineer Buddy — Architecture
 
-> Status: v0.1 — PR reviewer shipped. This document is the full engineering design: the brain chain, the agent skeleton, the complete tool taxonomy, and the deployment topology. Everything here runs at **$0/month with zero API keys**.
+> Status: v0.3 — Buddy Code (terminal coding agent with a Harness² harness) + five GitHub skills shipped. This document is the full engineering design: the brain chain, the agent skeleton, the complete tool taxonomy, the deployment topology, and the terminal agent. Everything here runs at **$0/month with zero API keys**.
 
 ---
 
@@ -310,3 +310,62 @@ Separation is deliberate: buddy updates ship on their own cadence and never requ
 | GitHub Actions (public repo) | free | 1 job ≈ 1 min | $0 |
 | LLM calls (keyless) | free | 2–6 calls | $0 |
 | **Total** | | | **$0.00** |
+
+## 8. Buddy Code (v0.3) — the terminal coding agent
+
+The same brain and tool discipline, running locally like Claude Code. New modules:
+
+```
+src/
+  harness/defaults.js     the default Harness² surface as markdown (5 of 8 components)
+  harness/scaffold.js     ensure/load/validate/apply + self-edit firewall (AGENT_DENY_GLOBS)
+  agent/chat.js           conversational loop: strict-JSON protocol, approval gates,
+                          per-turn tool caps, 1 protocol-repair retry, history compaction
+  tools/local.js          LocalScope (fs read/write/replace/append/list/search) + bash
+                          with blockedBashReason() policy + segment-based secret refusal
+  terminal/ui.js          zero-dep ANSI rendering (colors, spinner, tool-call display)
+  terminal/repl.js        interactive REPL + slash commands + approval prompts;
+                          runOneShot() for headless `buddy -p`
+  session.js              JSONL transcripts (.buddy/sessions/), /resume
+  learn.js                Harness² k=1 reflection: EXPERIENCE.md + validated harness
+                          proposal with verbatim-error retry and KEEP_BASE default
+```
+
+### Harness² adaptation (why k=1)
+
+Harness² (google-research/harness2, Apache-2.0) runs k base rollouts + 2k agentic
+proposal sessions + k compositions per task. On free anonymous gateways (200 req/h
+on the primary) that budget is ruinous, so Buddy runs the **k=1 sequential** variant:
+one task run → one reflect+propose call → whole-proposal validation → one
+verbatim-error retry → apply or KEEP_BASE. What is kept from the paper:
+
+- **8-component harness model** (5 components as editable markdown; subagents/scripts/plugins deferred)
+- **Evidence-as-files** — transcripts live on disk; the reflector sees a compact digest, not a stuffed prompt
+- **Triggered-skills rule** — a skill file without a literal trigger in always-on text is rejected
+- **Grader-marker tripwires** — evaluation vocabulary never enters harness files
+- **KEEP_BASE as a first-class answer** — unverifiable proposals change nothing
+- **Honest experience records** — `NO_ENTRY` when a transcript shows no contrast; `confounded`-style humility over invented lessons
+
+### Approval and hard-policy layering
+
+```
+tool call ──▶ hard policy (blockedBashReason / AGENT_DENY_GLOBS / secret paths)
+                 │ blocked → observation "BLOCKED: …", model adapts
+                 ▼
+            risky? ──▶ approval callback (interactive y/n/a, /yolo, or headless policy)
+                 │ denied → observation "DENIED by the user…"
+                 ▼
+            run → observation → next step
+```
+
+Hard policy is not overridable by any mode: no pipes/redirects/substitution, no
+sudo/network/destructive, no git push/commit/history rewrite, no secrets on disk
+readable, no self-editing of `.buddy/harness/` by the agent's file tools (the only
+path in is the validated `/learn` proposal flow with backups).
+
+### Context management
+
+History budget (default 48k chars) triggers compaction: older messages are
+summarized by the brain into one message, the last 4 stay verbatim. The system
+prompt is rebuilt per call from the harness files, so user edits apply instantly.
+Recent `EXPERIENCE.md` lessons are appended to project memory at session start.

@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 // index.js — Engineer Buddy CLI.
 //
+// LOCAL (Buddy Code — like Claude Code, keyless brain):
+//   engineer-buddy                    interactive session in this directory
+//   engineer-buddy -p "task"          one-shot autonomous task (headless)
+//   engineer-buddy init               scaffold the .buddy/harness surface
+//
+// GITHUB SKILLS (CI, keyless):
 //   engineer-buddy pr-review     --repo O/R --pr N        autonomous PR review
 //   engineer-buddy fix-issue     --repo O/R --issue N     issue → diagnosis → patch → tests → PR
 //   engineer-buddy dep-audit     --repo O/R               npm audit → triage → tracking issue
@@ -20,17 +26,26 @@ import { runIssueFix } from './skills/issue-fixer.js';
 import { runDepAudit } from './skills/dep-auditor.js';
 import { runIssueTriage } from './skills/issue-triage.js';
 import { runReleaseNotes } from './skills/release-notes.js';
+import { startRepl, runOneShot, VERSION } from './terminal/repl.js';
+import { ensureHarness } from './harness/scaffold.js';
 import { log, warn, setVerbose, truncate, BuddyError } from './util.js';
 import { parseArgs } from 'node:util';
+import path from 'node:path';
 
 function tokenFromEnv() {
   return process.env.BUDDY_GITHUB_TOKEN || process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '';
 }
 
 function usage() {
-  console.error(`Engineer Buddy v0.2 — keyless AI engineering agent ($0/month)
+  console.error(`Engineer Buddy v${VERSION} — keyless AI engineering agent ($0/month)
 
-Usage:
+Local coding agent (Buddy Code — like Claude Code, in your terminal):
+  engineer-buddy                        interactive session in the current directory
+  engineer-buddy -p "task"              one-shot autonomous task (add --safe to deny writes)
+  engineer-buddy init                   scaffold .buddy/harness/ (systemprompt, guardrails,
+                                        MEMORY.md, tool guidance, skills)
+
+GitHub skills (CI):
   engineer-buddy pr-review     --repo OWNER/NAME --pr N [--dry-run] [--repo-dir PATH]
   engineer-buddy fix-issue     --repo OWNER/NAME --issue N [--dry-run] --repo-dir PATH
   engineer-buddy dep-audit     --repo OWNER/NAME [--dry-run] --repo-dir PATH
@@ -215,9 +230,61 @@ async function cmdAsk(argv) {
   return 0;
 }
 
+// ── Buddy Code (local interactive / one-shot) ────────────────────────────────
+
+async function cmdChat(argv, { oneShot = false } = {}) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: {
+      p: { type: 'string' },
+      safe: { type: 'boolean', default: false },
+      yolo: { type: 'boolean', default: false },
+      quiet: { type: 'boolean', default: false },
+      config: { type: 'string' },
+      dir: { type: 'string' },
+    },
+    allowPositionals: true,
+  });
+  const cfg = loadConfig({ file: values.config });
+  const router = buildRouter(cfg);
+  const root = values.dir ? path.resolve(values.dir) : process.cwd();
+
+  if (oneShot || values.p) {
+    const task = values.p || positionals.join(' ');
+    if (!task) {
+      usage();
+      return 2;
+    }
+    const out = await runOneShot({ router, root, task, safe: Boolean(values.safe), yolo: Boolean(values.yolo), quiet: Boolean(values.quiet), config: cfg });
+    if (!out.said) {
+      console.error('buddy: no final reply (see events above)');
+      return 1;
+    }
+    return 0;
+  }
+  return (await startRepl({ router, root, config: cfg })) ?? 0;
+}
+
+async function cmdInit(argv) {
+  const { values } = parseArgs({ args: argv, options: { dir: { type: 'string' } }, allowPositionals: true });
+  const root = values.dir ? path.resolve(values.dir) : process.cwd();
+  const created = ensureHarness(root);
+  if (created.length) {
+    console.error(`Harness scaffolded in ${root}:`);
+    for (const f of created) console.error(`  + ${f}`);
+    console.error('\nEdit these markdown files to shape how Buddy works in this repo.');
+  } else {
+    console.error('Harness already present — nothing to do.');
+  }
+  return 0;
+}
+
 async function main() {
   const [cmd, ...argv] = process.argv.slice(2);
   try {
+    if (cmd === undefined || cmd === 'chat') process.exit(await cmdChat(argv));
+    if (cmd === '-p' || cmd === '--prompt' || cmd === 'run') process.exit(await cmdChat(argv, { oneShot: true }));
+    if (cmd === 'init') process.exit(await cmdInit(argv));
     if (cmd === 'pr-review') process.exit(await cmdPrReview(argv));
     if (cmd === 'fix-issue') process.exit(await cmdFixIssue(argv));
     if (cmd === 'dep-audit') process.exit(await cmdDepAudit(argv));
