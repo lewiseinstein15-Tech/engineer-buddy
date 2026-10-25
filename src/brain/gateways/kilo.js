@@ -4,6 +4,11 @@
 // Free models rotate; :free suffix + "auto" resolution keeps the bot working
 // even when the catalog changes. Verified keyless 2026-10-25.
 import { fetchWithTimeout, RateLimitError, BuddyError, debugLog } from '../../util.js';
+import { extractUsage, gwCtxLimit } from '../usage.js';
+
+// Conservative floor for OpenRouter-style free models (they vary 8k–128k) —
+// overridable via gateways.kilo.ctxLimit in buddy.config.json.
+const DEFAULT_CTX_LIMIT = 32000;
 
 let modelCache = { at: 0, ids: [] };
 const MODEL_TTL_MS = 60 * 60 * 1000;
@@ -37,6 +42,7 @@ function pickModel(available, cfg) {
 export function createKiloGateway(cfg, timeouts) {
   return {
     name: 'kilo',
+    ctxLimit: gwCtxLimit(cfg, DEFAULT_CTX_LIMIT),
     async chat(messages, { maxTokens = 2048, temperature = 0.2, timeoutMs = timeouts.chatMs, model } = {}) {
       let chosen = model || null;
       if (!chosen || chosen === 'auto') {
@@ -82,15 +88,16 @@ export function createKiloGateway(cfg, timeouts) {
       }
 
       const json = await res.json().catch(() => null);
+      const usage = extractUsage(json);
       const text = json?.choices?.[0]?.message?.content;
       if (typeof text === 'string' && text.trim()) {
-        return { text, model: json?.model || chosen, gateway: 'kilo' };
+        return { text, model: json?.model || chosen, gateway: 'kilo', usage };
       }
       // Some models return content as an array of parts.
       const parts = json?.choices?.[0]?.message?.content;
       if (Array.isArray(parts)) {
         const joined = parts.map((p) => p?.text || '').join('').trim();
-        if (joined) return { text: joined, model: json?.model || chosen, gateway: 'kilo' };
+        if (joined) return { text: joined, model: json?.model || chosen, gateway: 'kilo', usage };
       }
       throw new BuddyError('kilo: empty response', { code: 'EMPTY_RESPONSE', data: json });
     },

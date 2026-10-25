@@ -4,11 +4,17 @@
 // with "Retry after Ns" — we surface that as RateLimitError so the router
 // parks Pollinations for exactly that long and moves on. Verified 2026-10-25.
 import { fetchWithTimeout, RateLimitError, BuddyError } from '../../util.js';
+import { extractUsage, gwCtxLimit } from '../usage.js';
+
+// Anonymous tier is the tightest window in the chain — overridable via
+// gateways.pollinations.ctxLimit in buddy.config.json.
+const DEFAULT_CTX_LIMIT = 8000;
 
 export function createPollinationsGateway(cfg, timeouts) {
   const models = Array.isArray(cfg.models) && cfg.models.length ? cfg.models : ['openai'];
   return {
     name: 'pollinations',
+    ctxLimit: gwCtxLimit(cfg, DEFAULT_CTX_LIMIT),
     async chat(messages, { maxTokens = 2048, temperature = 0.2, timeoutMs = timeouts.chatMs, model } = {}) {
       const m = model || models[0];
       let res;
@@ -50,7 +56,7 @@ export function createPollinationsGateway(cfg, timeouts) {
           : Array.isArray(msg?.content)
             ? msg.content.map((p) => p?.text || '').join('').trim()
             : null;
-        if (text) return { text, model: json?.model || m, gateway: 'pollinations' };
+        if (text) return { text, model: json?.model || m, gateway: 'pollinations', usage: extractUsage(json) };
         if (typeof json === 'string' && json.trim()) return { text: json, model: m, gateway: 'pollinations' };
         throw new BuddyError('pollinations: empty response', { code: 'EMPTY_RESPONSE', data: json });
       } catch (e) {

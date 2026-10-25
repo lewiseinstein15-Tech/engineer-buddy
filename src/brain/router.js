@@ -10,6 +10,7 @@
 //   4. Full attempt telemetry so reviews can cite which brain answered.
 
 import { BuddyError, RateLimitError, debugLog, sleep } from '../util.js';
+import { estimateTokens } from './usage.js';
 
 const GATEWAY_FACTORIES = {};
 
@@ -75,9 +76,37 @@ export class GatewayRouter {
   /** Ask the brain once. Fails only if EVERY gateway fails every round trip. */
   async chat(messages, opts = {}) {
     const attempts = [];
-    const skipped = []; // gateways never tried this call — their circuit was already open
+    const skipped = []; // gateways never tried this call — circuit open OR window too small
+    // Context-limit enforcement (P1): a gateway whose window cannot hold the
+    // request is skipped BEFORE we burn an attempt (and a timeout) on a call
+    // the server will only reject. Request size is chars ÷ 4 — the same
+    // estimate the compaction budget uses. When NO gateway fits, limits are
+    // relaxed and the biggest windows are tried first: a maybe-rejected call
+    // beats never calling at all.
+    const reqChars = (Array.isArray(messages) ? messages : []).reduce(
+      (n, m) => n + (typeof m?.content === 'string' ? m.content.length : JSON.stringify(m?.content ?? '').length),
+      0
+    );
+    const reqTok = estimateTokens(reqChars);
+    const limitOf = (name) => this.gateways.get(name)?.ctxLimit || null;
+    const fits = (name) => {
+      const lim = limitOf(name);
+      return !lim || reqTok <= lim;
+    };
+    const fitting = this.order.filter(fits);
+    let ignoreLimits = false;
+    let effOrder = this.order;
+    if (this.order.length && !fitting.length) {
+      ignoreLimits = true;
+      effOrder = [...this.order].sort((a, b) => (limitOf(b) || Infinity) - (limitOf(a) || Infinity));
+      debugLog(`router: no gateway window holds ~${reqTok} tok — trying biggest windows first (limits relaxed)`);
+    }
+    // Walk the FULL chain order: fitting gateways are tried, oversized ones
+    // are skipped in-loop WITH a recorded reason (the final error must show
+    // every gateway and why it never answered — the v0.9.6 lesson).
+    const loopOrder = ignoreLimits ? effOrder : this.order;
     for (let round = 1; round <= this.maxRoundTrips; round++) {
-      for (const name of this.order) {
+      for (const name of loopOrder) {
         if (this._isOpen(name)) {
           const secs = Math.ceil((this.state.get(name).openUntil - Date.now()) / 1000);
           debugLog(`router: skip ${name} (circuit open for ${secs}s)`);
@@ -87,6 +116,14 @@ export class GatewayRouter {
           // report and Lewis had no idea whether llm7 was even tried).
           if (!skipped.some((s) => s.gateway === name)) {
             skipped.push({ gateway: name, ok: false, latencyMs: 0, error: `circuit open (retry in ~${Math.max(secs, 1)}s)` });
+          }
+          continue;
+        }
+        if (!ignoreLimits && !fits(name)) {
+          const lim = limitOf(name);
+          debugLog(`router: skip ${name} (request ~${reqTok} tok > window ~${lim})`);
+          if (!skipped.some((s) => s.gateway === name)) {
+            skipped.push({ gateway: name, ok: false, latencyMs: 0, error: `context too big: request ~${Math.round(reqTok / 100) / 10}k tok > window ~${Math.round(lim / 100) / 10}k (gateways.<name>.ctxLimit)` });
           }
           continue;
         }
@@ -110,7 +147,7 @@ export class GatewayRouter {
           });
           debugLog(`router: ${name} failed → ${attempts[attempts.length - 1].error}`);
           if (isRate && round < this.maxRoundTrips) {
-            const next = this.order.find((n) => n !== name && !this._isOpen(n));
+            const next = loopOrder.find((n) => n !== name && !this._isOpen(n) && (ignoreLimits || fits(n)));
             if (!next) {
               // Everyone else is parked too — wait for the shortest park time.
               const waitMs = Math.min(...this.order.map((n) => Math.max(0, this.state.get(n).openUntil - Date.now())).filter((v) => v > 0), 30000);
@@ -138,7 +175,7 @@ export class GatewayRouter {
     if (rateLimitedEntry) {
       const waitSecs = Math.max(
         0,
-        ...this.order.map((n) => Math.ceil((this.state.get(n).openUntil - Date.now()) / 1000))
+        ...loopOrder.map((n) => Math.ceil((this.state.get(n).openUntil - Date.now()) / 1000))
       );
       hint = ` — wait ~${Math.max(waitSecs, 5)}s for the rate limit to lift, then say "continue"`;
     }

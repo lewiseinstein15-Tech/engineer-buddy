@@ -52,7 +52,7 @@ You type a task. Buddy plans it with a **todo checklist**, lists/reads/searches 
 
 Slash commands: `/help /new /clear /compact /cost /model /gateways /permissions /todo /tools /agents /mcp /tasks /plan /plans /memory /experience /learn /review /init /export /sessions /resume /status /yolo /quit` — highlights:
 
-- `/cost` — brain calls, est. tokens, and **$0.00 spend** (keyless)
+- `/cost` — brain calls, **tokens in/out** (gateway-reported where the API gives it, chars÷4 estimate where it doesn't — labeled honestly), per-gateway windows, and **$0.00 spend** (keyless)
 - `/model kilo` — pin a gateway first for the session; `/model auto` restores
 - `/gateways` — parallel health probe of the whole keyless chain
 - `/compact` — force a context summarization now (auto-compaction also runs at ~80% of the budget, see below)
@@ -252,6 +252,10 @@ Type `explain @src/app.js and fix the race` and the file is **attached inline** 
 ### The repo map — orientation before the first research step (v0.12.1)
 
 Small models spend their first 2-4 steps on `fs_list`/`fs_read` just to learn what the repo looks like. Now every turn's system prompt opens with an **aider-style repo map**: file paths with their module-level symbols (`src/agent/chat.js: createChat, buildSystemPrompt`), **ranked by git churn** over the last 300 commits so the most-changed code survives the ~2.8k char cap. Zero dependencies (pure-JS symbol regexes for js/ts/jsx/tsx/py/go/rs, the same ignore-walk as `fs_list`), cached with a 60s TTL, and honest about its own staleness — the header tells the model it is *a hint, not the tree; use fs_list/fs_read/fs_search for the current truth*. `/map` shows exactly what the model sees (and rescans fresh); `chat.repoMap: false` in the config turns it off.
+
+### Real token accounting — honest numbers, per-gateway windows (v0.13.0)
+
+The old `/cost` showed chars÷4 and called it a day. Now the accounting has two sources and tells you which one it used: **gateway-reported usage** when the API provides an `usage` block (kilo, llm7, pollinations, ollama — the OpenAI-compatible shapes plus Ollama's native counters), and the **chars÷4 estimate** as the labeled fallback (duckai's SSE stream never reports). Compaction calls are on the books too — they are real brain calls with real prompt sizes. The router now also **enforces per-gateway context windows** (`kilo ~32k, llm7 ~32k, pollinations ~8k, duckai ~8k, ollama ~4k tok` by default): a request too big for a gateway's window skips it *before* burning a timeout on a call the server would only reject, the all-gateways-failed report says which window rejected what, and when **no** window fits the biggest ones are tried first (a maybe-rejected call beats never calling). Every limit is overridable in `buddy.config.json` via `gateways.<name>.ctxLimit`. `/cost` shows tokens in/out with the source label (`gateway-reported` / `chars ÷ 4 est.` / `mixed — X reported, Y est.`) and each gateway's window.
 
 ### Auto-compact — the loop shrinks context BEFORE the wall (v0.12.0)
 

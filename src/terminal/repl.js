@@ -39,6 +39,12 @@ import { truncate, debugLog } from '../util.js';
 // Version always comes from package.json so the banner can never drift from the release.
 export const VERSION = createRequire(import.meta.url)('../../package.json').version;
 
+/** Token count → display: 940 → "940", 128400 → "128.4k". */
+export function fmtTok(n) {
+  const v = Number(n) || 0;
+  return v >= 1000 ? `${(v / 1000).toFixed(1)}k` : String(Math.round(v));
+}
+
 // ── Slash commands (pure, testable) ──────────────────────────────────────────
 
 export const SLASH_COMMANDS = [
@@ -568,14 +574,24 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       }
       case 'cost': {
         const u = chat.usage();
-        const estK = ((u.charsIn + u.charsOut) / 4 / 1000).toFixed(1);
+        const source =
+          u.estimatedCalls === 0 && u.reportedCalls > 0
+            ? c.gray('gateway-reported')
+            : u.reportedCalls === 0 && u.estimatedCalls > 0
+              ? c.gray('chars ÷ 4 est.')
+              : c.gray(`mixed — ${u.reportedCalls} reported, ${u.estimatedCalls} est. (chars ÷ 4)`);
+        const gwLine = (g, v) => {
+          const lim = router.gateways.get(g)?.ctxLimit;
+          return `    ${c.dim(g.padEnd(14))} ${v.calls} calls · ~${fmtTok(v.tokIn)} in · ~${fmtTok(v.tokOut)} out${lim ? c.gray(` · window ~${Math.round(lim / 100) / 10}k tok`) : ''}`;
+        };
         say(
           [
             '',
             `  ${c.bold('spend')}        $0.00 ${c.gray('(keyless — the whole point)')}`,
-            `  ${c.bold('brain calls')}  ${u.calls}`,
-            `  ${c.bold('est. tokens')}  ~${estK}k ${c.gray('(chars ÷ 4, rough)')}`,
-            ...Object.entries(u.byGateway).map(([g, v]) => `    ${c.dim(g.padEnd(14))} ${v.calls} calls · ~${(v.charsOut / 4 / 1000).toFixed(1)}k tok out`),
+            `  ${c.bold('brain calls')}  ${u.calls} ${c.gray('(compaction calls included)')}`,
+            `  ${c.bold('tokens in')}    ~${fmtTok(u.tokIn)}  ${u.calls ? source : ''}`,
+            `  ${c.bold('tokens out')}   ~${fmtTok(u.tokOut)}`,
+            ...Object.entries(u.byGateway).map(([g, v]) => gwLine(g, v)),
             '',
           ].join('\n')
         );

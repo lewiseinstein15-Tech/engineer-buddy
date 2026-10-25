@@ -12,6 +12,7 @@ import { extractJson, tryRepairJson, debugLog, truncate } from '../util.js';
 import { describeTools } from './agent.js';
 import { describeSkillCatalog } from '../skills/loader.js';
 import { PLAN_TOOLS, planModePrompt } from '../tools/planmode.js';
+import { estimateTokens } from '../brain/usage.js';
 
 export const PROTOCOL_PREAMBLE = [
   'You are Engineer Buddy ("Buddy Code"), a software engineer working in the user\'s terminal inside this repository.',
@@ -108,7 +109,30 @@ export function createChat({
   // compaction summary. Short follow-ups ("continue", "go on") keep the
   // previous anchor instead of replacing it.
   let currentTask = '';
-  const usage = { calls: 0, charsIn: 0, charsOut: 0, byGateway: {} };
+  // Real token accounting (P1): gateway-reported usage when the API provides
+  // it, chars ÷ 4 estimate when it doesn't — and /cost says which. Compaction
+  // calls count too: they are real brain calls with real prompt sizes.
+  const usage = { calls: 0, charsIn: 0, charsOut: 0, tokIn: 0, tokOut: 0, reportedCalls: 0, estimatedCalls: 0, byGateway: {} };
+  function recordUsage(out, charsIn, charsOut) {
+    usage.calls += 1;
+    usage.charsIn += charsIn;
+    usage.charsOut += charsOut;
+    const u = out?.usage;
+    const reported = u && (u.promptTokens > 0 || u.completionTokens > 0);
+    const tokIn = reported ? u.promptTokens : estimateTokens(charsIn);
+    const tokOut = reported ? u.completionTokens : estimateTokens(charsOut);
+    usage.tokIn += tokIn;
+    usage.tokOut += tokOut;
+    if (reported) usage.reportedCalls += 1;
+    else usage.estimatedCalls += 1;
+    const gw = out?.gateway || 'unknown';
+    const g = (usage.byGateway[gw] = usage.byGateway[gw] || { calls: 0, charsOut: 0, tokIn: 0, tokOut: 0, reportedCalls: 0 });
+    g.calls += 1;
+    g.charsOut += charsOut;
+    g.tokIn += tokIn;
+    g.tokOut += tokOut;
+    if (reported) g.reportedCalls += 1;
+  }
 
   // System prompt is rebuilt per call: plan mode swaps the tool list (only
   // PLAN_TOOLS + exit_plan visible) and injects the read-only section; normal
@@ -144,7 +168,7 @@ export function createChat({
     const tail = messages.slice(-keep);
     if (head.length < 2) return;
     try {
-      const { text } = await router.chat(
+      const out = await router.chat(
         [
           {
             role: 'user',
@@ -159,7 +183,15 @@ export function createChat({
         ],
         { maxTokens: 600 }
       );
+      const { text } = out;
       if (!text || !text.trim()) return;
+      // The summarizer call is a real brain call — account it like any other
+      // (charsIn = the flattened head, charsOut = the summary text).
+      recordUsage(
+        out,
+        head.reduce((n, m) => n + m.content.length, 0),
+        (text || '').length
+      );
       // Todo anchor: the plan itself survives compaction (todo v2) — a long
       // implementation turn that churns context must not forget what is done
       // and what is next. Plain text, statuses included.
@@ -193,14 +225,13 @@ export function createChat({
     // (v0.9.2 live-test lesson).
     const maxTok = modes?.plan ? Math.max(maxTokens, 2500) : maxTokens;
     const out = await router.chat(history, { maxTokens: maxTok });
-    // Usage telemetry (the /cost surface). Rough char-based accounting.
-    usage.calls += 1;
-    usage.charsIn += history.reduce((n, m) => n + m.content.length, 0);
-    usage.charsOut += (out.text || '').length;
-    const gw = out.gateway || 'unknown';
-    usage.byGateway[gw] = usage.byGateway[gw] || { calls: 0, charsOut: 0 };
-    usage.byGateway[gw].calls += 1;
-    usage.byGateway[gw].charsOut += (out.text || '').length;
+    // Usage telemetry (the /cost surface) — real tokens when the gateway
+    // reports them, chars ÷ 4 estimate otherwise.
+    recordUsage(
+      out,
+      history.reduce((n, m) => n + m.content.length, 0),
+      (out.text || '').length
+    );
     return out;
   }
 
