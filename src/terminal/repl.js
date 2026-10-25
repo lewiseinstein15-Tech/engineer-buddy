@@ -13,6 +13,7 @@
 import readline from 'node:readline';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import { createChat } from '../agent/chat.js';
 import { LocalScope, buildLocalTools, runBash } from '../tools/local.js';
 import { ensureHarness, loadHarness, harnessContext } from '../harness/scaffold.js';
@@ -23,7 +24,8 @@ import { c, PALETTE, logoBanner, spinner, renderToolCall, renderToolEvent, rende
 import { renderMarkdown } from './markdown.js';
 import { truncate, debugLog } from '../util.js';
 
-export const VERSION = '0.4.0';
+// Version always comes from package.json so the banner can never drift from the release.
+export const VERSION = createRequire(import.meta.url)('../../package.json').version;
 
 // ── Slash commands (pure, testable) ──────────────────────────────────────────
 

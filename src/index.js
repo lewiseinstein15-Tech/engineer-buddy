@@ -265,6 +265,11 @@ async function cmdChat(argv, { oneShot = false } = {}) {
     }
     return 0;
   }
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.error('buddy: interactive mode needs a real terminal (TTY).');
+    console.error('       run `buddy` in your terminal, or use one-shot mode: buddy -p "task"');
+    return 2;
+  }
   return (await startRepl({ router, root, config: cfg, yolo: Boolean(values.yolo) })) ?? 0;
 }
 
@@ -285,7 +290,10 @@ async function cmdInit(argv) {
 async function main() {
   const [cmd, ...argv] = process.argv.slice(2);
   try {
-    if (cmd === undefined || cmd === 'chat') process.exit(await cmdChat(argv));
+    if (cmd === undefined || cmd === 'chat') {
+      await cmdChat(argv); // returns immediately by design — the REPL owns the process from here
+      return 0;            // quitting happens in the REPL's own close handler ("bye" + exit 0)
+    }
     if (cmd === '-p' || cmd === '--prompt' || cmd === 'run') process.exit(await cmdChat(argv, { oneShot: true }));
     if (cmd === 'init') process.exit(await cmdInit(argv));
     if (cmd === 'pr-review') process.exit(await cmdPrReview(argv));
@@ -302,5 +310,10 @@ async function main() {
     process.exit(e instanceof BuddyError && e.code === 'ALL_GATEWAYS_FAILED' ? 0 : 2);
   }
 }
+
+// Surface async crashes loudly instead of letting the process die silently mid-session.
+process.on('unhandledRejection', (e) => {
+  console.error('[buddy] async error:', (e && (e.stack || e.message)) || e);
+});
 
 main();
