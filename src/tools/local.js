@@ -14,6 +14,7 @@ import { isAgentDeniedPath } from '../harness/scaffold.js';
 import { renderTextDiff, renderDiff, diffLines } from '../terminal/difflib.js';
 import { createTestTool } from './testrunner.js';
 import { createSymbolIndexProvider, searchDefs, formatDef, findRefsIn } from '../agent/symbols.js';
+import { createLspHub, lspExtFor, formatDiagnostics } from '../agent/lsp.js';
 import { snapshotPaths } from '../agent/checkpoints.js';
 
 // ── Edit previews (shown before approval, Claude-Code style) ────────────────
@@ -405,10 +406,27 @@ function fmtResult(r) {
  * Build the local tool set.
  * @returns tools with {name, description, args, run, risky?, render?}
  */
-export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { latest: null }, symbolIndex = null } = {}) {
+export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { latest: null }, symbolIndex = null, lspEnabled = true } = {}) {
   const testTool = createTestTool({ root: scope.root });
   // Symbol index (v0.16.0) — lazy provider, shared TTL cache; read-only.
   const syms = symbolIndex || createSymbolIndexProvider(scope.root);
+  // LSP hub (v0.17.0) — lazy per-language connections to the repo's own
+  // language servers; diagnostics ride along on every edit (best-effort).
+  const lsp = lspEnabled ? createLspHub(scope.root) : null;
+  const DIAG_OFF = () => Promise.resolve('');
+  const postEditDiagnostics = lsp
+    ? async (rel) => {
+        try {
+          if (!rel || !lspExtFor(rel)) return '';
+          const out = await lsp.diagnosticsFor(String(rel), { waitMs: 900 });
+          if (!out.length) return '';
+          const errs = out.filter((d) => d.severity === 1).length;
+          return `\n[LSP] ${out.length} diagnostic${out.length === 1 ? '' : 's'}${errs ? ` — ${errs} ERROR${errs === 1 ? '' : 'S'}` : ''}:\n${formatDiagnostics(out, String(rel), { maxItems: 8 })}`;
+        } catch {
+          return ''; // LSP is a bonus — never blocks the edit
+        }
+      }
+    : DIAG_OFF;
   return [
     testTool,
     {
@@ -580,6 +598,58 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
       },
     },
     {
+      name: 'lsp_diagnostics',
+      description:
+        'Ask the language server for errors/warnings in a file (ts/js via typescript-language-server, python via pylsp, go via gopls — only when installed). Zero-dep Buddy spawns the repo server on first use.',
+      args: '{"path":"src/index.js"}',
+      render: (a) => `lsp_diagnostics ${a?.path}`,
+      run: async ({ path: p } = {}) => {
+        if (!p) return 'ERROR: path required';
+        if (!lsp) return 'ERROR: LSP disabled (chat.lsp: false)';
+        if (!lspExtFor(String(p))) return `ERROR: no language server support for ${p} (supported: js/jsx/ts/tsx/py/go)`;
+        const items = await lsp.diagnosticsFor(String(p), { waitMs: 2500 });
+        if (!items.length) return `no diagnostics for ${p} — clean as far as the language server sees`;
+        return `${items.length} diagnostic${items.length === 1 ? '' : 's'} for ${p}:\n${formatDiagnostics(items, String(p), { maxItems: 12 })}`;
+      },
+    },
+    {
+      name: 'lsp_goto_def',
+      description: 'Compiler-grade go-to-definition via the language server (precise — unlike the regex go_to_def). Position is 1-based line/column in the file.',
+      args: '{"path":"src/app.js","line":12,"column":20}',
+      render: (a) => `lsp_goto_def ${a?.path}:${a?.line}`,
+      run: async ({ path: p, line, column = 1 } = {}) => {
+        if (!p || line == null) return 'ERROR: path and line required';
+        if (!lsp) return 'ERROR: LSP disabled (chat.lsp: false)';
+        if (!lspExtFor(String(p))) return `ERROR: no language server support for ${p}`;
+        try {
+          const res = await lsp.definition(String(p), Number(line) - 1, Math.max(Number(column) - 1, 0));
+          const locs = Array.isArray(res) ? res : res ? [res] : [];
+          if (!locs.length) return `(language server found no definition at ${p}:${line})`;
+          return locs.map((l) => `${(l.uri || '').replace('file://', '')}:${(l.range?.start?.line ?? 0) + 1}:${(l.range?.start?.character ?? 0) + 1}`).join('\n');
+        } catch (e) {
+          return `ERROR: ${e?.message || e}`;
+        }
+      },
+    },
+    {
+      name: 'lsp_refs',
+      description: 'Compiler-grade find-references via the language server (type-aware — sees renames, not just names). Position is 1-based line/column.',
+      args: '{"path":"src/app.js","line":12,"column":20}',
+      render: (a) => `lsp_refs ${a?.path}:${a?.line}`,
+      run: async ({ path: p, line, column = 1 } = {}) => {
+        if (!p || line == null) return 'ERROR: path and line required';
+        if (!lsp) return 'ERROR: LSP disabled (chat.lsp: false)';
+        if (!lspExtFor(String(p))) return `ERROR: no language server support for ${p}`;
+        try {
+          const res = await lsp.references(String(p), Number(line) - 1, Math.max(Number(column) - 1, 0), { includeDecl: false });
+          if (!res?.length) return '(no references found by the language server)';
+          return `${res.length} reference${res.length === 1 ? '' : 's'}:\n${res.slice(0, 40).map((l) => `${(l.uri || '').replace('file://', '')}:${(l.range?.start?.line ?? 0) + 1}:${(l.range?.start?.character ?? 0) + 1}`).join('\n')}${res.length > 40 ? `\n… +${res.length - 40} more` : ''}`;
+        } catch (e) {
+          return `ERROR: ${e?.message || e}`;
+        }
+      },
+    },
+    {
       name: 'fs_write',
       description: 'Create or fully rewrite a file. Prefer fs_replace for existing files.',
       args: '{"path":"src/file.js","content":"full new file content"}',
@@ -589,7 +659,8 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
       run: async ({ path: p, content }) => {
         if (typeof content !== 'string' || !content.trim()) return 'ERROR: content required';
         const r = scope.write(p, content);
-        return `OK ${r.op} ${r.path} (${r.bytes} bytes)`;
+        const diag = await postEditDiagnostics(r.path);
+        return `OK ${r.op} ${r.path} (${r.bytes} bytes)${diag}`;
       },
     },
     {
@@ -603,7 +674,8 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
       run: async ({ path: p, find, replace, replace_all = false }) => {
         if (typeof find !== 'string' || !find) return 'ERROR: find required';
         const r = scope.replace(p, find, String(replace ?? ''), { replace_all: Boolean(replace_all) });
-        return `OK replaced ${r.count > 1 ? `${r.count} occurrences` : 'snippet'} in ${r.path}`;
+        const diag = await postEditDiagnostics(r.path);
+        return `OK replaced ${r.count > 1 ? `${r.count} occurrences` : 'snippet'} in ${r.path}${diag}`;
       },
     },
     {
@@ -617,7 +689,8 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
       preview: (a) => previewMultiEdit(scope, a?.path, a?.edits),
       run: async ({ path: p, edits }) => {
         const r = scope.multiReplace(p, edits);
-        return `OK multi_edit ${r.path}: ${r.edits} edit${r.edits === 1 ? '' : 's'} applied (${r.bytes} bytes now)`;
+        const diag = await postEditDiagnostics(r.path);
+        return `OK multi_edit ${r.path}: ${r.edits} edit${r.edits === 1 ? '' : 's'} applied (${r.bytes} bytes now)${diag}`;
       },
     },
     {
@@ -630,7 +703,8 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
       run: async ({ path: p, content }) => {
         if (typeof content !== 'string' || !content.trim()) return 'ERROR: content required';
         const r = scope.append(p, content);
-        return `OK ${r.op} ${r.path}`;
+        const diag = await postEditDiagnostics(r.path);
+        return `OK ${r.op} ${r.path}${diag}`;
       },
     },
     {
