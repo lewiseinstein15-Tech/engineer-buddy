@@ -7,6 +7,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { BuddyError, truncate } from '../util.js';
 import { LocalRepo } from './repo.js';
 import { isAgentDeniedPath } from '../harness/scaffold.js';
@@ -15,9 +16,46 @@ import { snapshotPaths } from '../agent/checkpoints.js';
 
 // ── Edit previews (shown before approval, Claude-Code style) ────────────────
 
+function contentHash(s) {
+  return crypto.createHash('sha256').update(String(s), 'utf8').digest('hex');
+}
+
+/** Line numbers (1-based) where `find` occurs in `content` (first 8). */
+function matchLines(content, find) {
+  const lines = [];
+  let idx = content.indexOf(find);
+  while (idx !== -1 && lines.length < 8) {
+    lines.push(content.slice(0, idx).split('\n').length);
+    idx = content.indexOf(find, idx + Math.max(find.length, 1));
+  }
+  return lines;
+}
+
+/** Apply an edit list to a string; throws BuddyError on any mismatch (pure). */
+function simulateMultiEdit(content, edits) {
+  let sim = String(content ?? '');
+  const list = Array.isArray(edits) ? edits : [];
+  if (!list.length) throw new BuddyError('edits must be a non-empty array', { code: 'BAD_EDITS' });
+  list.forEach((ed, i) => {
+    const findStr = String(ed?.find ?? '');
+    if (!findStr) throw new BuddyError(`edit ${i + 1} is missing "find"`, { code: 'BAD_EDITS' });
+    const count = sim.split(findStr).length - 1;
+    if (count === 0) throw new BuddyError(`edit ${i + 1} — snippet not found: ${truncate(findStr, 60)}`, { code: 'NO_MATCH' });
+    if (count > 1 && !ed?.replace_all) {
+      const at = matchLines(sim, findStr).join(', ');
+      throw new BuddyError(`edit ${i + 1} matches ${count} times (lines ${at}) — add more context or pass replace_all:true`, { code: 'AMBIGUOUS' });
+    }
+    sim = ed?.replace_all ? sim.split(findStr).join(String(ed?.replace ?? '')) : sim.replace(findStr, String(ed?.replace ?? ''));
+  });
+  return sim;
+}
+
 function currentContent(scope, rel) {
+  // peek, not read — previews must NOT refresh the freshness guard (a
+  // bash-modified file would otherwise look fresh again the moment its edit
+  // preview rendered, and the stale-file protection would never fire).
   try {
-    const r = scope.read(rel, 60000);
+    const r = scope.peek(rel, 60000);
     return r?.content ?? '';
   } catch {
     return ''; // new file or unreadable — empty old side
@@ -38,6 +76,17 @@ function previewReplace(scope, rel, find, replace) {
   const before = currentContent(scope, rel);
   if (!before || !before.includes(String(find))) return null; // preview pointless — run() will error
   return renderTextDiff(String(find), String(replace ?? ''), { maxLines: 16 });
+}
+
+function previewMultiEdit(scope, rel, edits) {
+  const before = currentContent(scope, rel);
+  let after;
+  try {
+    after = simulateMultiEdit(before, edits);
+  } catch {
+    return null; // broken plan — run() will produce the precise error
+  }
+  return renderTextDiff(before, after, { maxLines: 16 });
 }
 
 function previewAppend(content) {
@@ -145,6 +194,12 @@ export class LocalScope {
   constructor(root = process.cwd()) {
     this.repo = new LocalRepo(root);
     this.root = this.repo.root;
+    // Freshness guard (v0.10.2): abs path -> sha256 of the content the agent
+    // last read or wrote this session. If the file on disk differs when an
+    // edit lands, the edit is refused — exactly Claude Code's "file has been
+    // modified since read" protection (kills blind re-edits after bash mangled
+    // the file, or after a half-applied multi-step edit).
+    this._fresh = new Map();
   }
 
   /** Reject protected/secret paths up front. */
@@ -156,7 +211,55 @@ export class LocalScope {
     return p;
   }
 
+  _raw(rel) {
+    try {
+      const abs = this.repo.resolveSafe(rel);
+      const st = fs.statSync(abs);
+      if (!st.isFile() || st.size > 2_000_000) return null;
+      return fs.readFileSync(abs, 'utf8');
+    } catch {
+      return null;
+    }
+  }
+
+  _markFresh(rel) {
+    const raw = this._raw(rel);
+    if (raw != null) {
+      try {
+        this._fresh.set(this.repo.resolveSafe(rel), contentHash(raw));
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+
+  /** Refuse the edit when the file changed outside the agent's hands. */
+  _checkFresh(rel) {
+    let abs;
+    try {
+      abs = this.repo.resolveSafe(rel);
+    } catch {
+      return;
+    }
+    const known = this._fresh.get(abs);
+    if (known === undefined) return; // never read — nothing to compare (normal create path)
+    const current = this._raw(rel);
+    if (current == null) return; // vanished — replace() reports its own NO_FILE
+    if (contentHash(current) !== known) {
+      throw new BuddyError(`${rel} changed since you last read it — fs_read it again, then edit (someone or something modified it outside your tools)`, { code: 'STALE_FILE' });
+    }
+  }
+
   read(rel, maxChars = 30000) {
+    this._guard(rel);
+    const r = this.repo.readFile(rel, maxChars);
+    if (!r) throw new BuddyError(`cannot read ${rel} (missing, binary, or too large)`, { code: 'NO_FILE' });
+    this._markFresh(rel); // freshness baseline = what the agent just saw
+    return r;
+  }
+
+  /** Read WITHOUT touching the freshness state (previews, internal checks). */
+  peek(rel, maxChars = 30000) {
     this._guard(rel);
     const r = this.repo.readFile(rel, maxChars);
     if (!r) throw new BuddyError(`cannot read ${rel} (missing, binary, or too large)`, { code: 'NO_FILE' });
@@ -213,13 +316,15 @@ export class LocalScope {
     const abs = this.repo.resolveSafe(rel);
     fs_mkdir(abs);
     const before = (() => { try { return require_read(abs); } catch { return ''; } })();
+    if (before) this._checkFresh(rel); // full rewrite of a file the agent read → staleness applies
     this._snap(rel, 'fs_write');
     fs_write(abs, content);
+    this._markFresh(rel);
     return { path: rel, op: before ? 'rewrite' : 'create', bytes: content.length };
   }
 
-  /** Replace an exact unique snippet. */
-  replace(rel, find, replace) {
+  /** Replace an exact unique snippet (or all occurrences with replace_all). */
+  replace(rel, find, replace, { replace_all = false } = {}) {
     this._guard(rel);
     const abs = this.repo.resolveSafe(rel);
     let content;
@@ -228,13 +333,44 @@ export class LocalScope {
     } catch {
       throw new BuddyError(`replace: file not found: ${rel}`, { code: 'NO_FILE' });
     }
+    this._checkFresh(rel);
     const findStr = String(find);
     const count = content.split(findStr).length - 1;
     if (count === 0) throw new BuddyError(`replace: snippet not found in ${rel} — fs_read the file and retry`, { code: 'NO_MATCH' });
-    if (count > 1) throw new BuddyError(`replace: snippet matches ${count} times in ${rel} — include more context to make it unique`, { code: 'AMBIGUOUS' });
+    if (count > 1 && !replace_all) {
+      const at = matchLines(content, findStr).join(', ');
+      throw new BuddyError(`replace: snippet matches ${count} times in ${rel} (lines ${at}) — include more context to make it unique, or pass replace_all:true`, { code: 'AMBIGUOUS' });
+    }
     this._snap(rel, 'fs_replace');
-    fs.writeFileSync(abs, content.replace(findStr, String(replace)), 'utf8');
-    return { path: rel, op: 'replace' };
+    const next = replace_all ? content.split(findStr).join(String(replace)) : content.replace(findStr, String(replace));
+    fs.writeFileSync(abs, next, 'utf8');
+    this._markFresh(rel);
+    return { path: rel, op: 'replace', count: replace_all ? count : 1 };
+  }
+
+  /** Batch several edits to ONE file atomically (multi_edit): every edit must
+   *  match exactly once (or set replace_all), or NOTHING is written. */
+  multiReplace(rel, edits) {
+    this._guard(rel);
+    const abs = this.repo.resolveSafe(rel);
+    let content;
+    try {
+      content = fs.readFileSync(abs, 'utf8');
+    } catch {
+      throw new BuddyError(`multi_edit: file not found: ${rel}`, { code: 'NO_FILE' });
+    }
+    this._checkFresh(rel);
+    let after;
+    try {
+      after = simulateMultiEdit(content, edits);
+    } catch (e) {
+      if (e instanceof BuddyError) throw new BuddyError(`multi_edit: ${e.message} — file NOT changed`, { code: e.code });
+      throw e;
+    }
+    this._snap(rel, 'multi_edit');
+    fs.writeFileSync(abs, after, 'utf8');
+    this._markFresh(rel);
+    return { path: rel, op: 'multi_edit', edits: Array.isArray(edits) ? edits.length : 0, bytes: after.length };
   }
 
   append(rel, content) {
@@ -243,8 +379,10 @@ export class LocalScope {
     fs_mkdir(abs);
     let before = '';
     try { before = require_read(abs); } catch { /* new */ }
+    if (before) this._checkFresh(rel);
     this._snap(rel, 'fs_append');
     fs.writeFileSync(abs, (before && !before.endsWith('\n') ? before + '\n' : before) + String(content), 'utf8');
+    this._markFresh(rel);
     return { path: rel, op: before ? 'append' : 'create' };
   }
 }
@@ -382,15 +520,30 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     },
     {
       name: 'fs_replace',
-      description: 'Replace an exact unique snippet in a file.',
-      args: '{"path":"src/file.js","find":"exact existing snippet","replace":"new snippet"}',
+      description:
+        'Replace an exact snippet in a file — must match exactly once unless you pass replace_all:true (then every occurrence changes). If the file changed since you read it, fs_read it again first.',
+      args: '{"path":"src/file.js","find":"exact existing snippet","replace":"new snippet","replace_all":false}',
       risky: true,
-      render: (a) => `fs_replace ${a?.path}`,
+      render: (a) => `fs_replace ${a?.path}${a?.replace_all ? ' (all)' : ''}`,
       preview: (a) => previewReplace(scope, a?.path, a?.find, a?.replace),
-      run: async ({ path: p, find, replace }) => {
+      run: async ({ path: p, find, replace, replace_all = false }) => {
         if (typeof find !== 'string' || !find) return 'ERROR: find required';
-        const r = scope.replace(p, find, String(replace ?? ''));
-        return `OK replaced snippet in ${r.path}`;
+        const r = scope.replace(p, find, String(replace ?? ''), { replace_all: Boolean(replace_all) });
+        return `OK replaced ${r.count > 1 ? `${r.count} occurrences` : 'snippet'} in ${r.path}`;
+      },
+    },
+    {
+      name: 'multi_edit',
+      description:
+        'Apply several exact-snippet edits to ONE file atomically — every edit must match exactly once (or set replace_all on that edit), otherwise NOTHING is written and you get the precise failing edit. Prefer this over repeated fs_replace calls when changing 2+ spots in the same file.',
+      args: '{"path":"src/file.js","edits":[{"find":"old name","replace":"new name"},{"find":"x = 1","replace":"x = 2","replace_all":true}]}',
+      risky: true,
+      maxCalls: 4,
+      render: (a) => `multi_edit ${a?.path} (${(a?.edits || []).length} edits)`,
+      preview: (a) => previewMultiEdit(scope, a?.path, a?.edits),
+      run: async ({ path: p, edits }) => {
+        const r = scope.multiReplace(p, edits);
+        return `OK multi_edit ${r.path}: ${r.edits} edit${r.edits === 1 ? '' : 's'} applied (${r.bytes} bytes now)`;
       },
     },
     {

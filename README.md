@@ -222,6 +222,10 @@ Buddy's plan list grew up: items can now declare **dependencies** (`blocked_by`)
 
 Small models keep asking path questions with the content search. Now they have the right tool: `glob {"pattern":"src/**/*.js"}` — pure-JS, zero-dep matching with `**` globstars, `?`, `[abc]` classes and `{a,b}` braces, walking the same ignore list as `fs_list` (node_modules, .git, dot-dirs are invisible). Results are sorted, capped at 200 with a hint to narrow the pattern, and the tool is read-only — so it is allowed in plan mode too.
 
+### multi_edit + the freshness guard — half-applied edits are over (v0.10.2)
+
+`multi_edit` batches several exact-snippet changes to one file **atomically**: every edit is simulated first — one bad match aborts the whole batch (file byte-identical) with the precise failing edit number, and the approval preview renders the combined diff. `fs_replace` gained `replace_all` and its ambiguity error now names the matching lines. And the big one: a **file-freshness guard** — Buddy tracks what it read, and refuses to edit any file that changed outside its tools (`changed since you last read it — fs_read it again`) until it re-reads. Bash-mangled files, half-applied batches, concurrent terminals: blind re-edits just stopped.
+
 ### Safety model (terminal mode)
 
 - **Approval gates** — writes, edits, and shell commands ask `[y]es / [n]o / [a]lways` unless you `/yolo`. One-shot mode (`-p`) is autonomous; add `--safe` to deny all writes. Plan mode (above) is the strongest gate: **nothing mutates until the plan itself is approved**.
