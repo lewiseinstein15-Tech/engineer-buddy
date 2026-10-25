@@ -34,6 +34,7 @@ import { reflect, recentLessons, experiencePath } from '../learn.js';
 import { c, PALETTE, logoBanner, spinner, renderToolCall, renderToolEvent, renderTodo, renderTable, formatMs, renderContextBar } from './ui.js';
 import { renderMarkdown } from './markdown.js';
 import { expandMentions } from './mentions.js';
+import { loadCustomCommands, applyCustomCommand, renderCustomCommandHelp } from './customcommands.js';
 import { truncate, debugLog } from '../util.js';
 
 // Version always comes from package.json so the banner can never drift from the release.
@@ -516,6 +517,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
               ['/review [staged]', 'Buddy reviews your uncommitted diff'],
               ['/yolo', 'toggle auto-approval (careful)'],
             ].map(([k, d]) => `    ${c.bold(k.padEnd(20))} ${c.dim(d)}`),
+            ...(renderCustomCommandHelp(loadCustomCommands(root, { builtins: SLASH_COMMANDS }).commands) || ['']),
             '',
             c.gray(`  Brain: keyless failover chain — ${router.order.join(' → ')}. $0/month, no API keys.`),
             '',
@@ -1091,6 +1093,26 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         if (rec) {
           const text = `[The user invoked the /${rec.name} skill]${slash.args ? ` with arguments: ${slash.args}` : ''}\n\nFollow this playbook exactly:\n\n${rec.body}`;
           await runTask(text, { skill: rec, recordAs: input });
+          return;
+        }
+        // Custom commands (v0.13.2): .buddy/commands/<name>.md — a prompt
+        // template, not a playbook. Rescanned on every lookup so a newly
+        // dropped file needs no restart. allowed-tools arms the same
+        // turn-restriction skills use; like skills, custom commands QUEUE
+        // when a turn is running (they are tasks).
+        const { commands: customCmds } = loadCustomCommands(root, { builtins: SLASH_COMMANDS });
+        const custom = customCmds.get(slash.name);
+        if (custom) {
+          const expanded = applyCustomCommand(custom, slash.args);
+          if (!expanded.trim()) {
+            say(`  /${custom.name} is empty — add a prompt body to ${custom.source.endsWith(root) ? '.buddy' : '~/.buddy'}/commands/${custom.name}.md`);
+            rl.prompt();
+            return;
+          }
+          const restriction = custom.allowedTools?.length
+            ? { name: custom.name, allowedTools: custom.allowedTools }
+            : null;
+          await runTask(expanded, { skill: restriction, recordAs: input });
           return;
         }
       }
