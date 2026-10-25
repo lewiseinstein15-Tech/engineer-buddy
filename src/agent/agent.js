@@ -2,6 +2,9 @@
 // → finish). Skills compose this with a tool registry. Protocol is strict
 // JSON because small free models handle it far better than function-calling:
 //   model emits: {"tool":"<name>","args":{...}}  or  {"tool":"finish","result":...}
+//
+// v0.2 upgrades: one self-repair retry on protocol violation (free models
+// sometimes sneeze prose), per-tool call caps, and per-call maxTokens.
 import { extractJson, debugLog, truncate } from '../util.js';
 
 export function describeTools(tools) {
@@ -26,39 +29,79 @@ export function systemPromptFor(tools) {
  * Run the agent loop.
  * @param {object} p
  * @param {object} p.router  GatewayRouter
- * @param {Array}  p.tools   [{name, description, args, run(args)->string}]
+ * @param {Array}  p.tools   [{name, description, args, run(args)->string, maxCalls?}]
  * @param {string} p.systemPrompt  appended after the protocol preamble
  * @param {Array}  p.messages      task messages (user role)
  * @param {number} p.maxSteps
+ * @param {number} p.maxTokens  per-step completion budget
  * @param {(step:{tool,args,observation})=>void} p.onStep  observation tap
  * @returns {{finished:boolean, result:any, steps:Array, history:Array}}
  */
-export async function runAgent({ router, tools, systemPrompt, messages, maxSteps = 4, onStep = null }) {
+export async function runAgent({ router, tools, systemPrompt, messages, maxSteps = 6, maxTokens = 1200, onStep = null }) {
   const byName = new Map(tools.map((t) => [t.name, t]));
+  const callCounts = new Map();
   const history = [
     { role: 'system', content: `${systemPromptFor(tools)}\n\n${systemPrompt}` },
     ...messages,
   ];
   const steps = [];
+
+  const noteStep = (entry) => {
+    steps.push(entry);
+    if (onStep && entry.tool && entry.observation !== undefined) onStep({ tool: entry.tool, args: entry.args, observation: entry.observation });
+  };
+
   for (let i = 1; i <= maxSteps; i++) {
-    const { text, model, gateway, latencyMs } = await router.chat(history, { maxTokens: 1024 });
-    const parsed = extractJson(text);
+    let { text, model, gateway, latencyMs } = await router.chat(history, { maxTokens });
+    let parsed = extractJson(text);
+    let repaired = false;
+
+    // One self-repair retry: tell the model the protocol and ask again.
     if (!parsed.ok || typeof parsed.value !== 'object' || parsed.value === null || !parsed.value.tool) {
-      steps.push({ step: i, error: 'protocol violation', raw: truncate(text, 300), model, gateway, latencyMs });
-      break;
+      debugLog(`agent step ${i}: protocol violation, requesting repair`);
+      history.push({ role: 'assistant', content: truncate(text, 700) });
+      history.push({
+        role: 'user',
+        content:
+          'PROTOCOL ERROR: your reply was not a single JSON object with a "tool" key. Respond again with EXACTLY ONE JSON object: {"tool":"<name>","args":{...}} or {"tool":"finish","result":...}. No other text.',
+      });
+      const retry = await router.chat(history, { maxTokens });
+      parsed = extractJson(retry.text);
+      if (!parsed.ok || typeof parsed.value !== 'object' || parsed.value === null || !parsed.value.tool) {
+        noteStep({ step: i, error: 'protocol violation (after repair)', raw: truncate(text, 300), model: retry.model, gateway: retry.gateway, latencyMs });
+        break;
+      }
+      repaired = true;
+      ({ text, model, gateway, latencyMs } = retry);
+      history.splice(-2); // drop the violation exchange, keep clean history
     }
+
+    const meta = { model, gateway, latencyMs };
     const { tool, args = {} } = parsed.value;
+
     if (tool === 'finish') {
-      steps.push({ step: i, tool, args, model, gateway, latencyMs });
-      return { finished: true, result: args.result ?? args, steps, history };
+      // The payload may arrive as {"tool":"finish","result":X} or
+      // {"tool":"finish","args":{...}} — accept both shapes.
+      const payload = parsed.value.result ?? parsed.value.args ?? args;
+      noteStep({ step: i, tool, args, repaired, ...meta });
+      return { finished: true, result: payload, steps, history };
     }
+
+    const cap = byName.get(tool)?.maxCalls;
+    const used = callCounts.get(tool) || 0;
     const impl = byName.get(tool);
-    const observation = impl
-      ? await impl.run(args).catch((e) => `ERROR: ${e.message}`)
-      : `ERROR: unknown tool "${tool}". Available: ${[...byName.keys()].join(', ')}`;
+    let observation;
+    if (!impl) {
+      observation = `ERROR: unknown tool "${tool}". Available: ${[...byName.keys()].join(', ')}`;
+    } else if (cap && used >= cap) {
+      observation = `ERROR: tool "${tool}" already used ${used}/${cap} times this run. Choose a different approach or finish.`;
+    } else {
+      callCounts.set(tool, used + 1);
+      observation = await impl.run(args).catch((e) => `ERROR: ${e.message}`);
+    }
+
     debugLog(`agent step ${i}: ${tool} → ${truncate(observation, 120)}`);
-    steps.push({ step: i, tool, args, observation: truncate(observation, 200), model, gateway, latencyMs });
-    if (onStep) onStep({ tool, args, observation });
+    noteStep({ step: i, tool, args, observation: truncate(observation, 200), repaired, ...meta });
     history.push({ role: 'assistant', content: JSON.stringify({ tool, args }) });
     history.push({ role: 'user', content: `TOOL OBSERVATION:\n${observation}\n\nContinue with the next JSON step.` });
   }

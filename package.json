@@ -1,7 +1,7 @@
 {
   "name": "engineer-buddy",
-  "version": "0.1.0",
-  "description": "Keyless, $0/month AI engineering agent for GitHub. First skill: PR reviewer. Zero API keys, zero npm dependencies, zero monthly cost.",
+  "version": "0.2.0",
+  "description": "Keyless, $0/month AI engineering agent for GitHub. Five skills: PR review, issue→fix PR, dependency audit, issue triage, release notes. Zero API keys, zero npm dependencies.",
   "type": "module",
   "main": "src/index.js",
   "bin": {

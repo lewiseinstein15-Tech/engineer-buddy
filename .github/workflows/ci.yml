@@ -1,6 +1,7 @@
-# Engineer Buddy self-CI — dogfooding.
-# The buddy runs its own tests, probes its own brain, and reviews its own PRs
-# with the code already checked out (no cross-repo clone needed).
+# Engineer Buddy self-CI — full dogfooding on its own repo.
+# The buddy tests itself, probes its own brain, reviews its own PRs, and
+# executes @engineer-buddy commands on its own issues — using the code
+# already checked out (no cross-repo clone needed).
 name: "Engineer Buddy CI"
 
 on:
@@ -9,9 +10,13 @@ on:
   pull_request:
   issue_comment:
     types: [created]
+  issues:
+    types: [opened]
+  schedule:
+    - cron: "0 6 * * 1" # weekly self-audit, Mondays 06:00 UTC
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
   issues: write
 
@@ -31,6 +36,7 @@ jobs:
         run: npm test
 
   doctor:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     continue-on-error: true # gateway health is informational, never blocks
     steps:
@@ -46,9 +52,8 @@ jobs:
       github.event_name == 'pull_request' ||
       (
         github.event_name == 'issue_comment' &&
-        startsWith(github.event.comment.body, '@engineer-buddy') &&
-        github.event.comment.user.type != 'Bot' &&
-        github.event.issue.pull_request != null
+        startsWith(github.event.comment.body, '@engineer-buddy review') &&
+        github.event.comment.user.type != 'Bot'
       )
     runs-on: ubuntu-latest
     steps:
@@ -66,4 +71,122 @@ jobs:
           node src/index.js pr-review \
             --repo "${{ github.repository }}" \
             --pr "$PR" \
+            --repo-dir "$GITHUB_WORKSPACE"
+
+  self-triage:
+    if: github.event_name == 'issues'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Auto-triage new issue
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node src/index.js triage \
+            --repo "${{ github.repository }}" \
+            --issue "${{ github.event.issue.number }}" \
+            --repo-dir "$GITHUB_WORKSPACE"
+
+  self-command:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      !startsWith(github.event.comment.body, '@engineer-buddy review') &&
+      startsWith(github.event.comment.body, '@engineer-buddy') &&
+      github.event.comment.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Parse command
+        id: cmd
+        env:
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          LOWER="$(echo "$BODY" | head -1 | tr '[:upper:]' '[:lower:]' | xargs)"
+          case "$LOWER" in
+            "@engineer-buddy fix"*)   echo "skill=fix"   >> "$GITHUB_OUTPUT";;
+            "@engineer-buddy try"*)   echo "skill=fix"   >> "$GITHUB_OUTPUT";;
+            "@engineer-buddy audit"*) echo "skill=audit" >> "$GITHUB_OUTPUT";;
+            "@engineer-buddy notes"*) echo "skill=notes" >> "$GITHUB_OUTPUT";;
+            *)                        echo "skill=help"  >> "$GITHUB_OUTPUT";;
+          esac
+
+      - uses: actions/checkout@v4
+        if: steps.cmd.outputs.skill == 'fix' || steps.cmd.outputs.skill == 'audit'
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        if: steps.cmd.outputs.skill != 'none'
+        with:
+          node-version: 22
+
+      - name: Fix an issue (issue → branch → tests → PR)
+        if: steps.cmd.outputs.skill == 'fix'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ISSUE_NUM="$(echo '${{ github.event.comment.body }}' | head -1 | grep -oE '#[0-9]+' | head -1 | tr -d '#')"
+          node src/index.js fix-issue \
+            --repo "${{ github.repository }}" \
+            --issue "${ISSUE_NUM:-${{ github.event.issue.number }}}" \
+            --repo-dir "$GITHUB_WORKSPACE"
+
+      - name: Audit dependencies
+        if: steps.cmd.outputs.skill == 'audit'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node src/index.js dep-audit \
+            --repo "${{ github.repository }}" \
+            --repo-dir "$GITHUB_WORKSPACE"
+
+      - name: Draft release notes
+        if: steps.cmd.outputs.skill == 'notes'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node src/index.js release-notes \
+            --repo "${{ github.repository }}" \
+            --post-issue "${{ github.event.issue.number }}"
+
+      - name: Reply with help
+        if: steps.cmd.outputs.skill == 'help'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          NUMBER: ${{ github.event.issue.number }}
+        run: |
+          node -e "
+            import('./src/commands.js').then(m => {
+              const body = m.helpMarkdown();
+              const gh = process.env.GITHUB_API || 'https://api.github.com';
+              fetch(\`\${gh}/repos/\${process.env.GITHUB_REPOSITORY}/issues/\${process.env.NUMBER}/comments\`, {
+                method: 'POST',
+                headers: {
+                  Authorization: \`Bearer \${process.env.GITHUB_TOKEN}\`,
+                  'User-Agent': 'engineer-buddy',
+                  Accept: 'application/vnd.github+json',
+                },
+                body: JSON.stringify({ body }),
+              });
+            });
+          "
+
+  weekly-audit:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Weekly dependency self-audit
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node src/index.js dep-audit \
+            --repo "${{ github.repository }}" \
             --repo-dir "$GITHUB_WORKSPACE"

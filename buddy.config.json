@@ -65,5 +65,20 @@
   "timeouts": {
     "chatMs": 150000,
     "httpMs": 30000
-  }
+  },
+  "write": {
+    "maxFilesChanged": 10,
+    "maxLinesChanged": 600,
+    "requireTestsPass": true,
+    "maxRepairLoops": 2,
+    "branchPrefix": "buddy/",
+    "commitIdentity": {
+      "name": "engineer-buddy[bot]",
+      "email": "engineer-buddy[bot]@users.noreply.github.com"
+    }
+  },
+  "audit": {
+    "maxAdvisories": 15
+  },
+  "handle": "@engineer-buddy"
 }

@@ -1,19 +1,26 @@
-# Engineer Buddy — drop-in PR reviewer for ANY repo you own.
+# Engineer Buddy — drop-in AI engineer for ANY repo you own.
 # Copy this file into <target-repo>/.github/workflows/engineer-buddy.yml.
 # It pulls the buddy engine from your personal engineer-buddy repo.
 # Zero secrets: GITHUB_TOKEN (automatic) + keyless LLM gateways = $0/month.
-name: "Engineer Buddy — PR Review"
+#
+# Triggers:
+#   pull_request            → automatic engineering review
+#   issue opened            → automatic triage (labels + first response)
+#   @engineer-buddy <cmd>   → review | fix #N | audit | notes | triage | help
+name: "Engineer Buddy"
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  issues:
+    types: [opened]
   issue_comment:
-    types: [created] # comment "@engineer-buddy review" to re-run
+    types: [created]
 
 permissions:
-  contents: read
-  pull-requests: write
-  issues: write
+  contents: write        # fix-issue pushes buddy/* branches
+  pull-requests: write   # reviews + fix PRs
+  issues: write          # triage + audit tracking + commands
 
 concurrency:
   group: engineer-buddy-${{ github.event.pull_request.number || github.event.issue.number }}
@@ -21,27 +28,14 @@ concurrency:
 
 jobs:
   review:
-    if: >-
-      github.event_name == 'pull_request' ||
-      (
-        github.event_name == 'issue_comment' &&
-        startsWith(github.event.comment.body, '@engineer-buddy') &&
-        github.event.comment.user.type != 'Bot' &&
-        github.event.comment.author_association != 'NONE' &&
-        github.event.issue.pull_request != null
-      )
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Resolve PR number
         id: pr
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
-            echo "ref=${{ github.event.pull_request.head.ref }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
-            echo "ref=refs/pull/${{ github.event.issue.number }}/head" >> "$GITHUB_OUTPUT"
-          fi
+          echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          echo "ref=${{ github.event.pull_request.head.ref }}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout PR head
         uses: actions/checkout@v4
@@ -72,3 +66,167 @@ jobs:
             --repo "${{ github.repository }}" \
             --pr "${{ steps.pr.outputs.number }}" \
             --repo-dir "$GITHUB_WORKSPACE"
+
+  triage:
+    if: github.event_name == 'issues'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Engineer Buddy engine
+        env:
+          BUDDY_PAT: ${{ secrets.BUDDY_PAT }}
+        run: |
+          BUDDY_REPO="${BUDDY_REPO:-lewiseinstein15-Tech/engineer-buddy}"
+          if [ -n "$BUDDY_PAT" ]; then
+            git clone --depth 1 "https://x-access-token:${BUDDY_PAT}@github.com/${BUDDY_REPO}.git" "$RUNNER_TEMP/engineer-buddy"
+          else
+            git clone --depth 1 "https://github.com/${BUDDY_REPO}.git" "$RUNNER_TEMP/engineer-buddy"
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Auto-triage new issue
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node "$RUNNER_TEMP/engineer-buddy/src/index.js" triage \
+            --repo "${{ github.repository }}" \
+            --issue "${{ github.event.issue.number }}"
+
+  command:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      startsWith(github.event.comment.body, '@engineer-buddy') &&
+      github.event.comment.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve target (PR or issue)
+        id: t
+        run: |
+          if [ -n "${{ github.event.issue.pull_request }}" ]; then
+            echo "kind=pr" >> "$GITHUB_OUTPUT"
+            echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "kind=issue" >> "$GITHUB_OUTPUT"
+            echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Parse command
+        id: cmd
+        env:
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          LOWER="$(echo "$BODY" | head -1 | tr '[:upper:]' '[:lower:]' | xargs)"
+          case "$LOWER" in
+            "@engineer-buddy review"*) echo "skill=review" >> "$GITHUB_OUTPUT";;
+            "@engineer-buddy fix"*)    echo "skill=fix"    >> "$GITHUB_OUTPUT";;
+            "@engineer-buddy try"*)    echo "skill=fix"    >> "$GITHUB_OUTPUT";;
+            "@engineer-buddy patch"*)  echo "skill=fix"    >> "$GITHUB_OUTPUT";;
+            "@engineer-buddy audit"*)  echo "skill=audit"  >> "$GITHUB_OUTPUT";;
+            "@engineer-buddy notes"*)  echo "skill=notes"  >> "$GITHUB_OUTPUT";;
+            "@engineer-buddy release"*) echo "skill=notes" >> "$GITHUB_OUTPUT";;
+            *)                         echo "skill=other"  >> "$GITHUB_OUTPUT";;
+          esac
+          ISSUE_NUM="$(echo "$LOWER" | grep -oE '#[0-9]+' | head -1 | tr -d '#')"
+          echo "issue=${ISSUE_NUM:-${{ steps.t.outputs.number }}}" >> "$GITHUB_OUTPUT"
+
+      # ---- review (PR comment) ----
+      - name: Review PR
+        if: steps.cmd.outputs.skill == 'review' && steps.t.outputs.kind == 'pr'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const res = await github.rest.pulls.get({
+              owner: context.repo.owner, repo: context.repo.repo,
+              pull_number: Number('${{ steps.t.outputs.number }}'),
+            });
+            core.setOutput('ref', res.data.head.ref);
+        id: ref
+
+      - uses: actions/checkout@v4
+        if: steps.cmd.outputs.skill == 'review' && steps.t.outputs.kind == 'pr'
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+          fetch-depth: 1
+
+      - name: Fetch Engineer Buddy engine
+        if: steps.cmd.outputs.skill != 'other'
+        env:
+          BUDDY_PAT: ${{ secrets.BUDDY_PAT }}
+        run: |
+          BUDDY_REPO="${BUDDY_REPO:-lewiseinstein15-Tech/engineer-buddy}"
+          if [ -n "$BUDDY_PAT" ]; then
+            git clone --depth 1 "https://x-access-token:${BUDDY_PAT}@github.com/${BUDDY_REPO}.git" "$RUNNER_TEMP/engineer-buddy"
+          else
+            git clone --depth 1 "https://github.com/${BUDDY_REPO}.git" "$RUNNER_TEMP/engineer-buddy"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.cmd.outputs.skill != 'other'
+        with:
+          node-version: 22
+
+      - name: Run review command
+        if: steps.cmd.outputs.skill == 'review' && steps.t.outputs.kind == 'pr'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node "$RUNNER_TEMP/engineer-buddy/src/index.js" pr-review \
+            --repo "${{ github.repository }}" \
+            --pr "${{ steps.t.outputs.number }}" \
+            --repo-dir "$GITHUB_WORKSPACE"
+
+      # ---- fix (issue → PR) ----
+      - uses: actions/checkout@v4
+        if: steps.cmd.outputs.skill == 'fix'
+        with:
+          fetch-depth: 1
+
+      - name: Run fix command (issue → branch → tests → PR)
+        if: steps.cmd.outputs.skill == 'fix'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node "$RUNNER_TEMP/engineer-buddy/src/index.js" fix-issue \
+            --repo "${{ github.repository }}" \
+            --issue "${{ steps.cmd.outputs.issue }}" \
+            --repo-dir "$GITHUB_WORKSPACE"
+
+      # ---- audit (needs a full checkout for npm audit) ----
+      - uses: actions/checkout@v4
+        if: steps.cmd.outputs.skill == 'audit'
+        with:
+          fetch-depth: 1
+
+      - name: Run audit command
+        if: steps.cmd.outputs.skill == 'audit'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node "$RUNNER_TEMP/engineer-buddy/src/index.js" dep-audit \
+            --repo "${{ github.repository }}" \
+            --repo-dir "$GITHUB_WORKSPACE"
+
+      # ---- release notes ----
+      - name: Run release notes command
+        if: steps.cmd.outputs.skill == 'notes'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node "$RUNNER_TEMP/engineer-buddy/src/index.js" release-notes \
+            --repo "${{ github.repository }}" \
+            --post-issue "${{ steps.t.outputs.number }}"
+
+      # ---- unknown / help ----
+      - name: Reply with help
+        if: >-
+          steps.cmd.outputs.skill == 'other' ||
+          (steps.cmd.outputs.skill == 'review' && steps.t.outputs.kind == 'issue') ||
+          (steps.cmd.outputs.skill == 'fix' && steps.t.outputs.kind == 'pr')
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          NUMBER: ${{ steps.t.outputs.number }}
+        run: |
+          gh api "repos/${{ github.repository }}/issues/$NUMBER/comments" \
+            -f body="Tip: \`review\` goes on a PR, \`fix #N\` goes on an issue. Try \`@engineer-buddy help\` for the full command table." || true

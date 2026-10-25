@@ -120,7 +120,7 @@ Router sweep: gateways in configured order → skip open circuits → on total f
 
 ```
 system: protocol + tool descriptions + skill persona
-  ↓ loop (maxSteps, default 4)
+  ↓ loop (maxSteps, default 4–14 per skill)
 model → {"tool":"read_file","args":{"path":"src/x.js"}}
   ↓
 tool runs → observation string
@@ -128,7 +128,7 @@ tool runs → observation string
 model → … or {"tool":"finish","result":{…}}
 ```
 
-Protocol violations terminate the loop cleanly (the caller degrades gracefully). Every step is logged with model/gateway/latency for the review footer.
+Protocol violations trigger **one self-repair retry** (the model is shown the exact protocol again) before the loop terminates cleanly. Per-tool `maxCalls` caps prevent tool thrashing. Every step is logged with model/gateway/latency for the audit footer.
 
 ### 3.2 The review pipeline (skill #1)
 
@@ -156,7 +156,40 @@ mapToGitHubReview() ──► REQUEST_CHANGES iff critical (config) else COMMENT
 
 **Determinism + LLM separation is the core quality trick:** the LLM does judgment; regexes do facts; normalization enforces honesty. Free-model hallucinations (invented paths, out-of-range lines, verdicts outside the enum) are caught and quarantined, never posted.
 
-### 3.3 Why not OpenHands / SWE-agent / Aider?
+### 3.3 The write path (skill #2 — issue fixer)
+
+The v0.2 upgrade: the buddy can now *change* code. The pipeline is deliberately staged so the expensive/agentic phases only run after cheap deterministic gates:
+
+```
+@engineer-buddy fix #12
+   │
+   ▼
+PLAN (1 LLM call) ──► understanding · plan · files_to_read · test command
+   │
+   ▼
+EXPLORE (agent, read-only) ──► confirmed root_cause + files_to_edit
+   │      └─ confidence=low + no targets ► analysis comment, NO patch (never guesses)
+   ▼
+EDIT (agent, RepoEditor) ──► replace_in_file / write_file / append_to_file
+   │      • denylist enforced in the TOOL layer: .github/**, .env*, *.pem/key,
+   │        *credentials*, lock files — the model physically cannot write them
+   │      • budgets: maxFilesChanged=10, maxLinesChanged=600
+   │      • every mutation lands in the MutationLedger (the PR's audit table)
+   ▼
+VERIFY (deterministic) ──► allowlisted shell: npm test / node --test / pytest / …
+   │      • allowlist regexes + hard rejects (no pipes/redirects/network)
+   │      • fail → failure digest fed back to the edit agent (≤2 repair loops)
+   │      • still red → git reset --hard + clean, findings comment, NOTHING pushed
+   ▼
+SHIP (deterministic) ──► branch buddy/fix-issue-12-<slug> (never main)
+         commit (bot identity) → push (token in argv only, never persisted)
+         → PR with plan + ledger table + verification log
+         → issue comment + buddy:fix-ready label
+```
+
+**Why this shape:** every phase that can fail safely fails *before* anything leaves the runner. The only GitHub write mutations are branch-create → commit → PR-open, all on a `buddy/*` branch. The buddy never merges, never approves, and the PR body carries the entire decision trail so a human can audit it in one read.
+
+### 3.4 Why not OpenHands / SWE-agent / Aider?
 
 Evaluated for "best real-engineering performance, not benchmarks":
 
@@ -170,7 +203,7 @@ Evaluated for "best real-engineering performance, not benchmarks":
 
 ## 4. Complete tool taxonomy (engineering agent, everything)
 
-**Shipped in v0.1** = ✅ · **designed, next skills** = ◻
+**Shipped** = ✅ · **designed, next skills** = ◻
 
 ### A. Code intelligence
 | Tool | Status | Purpose |
@@ -182,17 +215,21 @@ Evaluated for "best real-engineering performance, not benchmarks":
 | AST-aware symbol extraction | ◻ | precise "what exports changed" |
 | repo map (Aider-style summaries) | ◻ | large-repo orientation |
 
-### B. Code mutation (future skills)
+### B. Code mutation
 | Tool | Status | Purpose |
 |---|---|---|
-| patch/diff apply + branch push | ◻ | test-fixer, auto-patch skills |
-| commit + PR creation | ◻ | close the loop on fixes |
+| `edit.write_file / replace_in_file / append_to_file` | ✅ | guarded edits + creation, uniqueness-checked replaces |
+| denylist + budget policy layer | ✅ | workflows/secrets/lock files physically unwritable by the model |
+| `MutationLedger` | ✅ | per-file audit trail rendered into the PR body |
+| patch/diff apply (unified diff format) | ◻ | for models that emit diffs natively |
+| AST-aware symbol extraction | ◻ | precise "what exports changed" |
 
 ### C. Verification
 | Tool | Status | Purpose |
 |---|---|---|
-| run test suite, parse failures | ◻ | test-fixer skill |
-| `npm audit` / lockfile diff | ◻ | dependency auditor skill |
+| `shell.run` (allowlist + timeout + output cap) | ✅ | test suite execution for the verify phase |
+| failure digest extraction | ✅ | only the relevant error lines go back to the model |
+| `npm audit --json` parse | ✅ | dependency auditor (npm 6 + npm 8 shapes) |
 | lint runner | ◻ | style gate (LLM freed from nits) |
 | coverage delta | ◻ | test-gap quantification |
 
@@ -203,8 +240,12 @@ Evaluated for "best real-engineering performance, not benchmarks":
 | `create_review` (event + inline) | ✅ | publish verdict |
 | `add_labels` | ✅ | triage state |
 | `create_comment` (fallback) | ✅ | degrade gracefully when reviews are blocked |
-| issue read/comment/close | ◻ | triage skill |
-| release notes from merged PRs | ◻ | release skill |
+| `get_issue / get_issue_comments` | ✅ | issue context for fixer + triage |
+| `create_issue` (+ tracking-issue reuse) | ✅ | audit reports, notes drafts |
+| `git.js`: branch / commit / push (bot identity) | ✅ | write path, `buddy/*` branches only |
+| `createPull` + `getRef`/`createBranch` API | ✅ | fix PRs without git-remote setup |
+| `listMergedPulls` | ✅ | release notes source data |
+| release notes from merged PRs | ✅ | grouped, human-ready drafts |
 
 ### E. Security & safety (deterministic layer)
 | Tool | Status | Purpose |
@@ -255,7 +296,11 @@ Separation is deliberate: buddy updates ship on their own cadence and never requ
 | Hallucinated file/line anchors | validated against the real parsed diff; displaced to the summary body |
 | Secrets in the diff | deterministic scan flags them regardless of model output; forces REQUEST_CHANGES |
 | Bot triggered by its own comment | author-type and comment-content guards in the workflow `if` |
-| Runaway agent loop | maxSteps (4) + per-call timeouts (150s) + Actions job ceiling |
+| Runaway agent loop | maxSteps (4–14 per skill) + per-tool call caps + per-call timeouts (150s) + Actions job ceiling |
+| Model tries to write a protected file | denylist enforced inside the tool layer — the write never happens, the attempt is ledgered and reported |
+| Model tries a destructive shell command | allowlist regexes + hard rejects (pipes, redirects, network tools); non-allowlisted = refused with explanation |
+| Fix fails verification | changes discarded (`reset --hard` + `clean`), findings comment posted, nothing pushed — requireTestsPass policy |
+| Push/PR API failure | fixer degrades to a findings comment; never partial state on the remote (branch+commit are atomic per-step) |
 | Review API 403 (fork PRs) | automatic fallback to a plain issue comment |
 
 ## 7. Cost accounting

@@ -31,6 +31,19 @@ export const DEFAULT_CONFIG = {
   },
   circuitBreaker: { failureThreshold: 2, cooldownMs: 120000, maxRoundTrips: 2 },
   timeouts: { chatMs: 150000, httpMs: 30000 },
+  // v0.2 — write path (issue fixer). Conservative by default.
+  write: {
+    maxFilesChanged: 10,
+    maxLinesChanged: 600,
+    requireTestsPass: true,
+    maxRepairLoops: 2,
+    branchPrefix: 'buddy/',
+    commitIdentity: { name: 'engineer-buddy[bot]', email: 'engineer-buddy[bot]@users.noreply.github.com' },
+  },
+  // v0.2 — dependency auditor
+  audit: { maxAdvisories: 15 },
+  // v0.2 — command handle (comments starting with this trigger the buddy)
+  handle: '@engineer-buddy',
 };
 
 function isPlainObject(v) {

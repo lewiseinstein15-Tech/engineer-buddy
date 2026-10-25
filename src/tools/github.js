@@ -7,6 +7,7 @@ export class GitHubClient {
   constructor({ token, repo, apiBase = 'https://api.github.com', httpMs = 30000 }) {
     if (!repo || !repo.includes('/')) throw new BuddyError(`GitHubClient: bad repo "${repo}"`, { code: 'BAD_REPO' });
     this.repo = repo;
+    this.token = token || '';
     this.apiBase = apiBase.replace(/\/$/, '');
     this.httpMs = httpMs;
     this.headers = {
@@ -133,5 +134,76 @@ export class GitHubClient {
         return 'none';
       }
     })();
+  }
+
+  // ---------- write-path APIs (issue fixer, triage, auditor) ----------
+
+  getRepository() {
+    return this._req(`/repos/${this.repo}`);
+  }
+
+  getIssue(number) {
+    return this._req(`/repos/${this.repo}/issues/${number}`);
+  }
+
+  getIssueComments(number, { max = 20 } = {}) {
+    return (async () => {
+      const all = await this._paginate(`/repos/${this.repo}/issues/${number}/comments`);
+      return all.slice(-max);
+    })();
+  }
+
+  getRef(branch) {
+    return this._req(`/repos/${this.repo}/git/ref/heads/${encodeURIComponent(branch)}`);
+  }
+
+  /** Create a branch pointing at `sha`. 422 = already exists → fetch it instead. */
+  async createBranch(branch, sha) {
+    try {
+      return await this._req(`/repos/${this.repo}/git/refs`, {
+        method: 'POST',
+        body: { ref: `refs/heads/${branch}`, sha },
+      });
+    } catch (e) {
+      if (e.code === 'GITHUB_422') return this.getRef(branch); // already exists
+      throw e;
+    }
+  }
+
+  createPull({ head, base, title, body }) {
+    return this._req(`/repos/${this.repo}/pulls`, {
+      method: 'POST',
+      body: { head, base, title, body },
+    });
+  }
+
+  createIssue({ title, body, labels }) {
+    return this._req(`/repos/${this.repo}/issues`, {
+      method: 'POST',
+      body: { title, body, ...(labels?.length ? { labels } : {}) },
+    });
+  }
+
+  listMergedPulls({ max = 30, since } = {}) {
+    return (async () => {
+      const all = await this._paginate(`/repos/${this.repo}/pulls?state=closed&sort=updated&direction=desc`);
+      return all
+        .filter((p) => p.merged_at)
+        .filter((p) => !since || new Date(p.merged_at) >= new Date(since))
+        .slice(0, max);
+    })();
+  }
+
+  listOpenIssues({ max = 100, excludePRs = true } = {}) {
+    return (async () => {
+      const all = await this._paginate(`/repos/${this.repo}/issues?state=open&sort=updated&direction=desc`);
+      return (excludePRs ? all.filter((i) => !i.pull_request) : all).slice(0, max);
+    })();
+  }
+
+  /** Find an open issue whose title starts with the given prefix (audit tracking). */
+  async findOpenIssueByTitlePrefix(prefix) {
+    const issues = await this.listOpenIssues({ max: 100 });
+    return issues.find((i) => (i.title || '').startsWith(prefix)) || null;
   }
 }

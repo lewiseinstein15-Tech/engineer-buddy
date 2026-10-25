@@ -1,17 +1,25 @@
 #!/usr/bin/env node
 // index.js — Engineer Buddy CLI.
 //
-//   engineer-buddy pr-review --repo OWNER/NAME --pr 5 [--dry-run] [--repo-dir PATH]
-//   engineer-buddy doctor                     probe every gateway in the chain
-//   engineer-buddy ask "question"             one-off brain query (debug)
+//   engineer-buddy pr-review     --repo O/R --pr N        autonomous PR review
+//   engineer-buddy fix-issue     --repo O/R --issue N     issue → diagnosis → patch → tests → PR
+//   engineer-buddy dep-audit     --repo O/R               npm audit → triage → tracking issue
+//   engineer-buddy triage        --repo O/R --issue N     classify + label + first-response
+//   engineer-buddy release-notes --repo O/R [--since TAG] draft notes from merged PRs
+//   engineer-buddy doctor                                 probe every gateway
+//   engineer-buddy ask "prompt"                           one-off brain query
 //
-// Exit codes: 0 = handled (review succeeded, skipped, or failed gracefully —
-// a review outage must never break CI), 2 = usage/config error.
+// Exit codes: 0 = handled (success, skip, or graceful failure — the buddy is a
+// non-blocking citizen and must never break CI), 2 = usage/config error.
 import { loadConfig } from './config.js';
 import { buildRouter } from './brain/index.js';
 import { GitHubClient } from './tools/github.js';
 import { LocalRepo } from './tools/repo.js';
 import { runPrReview } from './skills/pr-reviewer.js';
+import { runIssueFix } from './skills/issue-fixer.js';
+import { runDepAudit } from './skills/dep-auditor.js';
+import { runIssueTriage } from './skills/issue-triage.js';
+import { runReleaseNotes } from './skills/release-notes.js';
 import { log, warn, setVerbose, truncate, BuddyError } from './util.js';
 import { parseArgs } from 'node:util';
 
@@ -20,12 +28,16 @@ function tokenFromEnv() {
 }
 
 function usage() {
-  console.error(`Engineer Buddy v0.1 — keyless AI engineering agent ($0/month)
+  console.error(`Engineer Buddy v0.2 — keyless AI engineering agent ($0/month)
 
 Usage:
-  engineer-buddy pr-review --repo OWNER/NAME --pr NUMBER [--dry-run] [--repo-dir PATH] [--config FILE]
-  engineer-buddy doctor [--config FILE]
-  engineer-buddy ask "prompt" [--config FILE]
+  engineer-buddy pr-review     --repo OWNER/NAME --pr N [--dry-run] [--repo-dir PATH]
+  engineer-buddy fix-issue     --repo OWNER/NAME --issue N [--dry-run] --repo-dir PATH
+  engineer-buddy dep-audit     --repo OWNER/NAME [--dry-run] --repo-dir PATH
+  engineer-buddy triage        --repo OWNER/NAME --issue N [--dry-run] [--repo-dir PATH]
+  engineer-buddy release-notes --repo OWNER/NAME [--since TAG] [--dry-run] [--post-issue N]
+  engineer-buddy doctor
+  engineer-buddy ask "prompt"
 
 Environment:
   GITHUB_TOKEN / BUDDY_GITHUB_TOKEN   GitHub token (auto-provided by Actions)
@@ -33,62 +45,125 @@ Environment:
   BUDDY_DISABLE_GATEWAYS              disable gateways (csv)`);
 }
 
-async function cmdPrReview(argv) {
-  const { values } = parseArgs({
-    args: argv,
-    options: {
-      repo: { type: 'string' },
-      pr: { type: 'string' },
-      'dry-run': { type: 'boolean', default: false },
-      'repo-dir': { type: 'string' },
-      config: { type: 'string' },
-      debug: { type: 'boolean', default: false },
-    },
-  });
-  if (!values.repo || !values.pr) {
-    usage();
-    return 2;
-  }
+function commonOpts(extra = {}) {
+  return {
+    repo: { type: 'string' },
+    config: { type: 'string' },
+    debug: { type: 'boolean', default: false },
+    'dry-run': { type: 'boolean', default: false },
+    'repo-dir': { type: 'string' },
+    ...extra,
+  };
+}
+
+function setup(values) {
   setVerbose(Boolean(values.debug));
   const cfg = loadConfig({ file: values.config });
   const router = buildRouter(cfg);
-  const github = new GitHubClient({
-    token: tokenFromEnv(),
-    repo: values.repo,
-    httpMs: cfg.timeouts.httpMs,
-  });
+  const github = new GitHubClient({ token: tokenFromEnv(), repo: values.repo, httpMs: cfg.timeouts.httpMs });
   const repo = values['repo-dir'] ? new LocalRepo(values['repo-dir']) : null;
+  return { cfg, router, github, repo };
+}
 
+/** Wrap a skill run: every failure ends as a graceful comment, exit 0. */
+async function graceful(values, { issueNumber = null, prNumber = null, kind = 'task', run }) {
+  const { cfg, router, github, repo } = setup(values);
   try {
-    const result = await runPrReview({
-      repoSlug: values.repo,
-      pr: Number.parseInt(values.pr, 10),
-      github,
-      router,
-      repo,
-      config: cfg,
-      dryRun: Boolean(values['dry-run']),
-    });
-    if (result.skipped) console.log(JSON.stringify({ status: 'skipped', reason: result.reason }));
-    else console.log(JSON.stringify({ status: 'ok', event: result.event, findings: result.review.findings.length, brain: `${result.meta.gateway}/${result.meta.model}` }));
+    const result = await run({ cfg, router, github, repo });
+    console.log(JSON.stringify({ status: 'ok', ...(result.outcome ? { outcome: result.outcome } : {}), ...(result.skipped ? { skipped: true, reason: result.reason } : {}) }));
     return 0;
   } catch (e) {
-    // A review failure must never break the contributor's CI.
-    warn(`review failed: ${e.message}`);
-    try {
-      if (!values['dry-run']) {
+    warn(`${kind} failed: ${e.message}`);
+    const target = issueNumber ?? prNumber;
+    if (target && !values['dry-run']) {
+      try {
         await github.createComment(
-          Number.parseInt(values.pr, 10),
-          `## ⚠️ Engineer Buddy could not complete its review\n\n\`\`\`\n${truncate(e.message, 400)}\n\`\`\`\n\nAll keyless brain gateways were tried. A human review proceeds as normal — this is a non-blocking pre-filter. *(If this repeats, run the "Buddy Doctor" workflow to see gateway health.)*`
+          target,
+          `## ⚠️ Engineer Buddy could not complete this ${kind}\n\n\`\`\`\n${truncate(e.message, 500)}\n\`\`\`\n\nAll keyless brain gateways were tried. Nothing was changed in the repository. *(Recurring? Run the "Buddy Doctor" workflow to check gateway health.)*`
         );
-        log('posted fallback failure notice');
+      } catch (e2) {
+        warn(`could not post failure notice: ${e2.message}`);
       }
-    } catch (e2) {
-      warn(`could not post failure notice: ${e2.message}`);
     }
     console.log(JSON.stringify({ status: 'error', error: truncate(e.message, 300) }));
     return 0;
   }
+}
+
+async function cmdPrReview(argv) {
+  const { values } = parseArgs({ args: argv, options: commonOpts({ pr: { type: 'string' } }), allowPositionals: true });
+  if (!values.repo || !values.pr) {
+    usage();
+    return 2;
+  }
+  return graceful(values, {
+    kind: 'review',
+    prNumber: Number.parseInt(values.pr, 10),
+    run: ({ cfg, router, github, repo }) =>
+      runPrReview({ repoSlug: values.repo, pr: Number.parseInt(values.pr, 10), github, router, repo, config: cfg, dryRun: Boolean(values['dry-run']) }),
+  });
+}
+
+async function cmdFixIssue(argv) {
+  const { values } = parseArgs({ args: argv, options: commonOpts({ issue: { type: 'string' } }), allowPositionals: true });
+  if (!values.repo || !values.issue || !values['repo-dir']) {
+    usage();
+    return 2;
+  }
+  return graceful(values, {
+    kind: 'fix',
+    issueNumber: Number.parseInt(values.issue, 10),
+    run: ({ cfg, router, github, repo }) =>
+      runIssueFix({ repoSlug: values.repo, issue: Number.parseInt(values.issue, 10), github, router, repoDir: repo, config: cfg, dryRun: Boolean(values['dry-run']) }),
+  });
+}
+
+async function cmdDepAudit(argv) {
+  const { values } = parseArgs({ args: argv, options: commonOpts(), allowPositionals: true });
+  if (!values.repo || !values['repo-dir']) {
+    usage();
+    return 2;
+  }
+  return graceful(values, {
+    kind: 'dependency audit',
+    run: ({ cfg, router, github, repo }) => runDepAudit({ repoSlug: values.repo, github, router, repoDir: repo, config: cfg, dryRun: Boolean(values['dry-run']) }),
+  });
+}
+
+async function cmdTriage(argv) {
+  const { values } = parseArgs({ args: argv, options: commonOpts({ issue: { type: 'string' } }), allowPositionals: true });
+  if (!values.repo || !values.issue) {
+    usage();
+    return 2;
+  }
+  return graceful(values, {
+    kind: 'triage',
+    issueNumber: Number.parseInt(values.issue, 10),
+    run: ({ cfg, router, github, repo }) =>
+      runIssueTriage({ repoSlug: values.repo, issue: Number.parseInt(values.issue, 10), github, router, repo, config: cfg, dryRun: Boolean(values['dry-run']) }),
+  });
+}
+
+async function cmdReleaseNotes(argv) {
+  const { values } = parseArgs({ args: argv, options: commonOpts({ since: { type: 'string' }, 'post-issue': { type: 'string' } }), allowPositionals: true });
+  if (!values.repo) {
+    usage();
+    return 2;
+  }
+  return graceful(values, {
+    kind: 'release notes',
+    issueNumber: values['post-issue'] ? Number.parseInt(values['post-issue'], 10) : null,
+    run: ({ cfg, router, github }) =>
+      runReleaseNotes({
+        repoSlug: values.repo,
+        github,
+        router,
+        since: values.since || null,
+        config: cfg,
+        dryRun: Boolean(values['dry-run']),
+        postToIssue: values['post-issue'] ? Number.parseInt(values['post-issue'], 10) : null,
+      }),
+  });
 }
 
 async function cmdDoctor(argv) {
@@ -144,6 +219,10 @@ async function main() {
   const [cmd, ...argv] = process.argv.slice(2);
   try {
     if (cmd === 'pr-review') process.exit(await cmdPrReview(argv));
+    if (cmd === 'fix-issue') process.exit(await cmdFixIssue(argv));
+    if (cmd === 'dep-audit') process.exit(await cmdDepAudit(argv));
+    if (cmd === 'triage') process.exit(await cmdTriage(argv));
+    if (cmd === 'release-notes') process.exit(await cmdReleaseNotes(argv));
     if (cmd === 'doctor') process.exit(await cmdDoctor(argv));
     if (cmd === 'ask') process.exit(await cmdAsk(argv));
     usage();
