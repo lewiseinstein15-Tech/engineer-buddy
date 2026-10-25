@@ -55,7 +55,7 @@ export function fmtTok(n) {
 
 export const SLASH_COMMANDS = [
   'help', 'new', 'clear', 'screen', 'compact', 'context', 'map', 'model', 'gateways', 'cost',
-  'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'diff', 'hooks', 'docs', 'rename', 'branch', 'fork', 'share', 'verbosity', 'theme', 'output-style', 'statusline', 'memory', 'experience', 'learn', 'review',
+  'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'diff', 'hooks', 'docs', 'rename', 'branch', 'fork', 'share', 'verbosity', 'theme', 'output-style', 'statusline', 'why', 'compare', 'memory', 'experience', 'learn', 'review',
   'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit',
 ];
 
@@ -86,6 +86,8 @@ export const SLASH_DESCRIPTIONS = {
   theme: 'dark | light | high-contrast | mono — terminal palette (/theme mono)',
   'output-style': 'Swap the system-prompt wrapper (/output-style <name>; files in .buddy/harness/output-styles/)',
   statusline: 'Template for the post-turn status line (/statusline "{branch} · {gateway} · {ctx}%")',
+  why: 'Show exactly how the last answer was produced: gateway, model, every tool step',
+  compare: 'Ask two gateways the same question side by side (/compare kilo duckai "question")',
   tasks: 'List background shells (bash_bg / bash_output / kill_shell)',
   plan: 'Toggle plan mode — read-only research until the plan is approved',
   plans: 'List approved plans saved under .buddy/plans/',
@@ -117,6 +119,12 @@ export function renderStatusline(template, ctx = {}) {
     })
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/** /compare — pure formatter for one gateway result row. */
+export function formatCompareResult(r) {
+  if (!r.ok) return `${c.bold(r.gateway)}: ${c.red('failed')} — ${truncate(r.error || 'unknown error', 160)}`;
+  return `${c.bold(`${r.gateway} (${r.model || '?'}, ${(r.ms / 1000).toFixed(1)}s)`)}:\n${truncate(String(r.text || '').trim() || '(empty reply)', 1200)}`;
 }
 
 export function parseSlash(input) {
@@ -1130,6 +1138,54 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         statuslineRef.template = t;
         try { setChatSetting(root, 'statusline', t); } catch { /* best effort */ }
         say(`\n  ${c.green('✓ statusline set')} — rendered after every turn:\n  ${renderStatusline(t, { branch: 'main', gateway: 'kilo', ctx: '12', session: 'my-session', todo: '2/5', cwd: path.basename(root) })}\n`);
+        break;
+      }
+      case 'why': {
+        // Radical transparency: exactly how the last answer was produced.
+        const evs = lastTask?.events || [];
+        if (!evs.length) {
+          say('\n  no turn has run yet in this session — ask something first, then /why\n');
+          break;
+        }
+        const tools_ = evs.filter((e) => e.type === 'tool');
+        const said_ = [...evs].reverse().find((e) => e.type === 'say');
+        const usage_ = chat.usage();
+        const rows = tools_.map((e, i) => `${i + 1}. ${e.tool} ${e.argText || ''} → ${e.gateway || '?'}/${e.model || '?'} ${e.denied ? c.red('(denied)') : ''}`);
+        say(
+          `\n${c.bold('How the last answer was produced')}` +
+            `\n  task: ${c.bold(truncate(lastTask?.task || '(unknown)', 90))}` +
+            (rows.length ? `\n${rows.join('\n')}` : '\n  (no tool calls — direct reply)') +
+            `\n  reply: ${c.bold(`${said_ ? truncate(String(said_.text).split('\n')[0], 80) : '(none)'}…`)}` +
+            `\n  session totals: ${usage_.calls} brain call${usage_.calls === 1 ? '' : 's'} · ${usage_.tokIn || Math.round(usage_.charsIn / 4)} tok in / ${usage_.tokOut || Math.round(usage_.charsOut / 4)} tok out (${usage_.reportedCalls} reported, ${usage_.estimatedCalls} estimated)` +
+            `\n  ${c.dim('every line is also in the transcript (.buddy/sessions/) and .buddy/audit.jsonl')}\n`
+        );
+        break;
+      }
+      case 'compare': {
+        // Same prompt, two gateways, side by side — the A/B unfair advantage.
+        const m = /^(\S+)\s+(\S+)\s+([\s\S]+)$/.exec(args.trim());
+        if (!m) {
+          say(`\n  usage: ${c.bold('/compare kilo duckai "which design is better for X?"')}  ${c.dim(`— gateways: ${router.order.join(', ')}`)}\n`);
+          break;
+        }
+        const [, gwA, gwB, question] = m;
+        const invalid = [gwA, gwB].filter((g) => !router.gateways.has(g));
+        if (invalid.length) {
+          say(`\n  unknown gateway${invalid.length > 1 ? 's' : ''}: ${invalid.join(', ')} — available: ${router.order.join(', ')}\n`);
+          break;
+        }
+        const sp2 = spinner(`asking ${gwA} + ${gwB}`);
+        const ask = (name) =>
+          Promise.resolve()
+            .then(async () => {
+              const t0 = Date.now();
+              const out = await router.gateways.get(name).chat([{ role: 'user', content: question }], { maxTokens: 1024 });
+              return { gateway: name, ok: true, text: out.text, model: out.model, ms: Date.now() - t0 };
+            })
+            .catch((e) => ({ gateway: name, ok: false, error: e.message }));
+        const [a, b2] = [await ask(gwA), await ask(gwB)];
+        sp2.stop();
+        say(`\n${c.bold('Same question, two brains')} — ${c.dim(truncate(question, 80))}\n\n${formatCompareResult(a)}\n\n${formatCompareResult(b2)}\n\n  ${c.dim('this call is NOT in the conversation — nothing was taught, nothing polluted')}\n`);
         break;
       }
       case 'memory': {

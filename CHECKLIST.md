@@ -161,8 +161,8 @@ Sources: Claude Code official docs (code.claude.com/docs), the full 18-tool syst
 - [x] **Zero dependencies** — the whole agent is readable in an afternoon; CC is a compiled black box.
 - [x] **GitHub bot included** — `@engineer-buddy` review/fix/triage on any repo, free; CC charges for the equivalent Actions integration.
 - [x] **Harness² self-improvement** — `/learn` proposes validated edits to its own prompt/guardrails/memory; CC has nothing like a user-owned, versioned harness.
-- [ ] **Multi-gateway A/B compare** — `/compare kilo duckai <question>`: same prompt to two gateways, diff the answers side by side.
+- [x] **Multi-gateway A/B compare** — `/compare kilo duckai <question>`: same prompt to two gateways, diff the answers side by side. **✅ shipped v0.24.0** — parallel raw router calls (gateway/model/latency per answer, 1200-char cap, failures honest), the results are PRINT ONLY — deliberately not in the conversation, nothing taught, nothing polluted; unknown gateways refused with the available list.
 - [ ] **Self-healing routing** — persist `/gateways` probe history; the router learns live latencies and reorders the chain.
 - [ ] **Offline-first mode** — auto-detect ollama when every keyless gateway fails; Buddy keeps working on a plane.
-- [ ] **Radical transparency** — `/why`: show exactly which gateway, which prompt, which tool results produced the last answer (auditable agent).
+- [x] **Radical transparency** — `/why`: show exactly which gateway, which prompt, which tool results produced the last answer (auditable agent). **✅ shipped v0.24.0** — renders the last turn's trail: the task, every tool step with its gateway/model (denied calls flagged), the reply head, session token totals with the reported/estimated split; points at the durable copies (.buddy/sessions/ transcript + .buddy/audit.jsonl). Together with /permissions, /cost and the audit trail, every decision Buddy makes is inspectable.
 - [ ] **Unified protocol end-state** — MCP as plugin runtime, subagents on MCP tools, narration streaming from every level — the architecture Buddy sketched, shipped.
