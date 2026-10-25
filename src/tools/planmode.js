@@ -36,7 +36,9 @@ export function planModePrompt() {
     '## Plan mode (READ-ONLY)',
     'Plan mode is ON. You may ONLY use these tools: fs_search, fs_read, fs_list, web_search, web_fetch, todo, skill, exit_plan.',
     'Everything else (fs_write, fs_replace, fs_append, bash, task, MCP tools, background shells) is blocked until the user approves your plan.',
-    'Workflow: research the code until you understand it, then call exit_plan with the complete implementation plan as markdown (steps, files to touch, risks).',
+    'Workflow: research the code until you understand the change, then IMMEDIATELY call exit_plan. Do not research for more than ~8 steps — a good plan now beats a perfect plan never.',
+    'Deliver the plan ONLY through the exit_plan tool: {"tool":"exit_plan","args":{"summary":"one line","plan":"markdown"}}. NEVER write the plan as a plain-text reply — it will be lost.',
+    'Keep the plan concise (max 30 lines): steps, files to touch, risks. Short plans survive JSON escaping; huge ones get truncated.',
     'Never claim a change is made — nothing has been edited.',
   ].join('\n');
 }

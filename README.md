@@ -162,6 +162,8 @@ Dev servers, watchers, builds — Buddy starts them with `bash_bg`, polls output
 
 Toggle with `/plan` or **shift+tab** (normal → auto-accept → plan). In plan mode Buddy gets only research tools — `fs_search`, `fs_read`, `fs_list`, `web_search`, `web_fetch`, `todo`, `skill` — and the write tools, bash, sub-agents, MCP, and background shells are refused before they can even hit a gate. When research is done, Buddy calls `exit_plan` with the full plan; the standard approval gate renders it and your `[y]es` flips plan mode off **mid-turn**, so implementation continues in the same context — nothing lost, nothing restarted. Approved plans are saved to `.buddy/plans/` (`/plans` lists them); a `[n]o` keeps plan mode on so Buddy refines the plan instead.
 
+Live-testing hardening (v0.9.3): small free models sometimes write the plan as **plain prose** instead of a JSON tool call (escaping a long markdown plan into one JSON string is exactly what they fail at). In plan mode that prose is now **salvaged** — it routes straight into the `exit_plan` gate, so you still see it and approve or deny; normal turns keep the strict repair path. The last step of a turn gets a *"call exit_plan NOW"* nudge, an approval grants **8 bonus steps** so implementation never lands on a spent budget, plan-mode replies get a raised token ceiling (2500) so long plan JSON isn't truncated mid-escape, and compaction summaries carry the plan-mode obligation forward.
+
 ```text
 /plan
 ⏸ plan mode ON — Buddy researches read-only, then calls exit_plan

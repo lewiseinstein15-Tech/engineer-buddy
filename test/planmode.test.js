@@ -258,3 +258,174 @@ test('applyKey: shift+tab is mode-cycle, plain tab still completes', () => {
   assert.deepEqual(applyKey({ name: 'tab', shift: false }), { action: 'complete' });
   assert.deepEqual(applyKey({ name: 'tab' }), { action: 'complete' });
 });
+
+// ── Plan-mode hardening (v0.9.3 — the v0.9.2 live-test lessons) ──────────────
+// Lewis's kilo run: 11 steps of research → plan written as 5.5k chars of
+// prose → protocol violation → no plan ever reached the gate.
+
+test('plan mode: prose reply is salvaged into the exit_plan gate', async () => {
+  const root = tmpRoot();
+  const modes = { plan: true };
+  const { tools, harness } = makePlanBuddy(root, modes);
+  const approvals = [];
+  const events = [];
+  const prose = [
+    'Now I have a good understanding of the todo tool implementation. Let me analyze the potential bugs:',
+    '',
+    '1. **No way to update individual items** — the todo tool replaces the whole list on every call.',
+    '2. **Status is a free string** — no validation, typos silently break rendering.',
+    '',
+    'Fix: add id-based partial updates and validate status against pending/in_progress/done.',
+  ].join('\n');
+  const router = fakeRouter([prose]); // model writes prose instead of JSON
+  const chat = createChat({
+    router,
+    tools,
+    harness,
+    modes,
+    approval: async (p) => {
+      approvals.push(p);
+      return 'yes';
+    },
+    onEvent: (ev) => events.push(ev),
+  });
+  await chat.turn('find a bug in the todo tool and fix it');
+  assert.deepEqual(approvals.map((a) => a.tool), ['exit_plan'], 'prose must route into the gate');
+  assert.match(approvals[0].preview, /No way to update individual items/, 'the prose itself is the gate preview');
+  assert.equal(modes.plan, false, 'approval flips plan mode off');
+  assert.equal(listPlans(root).length, 1, 'salvaged plan is saved for /plans');
+  const toolEv = events.find((e) => e.type === 'tool' && e.tool === 'exit_plan');
+  assert.equal(toolEv.salvaged, true, 'TUI gets the salvage hint');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('normal mode: prose still goes through repair, never exit_plan', async () => {
+  const root = tmpRoot();
+  const { tools, harness } = makeBuddy(root);
+  const approvals = [];
+  const prose = 'This is a long prose reply, well over the eighty character salvage threshold used by plan mode.';
+  const router = fakeRouter([prose, '{"tool":"say","message":"recovered"}']);
+  const chat = createChat({
+    router,
+    tools,
+    harness,
+    approval: async (p) => {
+      approvals.push(p);
+      return 'yes';
+    },
+  });
+  const out = await chat.turn('just talk');
+  assert.equal(out.said, 'recovered');
+  assert.deepEqual(approvals, [], 'no gate may fire in normal mode');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('plan mode: short garbage is NOT salvaged — repair retry handles it', async () => {
+  const root = tmpRoot();
+  const modes = { plan: true };
+  const { tools, harness } = makePlanBuddy(root, modes);
+  const router = fakeRouter(['{"tool":"oops"', '{"tool":"say","message":"repaired"}']);
+  const chat = createChat({ router, tools, harness, modes });
+  const out = await chat.turn('short burst');
+  assert.equal(out.said, 'repaired');
+  assert.equal(modes.plan, true, 'nothing was approved');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('plan mode: final step forces exit_plan pressure; budget-end offers the plan', async () => {
+  const root = tmpRoot();
+  const modes = { plan: true };
+  const { tools, harness } = makePlanBuddy(root, modes);
+  const read = '{"tool":"fs_read","args":{"path":"README.md"}}';
+  const router = fakeRouter([read, read, '{"tool":"exit_plan","args":{"summary":"s","plan":"1. p"}}']);
+  const events = [];
+  const chat = createChat({
+    router,
+    tools,
+    harness,
+    modes,
+    maxStepsPerTurn: 3,
+    approval: async () => 'no',
+    onEvent: (ev) => events.push(ev),
+  });
+  const out = await chat.turn('research');
+  assert.equal(out.steps, 3);
+  const nudge = chat.messages.find((m) => m.content.includes('PLAN MODE FINAL STEP'));
+  assert.ok(nudge, 'nudge must be injected before the last step');
+  const errs = events.filter((e) => e.type === 'error').map((e) => e.text).join('\n');
+  assert.match(errs, /Plan mode is still ON/);
+  assert.equal(modes.plan, true, 'denial keeps plan mode on');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('plan mode: approval on the last step grants bonus steps for implementation', async () => {
+  const root = tmpRoot();
+  const modes = { plan: true };
+  const { tools, harness } = makePlanBuddy(root, modes);
+  const router = fakeRouter([
+    '{"tool":"fs_read","args":{"path":"README.md"}}',
+    '{"tool":"exit_plan","args":{"summary":"write","plan":"1. write"}}',
+    '{"tool":"fs_write","args":{"path":"bonus.txt","content":"same turn"}}',
+    '{"tool":"say","message":"done"}',
+  ]);
+  const chat = createChat({
+    router,
+    tools,
+    harness,
+    modes,
+    maxStepsPerTurn: 2, // approval lands on the FINAL step…
+    approval: async () => 'yes',
+  });
+  const out = await chat.turn('plan then implement');
+  assert.equal(out.said, 'done', 'impossible without bonus steps (budget was 2)');
+  assert.equal(fs.readFileSync(path.join(root, 'bonus.txt'), 'utf8'), 'same turn');
+  assert.equal(modes.plan, false);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('exit_plan: top-level plan/summary tolerated (say/finish shape precedent)', async () => {
+  const root = tmpRoot();
+  const modes = { plan: true };
+  const { tools, harness } = makePlanBuddy(root, modes);
+  const router = fakeRouter([
+    '{"tool":"exit_plan","summary":"top level shape","plan":"## Plan\\n1. fine"}',
+    '{"tool":"say","message":"ok"}',
+  ]);
+  const chat = createChat({ router, tools, harness, modes, approval: async () => 'yes' });
+  const out = await chat.turn('odd shape');
+  assert.equal(out.said, 'ok');
+  assert.equal(modes.plan, false);
+  const saved = listPlans(root)[0];
+  assert.match(fs.readFileSync(saved.file, 'utf8'), /1\. fine/, 'plan text must not be lost');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('compaction summary carries the plan-mode obligation', async () => {
+  const root = tmpRoot();
+  const modes = { plan: true };
+  const { tools, harness } = makePlanBuddy(root, modes);
+  const read = '{"tool":"fs_read","args":{"path":"README.md"}}';
+  const router = fakeRouter([read, read, read, read, read, read, read, read]);
+  const chat = createChat({ router, tools, harness, modes, charBudget: 50, maxStepsPerTurn: 5 });
+  await chat.turn('research a lot');
+  const sum = router.calls.find((c) => c.messages[0].content.startsWith('Summarize'));
+  assert.ok(sum, 'compaction must run at a 50-char budget');
+  assert.match(sum.messages[0].content, /plan mode is ACTIVE/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('plan mode raises the reply token ceiling so long plan JSON survives', async () => {
+  const root = tmpRoot();
+  const root2 = tmpRoot();
+  const modes = { plan: true };
+  const planB = makePlanBuddy(root, modes);
+  const router = fakeRouter(['{"tool":"say","message":"hi"}']);
+  await createChat({ router, tools: planB.tools, harness: planB.harness, modes }).turn('hello');
+  assert.equal(router.calls[0].opts.maxTokens, 2500, 'plan mode gets the raised ceiling');
+  const normalB = makeBuddy(root2);
+  const router2 = fakeRouter(['{"tool":"say","message":"hi"}']);
+  await createChat({ router: router2, tools: normalB.tools, harness: normalB.harness }).turn('hello');
+  assert.equal(router2.calls[0].opts.maxTokens, 1500, 'normal mode keeps the default');
+  fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(root2, { recursive: true, force: true });
+});

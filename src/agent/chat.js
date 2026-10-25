@@ -100,7 +100,11 @@ export function createChat({
           {
             role: 'user',
             content:
-              `Summarize this engineering conversation in at most 220 words. Keep: the current task, decisions made, files changed, commands run and their outcomes, open questions. Plain text only.\n\n` +
+              `Summarize this engineering conversation in at most 220 words. Keep: the current task, decisions made, files changed, commands run and their outcomes, open questions.` +
+              (modes?.plan
+                ? ' Note: plan mode is ACTIVE — research is read-only and the work must end by calling exit_plan with the plan.'
+                : '') +
+              ` Plain text only.\n\n` +
               truncate(head.map((m) => `${m.role.toUpperCase()}: ${m.content}`).join('\n'), 40000),
           },
         ],
@@ -119,7 +123,11 @@ export function createChat({
   async function callModel() {
     await maybeCompact();
     const history = [systemMsg(), ...messages];
-    const out = await router.chat(history, { maxTokens });
+    // Plan mode raises the ceiling: a full markdown plan inside one JSON
+    // string is token-heavy, and a truncated escape = protocol violation
+    // (v0.9.2 live-test lesson).
+    const maxTok = modes?.plan ? Math.max(maxTokens, 2500) : maxTokens;
+    const out = await router.chat(history, { maxTokens: maxTok });
     // Usage telemetry (the /cost surface). Rough char-based accounting.
     usage.calls += 1;
     usage.charsIn += history.reduce((n, m) => n + m.content.length, 0);
@@ -153,12 +161,25 @@ export function createChat({
     if (skill?.allowedTools?.length) {
       skillRestriction = { name: skill.name, allowed: new Set([...skill.allowedTools, 'skill', 'say']) };
     }
+    // Dynamic loop bound: an approved plan grants fresh steps so the approval
+    // can flow straight into implementation (planmode.js contract).
+    let stepLimit = maxStepsPerTurn;
 
-    for (let step = 1; step <= maxStepsPerTurn; step++) {
+    for (let step = 1; step <= stepLimit; step++) {
       if (signal?.aborted) {
         onEvent({ type: 'interrupted', at: step });
         messages.push({ role: 'user', content: '[The user interrupted this turn.] Continue only if they ask again.' });
         return { said: null, steps: step - 1, aborted: true };
+      }
+      // Plan-mode wrap-up pressure (v0.9.2 live-test lesson: kilo researched
+      // for 11 steps, then wrote the plan as prose → protocol violation, and
+      // no plan ever reached the gate). On the last step, force the door.
+      if (modes?.plan && step === stepLimit) {
+        messages.push({
+          role: 'user',
+          content:
+            'PLAN MODE FINAL STEP: you are on your last step. Stop researching and call exit_plan NOW with the best plan you can write from your research so far. Deliver the plan ONLY through exit_plan — never as a plain-text reply.',
+        });
       }
       let res;
       try {
@@ -168,7 +189,25 @@ export function createChat({
         return { said: null, steps: step - 1, error: true };
       }
 
+      let salvaged = false;
       let parsed = extractJson(res.text);
+      // Plan-mode salvage (v0.9.2 live-test lesson): free models often hand
+      // the plan over as prose — escaping a long markdown plan into a single
+      // JSON string is exactly what they fail at. In plan mode that prose IS
+      // the plan: route it into the exit_plan gate instead of failing the
+      // turn. The user still decides at the gate (approve → implement,
+      // deny → refine).
+      if (modes?.plan) {
+        const raw = String(res.text || '').trim();
+        const broken = !parsed.ok || typeof parsed.value !== 'object' || !parsed.value || !parsed.value.tool;
+        if (broken && raw.length >= 80) {
+          parsed = {
+            ok: true,
+            value: { tool: 'exit_plan', args: { summary: truncate(raw.split('\n')[0], 80), plan: raw } },
+          };
+          salvaged = true;
+        }
+      }
       // One protocol-repair retry (v0.2 heritage) for free-model sneezes.
       if (!parsed.ok || typeof parsed.value !== 'object' || !parsed.value || !parsed.value.tool) {
         debugLog(`chat step ${step}: protocol violation, requesting repair`);
@@ -196,6 +235,14 @@ export function createChat({
       }
 
       const { tool, args = {} } = parsed.value;
+
+      // v0.2 heritage: models put payload fields at the top level instead of
+      // inside args (the say/finish lesson). exit_plan gets the same
+      // tolerance so a good plan is never lost to a shape mistake.
+      if (tool === 'exit_plan') {
+        if (args.plan === undefined && parsed.value.plan !== undefined) args.plan = parsed.value.plan;
+        if (args.summary === undefined && parsed.value.summary !== undefined) args.summary = parsed.value.summary;
+      }
 
       // say / finish → speak to the user, end the turn. Both shapes are
       // accepted ("message" may arrive at top level or in args; same for
@@ -255,13 +302,24 @@ export function createChat({
         }
       }
 
+      // Approved plan → the SAME turn flows into implementation. Grant fresh
+      // steps so an approval on the budget's last step isn't stranded.
+      if (tool === 'exit_plan' && !denied && String(observation).startsWith('PLAN APPROVED')) {
+        stepLimit = step + 8;
+      }
+
       debugLog(`chat step ${step}: ${tool}${denied ? ' (denied)' : ''} → ${truncate(observation, 120)}`);
-      onEvent({ type: 'tool', tool, args, observation, denied, preview, argText: impl?.render ? String(impl.render(args) || '').slice(0, 200) : '', model: res.model, gateway: res.gateway });
+      onEvent({ type: 'tool', tool, args, observation, denied, salvaged, preview, argText: impl?.render ? String(impl.render(args) || '').slice(0, 200) : '', model: res.model, gateway: res.gateway });
       messages.push({ role: 'assistant', content: JSON.stringify({ tool, args }) });
       messages.push({ role: 'user', content: `TOOL OBSERVATION:\n${observation}\n\nContinue with the next JSON step.` });
     }
 
-    onEvent({ type: 'error', text: `Turn budget reached (${maxStepsPerTurn} steps). I paused mid-task — say "continue" to keep going.` });
+    onEvent({
+      type: 'error',
+      text: modes?.plan
+        ? `Turn budget reached (${maxStepsPerTurn} steps) with no plan approved. Plan mode is still ON — say "continue" and I will call exit_plan with the plan.`
+        : `Turn budget reached (${maxStepsPerTurn} steps). I paused mid-task — say "continue" to keep going.`,
+    });
     return { said: null, steps: maxStepsPerTurn, error: false };
   }
 

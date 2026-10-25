@@ -150,6 +150,7 @@ function makeRenderer({ quiet = false, toolByName = new Map() } = {}) {
         return;
       }
       console.log(renderToolEvent(ev, { preview: !quiet }));
+      if (ev.salvaged) console.log(c.gray('  ↺ prose reply salvaged as the plan — approve at the gate or deny to refine'));
     } else if (ev.type === 'error') {
       console.log(`  ${c.red('!')} ${ev.text}`);
     } else if (ev.type === 'interrupted') {
