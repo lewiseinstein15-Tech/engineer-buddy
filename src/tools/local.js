@@ -11,6 +11,7 @@ import { BuddyError, truncate } from '../util.js';
 import { LocalRepo } from './repo.js';
 import { isAgentDeniedPath } from '../harness/scaffold.js';
 import { renderTextDiff, renderDiff, diffLines } from '../terminal/difflib.js';
+import { snapshotPaths } from '../agent/checkpoints.js';
 
 // ── Edit previews (shown before approval, Claude-Code style) ────────────────
 
@@ -52,7 +53,7 @@ export function blockedBashReason(cmd) {
   if (!c) return 'empty command';
   if (c.length > 500) return 'command too long (>500 chars)';
   // Operators and substitution — one simple command only.
-  if (/[|;&`$()<>]/.test(c)) return 'pipes, redirects, chains, and command substitution are not allowed — run one simple command';
+  if (/[|;&`$()<>]/.test(c)) return 'pipes, redirects, chains, and command substitution are not allowed — run one simple command (output and stderr are captured automatically — no 2>&1 or | head needed)';
   // Destructive / privileged.
   if (/(^|\s)(sudo|doas|su)(\s|$)/.test(c)) return 'privilege escalation is not allowed';
   if (/\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+/.test(c)) return 'rm -r / rm -f is not allowed — ask the user to remove directories';
@@ -164,6 +165,17 @@ export class LocalScope {
 
   list(dir = '', opts = {}) {
     this._guard(dir || '.');
+    if (dir) {
+      // A missing directory used to return "(empty)" — kilo lost a step to
+      // that in the v0.9.6 live test (fs_list tools → (empty)). Errors now.
+      let st = null;
+      try {
+        st = fs.statSync(this.repo.resolveSafe(dir));
+      } catch {
+        /* handled below */
+      }
+      if (!st || !st.isDirectory()) throw new BuddyError(`no such directory: ${dir}`, { code: 'NO_DIR' });
+    }
     return this.repo.listFiles(dir, { max: 250, ...opts });
   }
 
@@ -177,12 +189,23 @@ export class LocalScope {
     return this.repo.search(q, { max: 15, ...opts });
   }
 
+  /** Snapshot a file into .buddy/checkpoints BEFORE the agent mutates it.
+   *  Best effort — a checkpoint failure must never block the write. */
+  _snap(rel, tool) {
+    try {
+      snapshotPaths(this.root, [rel], { tool });
+    } catch {
+      /* best effort */
+    }
+  }
+
   /** Overwrite or create a file (agent-scoped, policy-checked). */
   write(rel, content) {
     this._guard(rel);
     const abs = this.repo.resolveSafe(rel);
     fs_mkdir(abs);
     const before = (() => { try { return require_read(abs); } catch { return ''; } })();
+    this._snap(rel, 'fs_write');
     fs_write(abs, content);
     return { path: rel, op: before ? 'rewrite' : 'create', bytes: content.length };
   }
@@ -201,6 +224,7 @@ export class LocalScope {
     const count = content.split(findStr).length - 1;
     if (count === 0) throw new BuddyError(`replace: snippet not found in ${rel} — fs_read the file and retry`, { code: 'NO_MATCH' });
     if (count > 1) throw new BuddyError(`replace: snippet matches ${count} times in ${rel} — include more context to make it unique`, { code: 'AMBIGUOUS' });
+    this._snap(rel, 'fs_replace');
     fs.writeFileSync(abs, content.replace(findStr, String(replace)), 'utf8');
     return { path: rel, op: 'replace' };
   }
@@ -211,6 +235,7 @@ export class LocalScope {
     fs_mkdir(abs);
     let before = '';
     try { before = require_read(abs); } catch { /* new */ }
+    this._snap(rel, 'fs_append');
     fs.writeFileSync(abs, (before && !before.endsWith('\n') ? before + '\n' : before) + String(content), 'utf8');
     return { path: rel, op: before ? 'append' : 'create' };
   }

@@ -23,6 +23,7 @@ import { BackgroundShells, buildBackgroundTools } from '../tools/background.js';
 import { buildSkillTool } from '../tools/skill.js';
 import { loadSkills } from '../skills/loader.js';
 import { buildExitPlanTool, listPlans, PLANS_DIR } from '../tools/planmode.js';
+import { listCheckpoints, restoreCheckpoint } from '../agent/checkpoints.js';
 import { connectMcpServers, buildMcpTools, describeMcpServers, MCP_CONFIG_PATH } from '../tools/mcp.js';
 import { ensureHarness, loadHarness, harnessContext } from '../harness/scaffold.js';
 import { HARNESS_DIR } from '../harness/defaults.js';
@@ -39,7 +40,7 @@ export const VERSION = createRequire(import.meta.url)('../../package.json').vers
 
 export const SLASH_COMMANDS = [
   'help', 'new', 'clear', 'screen', 'compact', 'model', 'gateways', 'cost',
-  'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'memory', 'experience', 'learn', 'review',
+  'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'memory', 'experience', 'learn', 'review',
   'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit',
 ];
 
@@ -62,6 +63,7 @@ export const SLASH_DESCRIPTIONS = {
   tasks: 'List background shells (bash_bg / bash_output / kill_shell)',
   plan: 'Toggle plan mode — read-only research until the plan is approved',
   plans: 'List approved plans saved under .buddy/plans/',
+  rewind: 'List checkpoints — /rewind 1 restores files to before the latest edit',
   memory: 'Show project memory (edit it to teach Buddy)',
   experience: 'Lessons from past tasks',
   learn: 'Reflect on the last task → harness refinement',
@@ -444,6 +446,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
               ['/mcp', 'MCP servers + tools (from .buddy/mcp.json)'],
               ['/plan', 'toggle plan mode — read-only research, plan approved at the gate'],
               ['/plans', 'list approved plans in .buddy/plans/'],
+              ['/rewind [n]', 'list checkpoints · /rewind 1 restores files to before the latest edit'],
               ['/permissions', 'show session approvals · /permissions reset'],
               ['/review [staged]', 'Buddy reviews your uncommitted diff'],
               ['/yolo', 'toggle auto-approval (careful)'],
@@ -649,6 +652,37 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           (p.mtime || '').slice(0, 16).replace('T', ' '),
         ]);
         say(`\n${renderTable(rows, { headers: ['#', 'plan', 'approved'] })}\n${c.dim(`  read one: !cat ${PLANS_DIR}/<file>`)}\n`);
+        break;
+      }
+      case 'rewind': {
+        const list = listCheckpoints(root, 10);
+        if (!list.length) {
+          say(`\n  no checkpoints yet — every fs_write / fs_replace / fs_append snapshots its target file to ${c.bold('.buddy/checkpoints/')} first\n`);
+          break;
+        }
+        const rarg = String(args || '').trim();
+        if (!rarg) {
+          const rows = list.map((ck, i) => [
+            i === 0 ? c.bold('1') : String(i + 1),
+            (ck.time || '').slice(0, 19).replace('T', ' '),
+            ck.tool,
+            ck.files.map((f) => f.path).join(', ').slice(0, 60),
+          ]);
+          say(`\n${renderTable(rows, { headers: ['#', 'when', 'tool', 'files'] })}\n${c.dim('  restore: /rewind <#>  ("/rewind 1" = latest) — files only, the conversation stays')}\n`);
+          break;
+        }
+        const n = parseInt(rarg, 10);
+        if (!Number.isInteger(n) || n < 1 || n > list.length) {
+          say(`  usage: /rewind — lists checkpoints · /rewind <1-${list.length}> — restores that one\n`);
+          break;
+        }
+        const ck = list[n - 1];
+        const res = restoreCheckpoint(root, ck.file);
+        const parts = [];
+        if (res.restored.length) parts.push(`${c.green('restored')} ${res.restored.join(', ')}`);
+        if (res.removed.length) parts.push(`${c.yellow('removed')} ${res.removed.join(', ')}`);
+        if (res.lost.length) parts.push(`${c.red('lost')} ${res.lost.join(', ')}`);
+        say(`\n  ↩ rewound to the state before ${c.bold(ck.tool)} (${(ck.time || '').slice(0, 19).replace('T', ' ')})\n    ${parts.join(' · ') || 'nothing to do'}\n${c.dim('  files only — the conversation was not rewound')}\n`);
         break;
       }
       case 'memory': {

@@ -184,6 +184,25 @@ Fourth round (v0.9.6) — raw-quote recovery: with the needle fixed, kilo's next
 ⏺ fs_replace src/payments/stripe.js …
 ```
 
+### Checkpoints & /rewind — undo what Buddy touched (v0.9.7)
+
+Kilo's v0.9.6 session ended the hard way: a half-applied `fs_replace` left `src/tools/local.js` broken, and the brain went offline before it could recover. Now every file-mutating tool snapshots its target **before** the edit lands. Each `fs_write`, `fs_replace`, and `fs_append` stores the pre-edit content in a content-addressed store — `.buddy/checkpoints/objects/<sha256>` — plus a manifest recording which file, which tool, and whether the file existed before (so a rewind can also **delete** files the agent created). `/rewind` lists the last 10 checkpoints; `/rewind 1` restores the latest.
+
+```text
+> /rewind
+#  when                 tool        files
+1  2026-10-25 17:50:03  fs_replace  src/tools/local.js
+2  2026-10-25 17:50:01  fs_append   src/tools/local.js
+  restore: /rewind <#>  ("/rewind 1" = latest) — files only, the conversation stays
+
+> /rewind 1
+  ↩ rewound to the state before fs_replace (2026-10-25 17:50:03)
+    restored src/tools/local.js
+  files only — the conversation was not rewound
+```
+
+Design notes: identical content is deduped to one object (same sha256 → same blob); a per-process sequence number keeps same-millisecond snapshots in creation order; retention keeps the newest 50 manifests and prunes orphan objects; `.buddy/**` is never snapshotted; files over 2 MB are skipped; and restore refuses traversal paths even from a hand-edited manifest. Known limits (on purpose): `bash` edits are not captured — only the three file tools funnel through the snapshot hook — and the rewind restores **files only**, not the conversation. 14 tests (round-trip, dedupe, delete-on-rewind, traversal refusal, retention, chat-level end-to-end).
+
 ### Safety model (terminal mode)
 
 - **Approval gates** — writes, edits, and shell commands ask `[y]es / [n]o / [a]lways` unless you `/yolo`. One-shot mode (`-p`) is autonomous; add `--safe` to deny all writes. Plan mode (above) is the strongest gate: **nothing mutates until the plan itself is approved**.
