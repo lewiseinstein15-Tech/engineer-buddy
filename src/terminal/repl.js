@@ -43,7 +43,7 @@ export const VERSION = createRequire(import.meta.url)('../../package.json').vers
 
 export const SLASH_COMMANDS = [
   'help', 'new', 'clear', 'screen', 'compact', 'context', 'map', 'model', 'gateways', 'cost',
-  'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'hooks', 'memory', 'experience', 'learn', 'review',
+  'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'diff', 'hooks', 'memory', 'experience', 'learn', 'review',
   'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit',
 ];
 
@@ -69,6 +69,7 @@ export const SLASH_DESCRIPTIONS = {
   plan: 'Toggle plan mode — read-only research until the plan is approved',
   plans: 'List approved plans saved under .buddy/plans/',
   rewind: 'List checkpoints — /rewind 1 restores files to before the latest edit',
+  diff: 'Show uncommitted changes (git status + stat + diff)',
   hooks: 'Show lifecycle hooks (.buddy/settings.json) — exit 2 blocks a tool/prompt',
   memory: 'Show project memory (edit it to teach Buddy)',
   experience: 'Lessons from past tasks',
@@ -89,6 +90,20 @@ export function parseSlash(input) {
   if (!s.startsWith('/')) return null;
   const [name, ...rest] = s.slice(1).split(/\s+/);
   return { name: name.toLowerCase(), args: rest.join(' ') };
+}
+
+/** Pure formatter for /diff — status, stat and the body, capped. */
+export function formatDiffReport({ status = '', stat = '', diff = '', gitFailed = null } = {}) {
+  if (gitFailed) return `\n  ${c.red('git failed')}: ${truncate(gitFailed, 240)}\n`;
+  if (!status.trim() && !stat.trim()) return '\n  working tree clean — nothing to show\n';
+  return [
+    '',
+    `${c.bold('Uncommitted changes')} ${c.dim('(vs HEAD)')}`,
+    status.trim(),
+    ...(stat.trim() ? ['', c.gray(stat.trim())] : []),
+    ...(diff.trim() ? ['', c.dim(truncate(diff.trim(), 6000))] : []),
+    '',
+  ].join('\n');
 }
 
 // ── Session factory ──────────────────────────────────────────────────────────
@@ -485,6 +500,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
               ['/plan', 'toggle plan mode — read-only research, plan approved at the gate'],
               ['/plans', 'list approved plans in .buddy/plans/'],
               ['/rewind [n]', 'list checkpoints · /rewind 1 restores files to before the latest edit'],
+              ['/diff', 'show uncommitted changes (git status + stat + diff)'],
               ['/hooks', 'show lifecycle hooks (.buddy/settings.json) — exit 2 blocks a tool or prompt'],
               ['/permissions', 'show session approvals · /permissions reset'],
               ['/review [staged]', 'Buddy reviews your uncommitted diff'],
@@ -745,6 +761,24 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         if (res.removed.length) parts.push(`${c.yellow('removed')} ${res.removed.join(', ')}`);
         if (res.lost.length) parts.push(`${c.red('lost')} ${res.lost.join(', ')}`);
         say(`\n  ↩ rewound to the state before ${c.bold(ck.tool)} (${(ck.time || '').slice(0, 19).replace('T', ' ')})\n    ${parts.join(' · ') || 'nothing to do'}\n${c.dim('  files only — the conversation was not rewound')}\n`);
+        break;
+      }
+      case 'diff': {
+        const st = await runBash('git status --short', { cwd: root, timeoutMs: 15000 });
+        if (!st.ok && /not a git repository/i.test(st.stderr || '')) {
+          say('\n  not a git repository — /diff needs git\n');
+          break;
+        }
+        const dv = await runBash('git diff HEAD --stat', { cwd: root, timeoutMs: 15000 });
+        const df = await runBash('git diff HEAD', { cwd: root, timeoutMs: 15000, maxOutputChars: 12000 });
+        say(
+          formatDiffReport({
+            status: st.stdout || '',
+            stat: dv.stdout || '',
+            diff: df.stdout || '',
+            gitFailed: st.ok ? null : st.stderr || 'git status failed',
+          })
+        );
         break;
       }
       case 'hooks': {
