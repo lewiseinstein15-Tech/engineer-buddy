@@ -12,6 +12,7 @@ import { BuddyError, truncate } from '../util.js';
 import { LocalRepo } from './repo.js';
 import { isAgentDeniedPath } from '../harness/scaffold.js';
 import { renderTextDiff, renderDiff, diffLines } from '../terminal/difflib.js';
+import { createTestTool } from './testrunner.js';
 import { snapshotPaths } from '../agent/checkpoints.js';
 
 // ── Edit previews (shown before approval, Claude-Code style) ────────────────
@@ -404,7 +405,9 @@ function fmtResult(r) {
  * @returns tools with {name, description, args, run, risky?, render?}
  */
 export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { latest: null } } = {}) {
+  const testTool = createTestTool({ root: scope.root });
   return [
+    testTool,
     {
       name: 'todo',
       description:

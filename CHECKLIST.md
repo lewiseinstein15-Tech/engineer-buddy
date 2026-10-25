@@ -79,7 +79,7 @@ Sources: Claude Code official docs (code.claude.com/docs), the full 18-tool syst
 
 ## 5. P1 — Execution & Testing (Buddy's extended wishlist)
 
-- [ ] **Test debugging suite** — run a single test (`test <file>::<name>` detection per framework), rerun only failures, structured pass/fail/skip output parsed for the model.
+- [x] **Test debugging suite** — run a single test (`test <file>::<name>` detection per framework), rerun only failures, structured pass/fail/skip output parsed for the model. **✅ shipped v0.13.4** — `src/tools/testrunner.js`: `createTestTool` with per-framework detection (node --test beats npm script — zero-dep first; then pytest/go/npm), `target: "file::name"` single-test via `--test-name-pattern` (regex-escaped), `rerun_failures` with in-session failure memory (names carry as patterns suite-wide, files when targeted), structured `tests: N run · N passed · N failed · N skipped` + FAILING list + 6k output tail; parses BOTH node dialects (TTY spec `ℹ` / piped TAP `#`) — caught live: piped `node --test` emits TAP, and a child runner spawned from inside a node:test run needs `NODE_TEST_CONTEXT` stripped or it silently runs nothing. Not approval-gated (safe happy path), max 4 calls/turn. 9 tests.
 - [ ] **Coverage reports** — run coverage tooling if present (`c8`/`istanbul`/`pytest-cov`), summarize uncovered files into the turn report.
 - [ ] **Performance profiling integration** — run profilers (`node --prof`, `py-spy`) and summarize hotspots on request.
 - [ ] **Time-travel debugging / replay** — replay a session's tool calls deterministically against checkpoints (P0 checkpoints make this possible); "replay from step 7 with this one edit changed".
