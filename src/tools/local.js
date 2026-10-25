@@ -13,6 +13,7 @@ import { LocalRepo } from './repo.js';
 import { isAgentDeniedPath } from '../harness/scaffold.js';
 import { renderTextDiff, renderDiff, diffLines } from '../terminal/difflib.js';
 import { createTestTool } from './testrunner.js';
+import { createSymbolIndexProvider, searchDefs, formatDef, findRefsIn } from '../agent/symbols.js';
 import { snapshotPaths } from '../agent/checkpoints.js';
 
 // ── Edit previews (shown before approval, Claude-Code style) ────────────────
@@ -404,8 +405,10 @@ function fmtResult(r) {
  * Build the local tool set.
  * @returns tools with {name, description, args, run, risky?, render?}
  */
-export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { latest: null } } = {}) {
+export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { latest: null }, symbolIndex = null } = {}) {
   const testTool = createTestTool({ root: scope.root });
+  // Symbol index (v0.16.0) — lazy provider, shared TTL cache; read-only.
+  const syms = symbolIndex || createSymbolIndexProvider(scope.root);
   return [
     testTool,
     {
@@ -515,6 +518,65 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
         if (!hits.length) return `(no files match ${String(pattern).trim()})`;
         const shown = hits.slice(0, 200);
         return `${hits.length} file(s):\n${shown.join('\n')}${hits.length > shown.length ? `\n… (+${hits.length - shown.length} more — narrow the pattern)` : ''}`;
+      },
+    },
+    {
+      name: 'symbol_search',
+      description:
+        'Find function/class/type definitions by name across the repo (exact → prefix → substring). Cheaper than fs_search when you know roughly WHAT you seek but not where.',
+      args: '{"needle":"createChat","limit":10}',
+      render: (a) => `symbol_search ${JSON.stringify(a?.needle ?? '')}`,
+      run: async ({ needle, limit = 20 } = {}) => {
+        if (!needle) return 'ERROR: needle required';
+        const hits = searchDefs(syms().defs, needle, { limit: Math.min(Number(limit) || 20, 40) });
+        return hits.length ? hits.map(formatDef).join('\n') : `(no definitions match ${String(needle)})`;
+      },
+    },
+    {
+      name: 'go_to_def',
+      description: 'Jump to the definition of a symbol. Ambiguous names list every candidate so you can pick by file.',
+      args: '{"symbol":"buildSymbolIndex"}',
+      render: (a) => `go_to_def ${a?.symbol}`,
+      run: async ({ symbol } = {}) => {
+        if (!symbol) return 'ERROR: symbol required';
+        const hits = searchDefs(syms().defs, symbol, { limit: 10 }).filter((d) => d.name === String(symbol));
+        if (!hits.length) return `ERROR: no definition of "${symbol}" found in the index (dynamic or renamed defs are invisible to a regex index — try symbol_search with a looser needle)`;
+        return hits.length === 1 ? formatDef(hits[0]) : `"${symbol}" is defined ${hits.length} times:\n${hits.map(formatDef).join('\n')}`;
+      },
+    },
+    {
+      name: 'find_refs',
+      description: 'Every place a symbol NAME appears (word match, includes comments — a regex index, not a compiler). The definition line is not tagged separately; use go_to_def for it.',
+      args: '{"symbol":"extractDefs"}',
+      render: (a) => `find_refs ${a?.symbol}`,
+      run: async ({ symbol } = {}) => {
+        if (!symbol) return 'ERROR: symbol required';
+        const { hits, files, truncated } = findRefsIn(scope.list('', { max: 900, maxDepth: 8 }).filter((f) => /\.(js|mjs|cjs|jsx|ts|tsx|py|go|rs)$/.test(f)), scope.root, String(symbol));
+        if (!hits.length) return `(no references to "${symbol}" in code files)`;
+        const lines = hits.map((h) => `${h.file}:${h.line}: ${h.text}`);
+        return `${hits.length} reference${hits.length === 1 ? '' : 's'} across ${files} file${files === 1 ? '' : 's'}${truncated ? ' (capped — narrow with fs_search if needed)' : ''}:\n${lines.join('\n')}`;
+      },
+    },
+    {
+      name: 'impact',
+      description: 'Impact analysis: who imports the file that defines this symbol, and who references the name — "what breaks if I change this?"',
+      args: '{"symbol":"LocalScope"}',
+      render: (a) => `impact ${a?.symbol}`,
+      run: async ({ symbol } = {}) => {
+        if (!symbol) return 'ERROR: symbol required';
+        const idx = syms();
+        const defs = idx.defs.filter((d) => d.name === String(symbol));
+        if (!defs.length) return `ERROR: "${symbol}" is not in the index — try symbol_search first`;
+        const parts = [];
+        for (const d of defs.slice(0, 3)) {
+          const importerList = [...(idx.importers.get(d.file) || [])].slice(0, 20);
+          const { hits } = findRefsIn(scope.list('', { max: 900, maxDepth: 8 }).filter((f) => /\.(js|mjs|cjs|jsx|ts|tsx|py|go|rs)$/.test(f)), scope.root, String(symbol));
+          const refFiles = [...new Set(hits.map((h) => h.file))].filter((f) => f !== d.file).slice(0, 20);
+          parts.push(
+            `${formatDef(d)}\n  imported by: ${importerList.length ? importerList.join(', ') : '(nothing imports this file)'}\n  referenced in: ${refFiles.length ? refFiles.join(', ') : '(name appears only in its own file)'}`
+          );
+        }
+        return parts.join('\n');
       },
     },
     {

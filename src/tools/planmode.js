@@ -23,6 +23,10 @@ export const PLAN_TOOLS = new Set([
   'fs_read',
   'fs_search',
   'glob', // path matching (read-only)
+  'symbol_search', // code navigation (read-only, v0.16.0)
+  'go_to_def',
+  'find_refs',
+  'impact',
   'web_search', // docs lookup (read-only, safe-flagged)
   'web_fetch',
   'skill', // loading a playbook is read-only; its allowed-tools still bind
