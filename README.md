@@ -19,7 +19,7 @@ $ node src/index.js doctor
 
 ## Why this exists
 
-Our team needed a serious pre-review gate: every PR gets an engineering-grade review *before* the team lead reads it. The constraints that shaped everything:
+I needed a serious pre-review gate: every PR gets an engineering-grade review *before* a human ever opens it. The constraints that shaped everything:
 
 | Constraint | How it's met |
 |---|---|
@@ -50,12 +50,12 @@ node src/index.js doctor
 
 # 2. Dry-run a review of any PR
 GITHUB_TOKEN=ghp_xxx node src/index.js pr-review \
-  --repo OpenAImakers/efoootball --pr 3 --dry-run --repo-dir /path/to/repo
+  --repo lewiseinstein15-Tech/my-app --pr 1 --dry-run --repo-dir /path/to/repo
 
 # 3. Post it for real (drop --dry-run)
 ```
 
-**In CI (the normal path):** the `engineer-buddy.yml` workflow in the target repo does all of this automatically on every `pull_request` event, using the built-in `GITHUB_TOKEN`. See `deploy/efoootball-engineer-buddy.yml`.
+**In CI (the normal path):** the `engineer-buddy.yml` workflow in the target repo does all of this automatically on every `pull_request` event, using the built-in `GITHUB_TOKEN`. See `deploy/engineer-buddy.yml`.
 
 **On-demand re-review:** comment `@engineer-buddy review` on any PR.
 

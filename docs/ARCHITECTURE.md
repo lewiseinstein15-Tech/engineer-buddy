@@ -8,7 +8,7 @@
 
 ```
                         ┌──────────────────────────────────────────────┐
-                        │              TARGET REPO (efoootball)        │
+                        │         TARGET REPO (any repo you own)       │
                         │                                              │
                         │  PR opened/sync ─┐                           │
                         │  "@engineer-buddy│                           │
@@ -20,7 +20,8 @@
                         │   engineer-buddy.yml — $0 free-tier runner   │
                         │                                              │
                         │   GITHUB_TOKEN (built-in, no secrets)        │
-                        │   + clone of OpenAImakers/engineer-buddy     │
+                        │   + clone of lewiseinstein15-Tech/           │
+                        │     engineer-buddy                           │
                         └──────────────────┬───────────────────────────┘
                                            │ node src/index.js pr-review
               ┌────────────────────────────▼──────────────────────────────┐
@@ -232,9 +233,10 @@ Evaluated for "best real-engineering performance, not benchmarks":
 ## 5. Deployment topology
 
 ```
-github.com/OpenAImakers/engineer-buddy     github.com/OpenAImakers/efoootball
+github.com/lewiseinstein15-Tech/          github.com/lewiseinstein15-Tech/
+  engineer-buddy                            your-product
 ┌──────────────────────────────────┐       ┌─────────────────────────────────┐
-│ the agent itself                 │       │ the product (React + Supabase)  │
+│ the agent itself                 │       │ the product (any stack)         │
 │ src/ + tests + workflows         │◄──────│ .github/workflows/              │
 │ self-dogfooding on its own PRs   │ clone │   engineer-buddy.yml (thin shim)│
 │ CI: node --test + doctor         │       │ triggers: PR + @engineer-buddy  │

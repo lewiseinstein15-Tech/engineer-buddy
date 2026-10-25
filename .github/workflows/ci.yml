@@ -1,8 +1,23 @@
-name: CI
+# Engineer Buddy self-CI — dogfooding.
+# The buddy runs its own tests, probes its own brain, and reviews its own PRs
+# with the code already checked out (no cross-repo clone needed).
+name: "Engineer Buddy CI"
+
 on:
   push:
     branches: [main]
   pull_request:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: buddy-ci-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -12,5 +27,43 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Unit tests (zero dependencies)
-        run: node --test
+      - name: Unit tests
+        run: npm test
+
+  doctor:
+    runs-on: ubuntu-latest
+    continue-on-error: true # gateway health is informational, never blocks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Brain health check (keyless)
+        run: node src/index.js doctor
+
+  self-review:
+    if: >-
+      github.event_name == 'pull_request' ||
+      (
+        github.event_name == 'issue_comment' &&
+        startsWith(github.event.comment.body, '@engineer-buddy') &&
+        github.event.comment.user.type != 'Bot' &&
+        github.event.issue.pull_request != null
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Review this repo's own PR (self-dogfooding)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          PR="${{ github.event.pull_request.number || github.event.issue.number }}"
+          node src/index.js pr-review \
+            --repo "${{ github.repository }}" \
+            --pr "$PR" \
+            --repo-dir "$GITHUB_WORKSPACE"

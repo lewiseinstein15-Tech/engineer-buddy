@@ -1,5 +1,6 @@
-# Engineer Buddy — PR reviewer for the efoootball repo.
-# Lives in the efoootball repo; pulls the buddy engine from its own repo.
+# Engineer Buddy — drop-in PR reviewer for ANY repo you own.
+# Copy this file into <target-repo>/.github/workflows/engineer-buddy.yml.
+# It pulls the buddy engine from your personal engineer-buddy repo.
 # Zero secrets: GITHUB_TOKEN (automatic) + keyless LLM gateways = $0/month.
 name: "Engineer Buddy — PR Review"
 
@@ -49,11 +50,15 @@ jobs:
           fetch-depth: 1
 
       - name: Fetch Engineer Buddy engine
-        run: |
-          BUDDY_REPO="${BUDDY_REPO:-OpenAImakers/engineer-buddy}"
-          git clone --depth 1 "https://github.com/${BUDDY_REPO}.git" "$RUNNER_TEMP/engineer-buddy"
         env:
-          BUDDY_REPO: ${{ vars.BUDDY_REPO }}
+          BUDDY_PAT: ${{ secrets.BUDDY_PAT }} # only needed if engineer-buddy repo is PRIVATE
+        run: |
+          BUDDY_REPO="${BUDDY_REPO:-lewiseinstein15-Tech/engineer-buddy}"
+          if [ -n "$BUDDY_PAT" ]; then
+            git clone --depth 1 "https://x-access-token:${BUDDY_PAT}@github.com/${BUDDY_REPO}.git" "$RUNNER_TEMP/engineer-buddy"
+          else
+            git clone --depth 1 "https://github.com/${BUDDY_REPO}.git" "$RUNNER_TEMP/engineer-buddy"
+          fi
 
       - uses: actions/setup-node@v4
         with:

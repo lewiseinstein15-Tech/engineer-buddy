@@ -163,7 +163,7 @@ test('runPrReview: end-to-end dry run produces validated review', async () => {
   });
   const github = fakeGithub();
   const result = await runPrReview({
-    repoSlug: 'OpenAImakers/efoootball',
+    repoSlug: 'lewiseinstein15-Tech/demo-repo',
     pr: 5,
     github,
     router: fakeRouter(reply),
