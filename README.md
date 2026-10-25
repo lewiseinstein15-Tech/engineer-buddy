@@ -203,6 +203,10 @@ Kilo's v0.9.6 session ended the hard way: a half-applied `fs_replace` left `src/
 
 Design notes: identical content is deduped to one object (same sha256 → same blob); a per-process sequence number keeps same-millisecond snapshots in creation order; retention keeps the newest 50 manifests and prunes orphan objects; `.buddy/**` is never snapshotted; files over 2 MB are skipped; and restore refuses traversal paths even from a hand-edited manifest. Known limits (on purpose): `bash` edits are not captured — only the three file tools funnel through the snapshot hook — and the rewind restores **files only**, not the conversation. 14 tests (round-trip, dedupe, delete-on-rewind, traversal refusal, retention, chat-level end-to-end).
 
+### Brain-offline honesty — every gateway accounted for (v0.9.8)
+
+When the whole keyless chain fails, the `brain offline` line now reports **every gateway in the chain** — including ones skipped because their circuit breaker was already open (`llm7: circuit open (retry in ~43s)`), which previously vanished from the report entirely. And when a rate limit caused the outage, the line ends with an actionable hint: `wait ~60s for the rate limit to lift, then say "continue"` — kilo parks for its exact `Retry-After`, and now the report says so instead of leaving you guessing.
+
 ### Safety model (terminal mode)
 
 - **Approval gates** — writes, edits, and shell commands ask `[y]es / [n]o / [a]lways` unless you `/yolo`. One-shot mode (`-p`) is autonomous; add `--safe` to deny all writes. Plan mode (above) is the strongest gate: **nothing mutates until the plan itself is approved**.

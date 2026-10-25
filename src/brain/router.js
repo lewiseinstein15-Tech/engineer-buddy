@@ -75,10 +75,19 @@ export class GatewayRouter {
   /** Ask the brain once. Fails only if EVERY gateway fails every round trip. */
   async chat(messages, opts = {}) {
     const attempts = [];
+    const skipped = []; // gateways never tried this call — their circuit was already open
     for (let round = 1; round <= this.maxRoundTrips; round++) {
       for (const name of this.order) {
         if (this._isOpen(name)) {
-          debugLog(`router: skip ${name} (circuit open for ${Math.ceil((this.state.get(name).openUntil - Date.now()) / 1000)}s)`);
+          const secs = Math.ceil((this.state.get(name).openUntil - Date.now()) / 1000);
+          debugLog(`router: skip ${name} (circuit open for ${secs}s)`);
+          // Surface the skip in the final error (v0.9.6 live test: the
+          // brain-offline line showed kilo/pollinations/duckai but never
+          // llm7 — its circuit was open, so it silently vanished from the
+          // report and Lewis had no idea whether llm7 was even tried).
+          if (!skipped.some((s) => s.gateway === name)) {
+            skipped.push({ gateway: name, ok: false, latencyMs: 0, error: `circuit open (retry in ~${Math.max(secs, 1)}s)` });
+          }
           continue;
         }
         const gw = this.gateways.get(name);
@@ -114,10 +123,28 @@ export class GatewayRouter {
         }
       }
     }
-    const summary = attempts.map((a) => `${a.gateway}: ${a.error}`).join(' | ');
-    throw new BuddyError(`all gateways failed after ${this.maxRoundTrips} round-trips — ${summary}`, {
+    // Final report covers EVERY gateway in the chain: tried-and-failed AND
+    // skipped (circuit open). One line, no gaps — plus an actionable wait
+    // hint when rate limits are involved (v0.9.6 live test: kilo parked for
+    // its exact Retry-After while the model kept retrying into a wall).
+    const seen = new Map();
+    for (const a of [...attempts, ...skipped]) if (!seen.has(a.gateway)) seen.set(a.gateway, a);
+    const summary = this.order
+      .filter((n) => seen.has(n))
+      .map((n) => `${n}: ${seen.get(n).error}`)
+      .join(' | ');
+    const rateLimitedEntry = [...seen.values()].find((a) => /rate-limited/.test(a.error));
+    let hint = '';
+    if (rateLimitedEntry) {
+      const waitSecs = Math.max(
+        0,
+        ...this.order.map((n) => Math.ceil((this.state.get(n).openUntil - Date.now()) / 1000))
+      );
+      hint = ` — wait ~${Math.max(waitSecs, 5)}s for the rate limit to lift, then say "continue"`;
+    }
+    throw new BuddyError(`all gateways failed after ${this.maxRoundTrips} round-trips — ${summary}${hint}`, {
       code: 'ALL_GATEWAYS_FAILED',
-      data: attempts,
+      data: { attempts, skipped },
     });
   }
 
