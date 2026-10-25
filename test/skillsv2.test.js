@@ -158,7 +158,9 @@ test('loadSkills: the 5 migrated GitHub-bot skills ship as bundled SKILL.md play
     assert.ok(s.description.length > 20, `${name} has a real description`);
     assert.ok(s.body.includes('# Skill:'), `${name} has a playbook body`);
   }
-  assert.equal(BUNDLED_SKILLS_DIR, path.join(process.cwd(), 'skills'));
+  // cwd-proof: the bundled dir hangs off the package root (repo/test/..),
+  // regardless of where node --test was launched from.
+  assert.equal(BUNDLED_SKILLS_DIR, path.join(import.meta.dirname, '..', 'skills'));
 });
 
 // ── describeSkillCatalog ─────────────────────────────────────────────────────
