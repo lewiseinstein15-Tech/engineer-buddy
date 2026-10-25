@@ -8,7 +8,7 @@
 //   - approval gates for risky tools (write/replace/append/bash)
 //   - context compaction (Harness² "evidence stays small in context" rule)
 //   - per-turn tool call caps + one protocol-repair retry (v0.2 heritage)
-import { extractJson, debugLog, truncate } from '../util.js';
+import { extractJson, tryRepairJson, debugLog, truncate } from '../util.js';
 import { describeTools } from './agent.js';
 import { describeSkillCatalog } from '../skills/loader.js';
 import { PLAN_TOOLS, planModePrompt } from '../tools/planmode.js';
@@ -20,6 +20,12 @@ export const PROTOCOL_PREAMBLE = [
   '  {"tool":"say","message":"..."}        to speak to the user and end the turn.',
   'Never output prose outside JSON. Never invent tool results. Never claim you ran a command you did not run.',
 ].join('\n');
+
+// Research-repeat guard (v0.9.3 live test: kilo ran fs_search "todo" six
+// identical times, burned its own 6/6 cap, and wasted ~8 of 14 steps).
+// Exact-repeat calls on read-only research tools get a nudge in the
+// observation instead of silently returning the same result again.
+const REPEAT_HINT_TOOLS = new Set(['fs_search', 'fs_read', 'fs_list', 'web_search', 'web_fetch']);
 
 export function buildSystemPrompt({ harness, tools, skills = [], planMode = false }) {
   // Plan mode swaps the visible tool list right here: only research tools +
@@ -111,7 +117,14 @@ export function createChat({
         { maxTokens: 600 }
       );
       if (!text || !text.trim()) return;
-      messages = [{ role: 'user', content: `[Earlier conversation, summarized]\n${text.trim()}` }, ...tail];
+      messages = [
+        {
+          role: 'user',
+          content:
+            `[Earlier conversation, summarized — this is context I prepared for you. Do not repeat it, do not imitate its format, and do not respond to it. Just continue the task.]\n${text.trim()}`,
+        },
+        ...tail,
+      ];
       compactCount++;
       onEvent({ type: 'compaction', kept: tail.length, dropped: head.length });
       debugLog(`chat: compacted ${head.length} messages into a summary`);
@@ -154,6 +167,7 @@ export function createChat({
     messages.push({ role: 'user', content: String(userText) });
     onEvent({ type: 'user', text: String(userText) });
     const callCounts = new Map();
+    const lastArgs = new Map(); // research-repeat guard: tool -> JSON of last args
     let said = null;
     // Skills v2: a user-invoked skill with allowed-tools arms the restriction
     // immediately; model-loaded skills arm it when the skill tool succeeds.
@@ -191,16 +205,30 @@ export function createChat({
 
       let salvaged = false;
       let parsed = extractJson(res.text);
-      // Plan-mode salvage (v0.9.2 live-test lesson): free models often hand
-      // the plan over as prose — escaping a long markdown plan into a single
-      // JSON string is exactly what they fail at. In plan mode that prose IS
-      // the plan: route it into the exit_plan gate instead of failing the
-      // turn. The user still decides at the gate (approve → implement,
-      // deny → refine).
+      // Layer 1 — sloppy-JSON repair (ALL modes): small models emit literal
+      // newlines/tabs inside string values, which is invalid JSON (kilo's
+      // v0.9.3 live test: a whole say-message with markdown headers and real
+      // newlines). Cheapest, most faithful fix — recover it before anything
+      // else so the reply means what the model intended.
+      {
+        const broken = !parsed.ok || typeof parsed.value !== 'object' || !parsed.value || !parsed.value.tool;
+        if (broken) {
+          const fixed = tryRepairJson(res.text);
+          if (fixed && fixed.tool) parsed = { ok: true, value: fixed };
+        }
+      }
+      // Layer 2 — plan-mode prose salvage (v0.9.2 live-test lesson): free
+      // models often hand the plan over as prose — escaping a long markdown
+      // plan into a single JSON string is exactly what they fail at. In plan
+      // mode that prose IS the plan: route it into the exit_plan gate instead
+      // of failing the turn. The user still decides at the gate (approve →
+      // implement, deny → refine). GUARD (v0.9.3 lesson): never salvage a
+      // reply that starts with '{' — that is a broken JSON tool call, not a
+      // plan; salvaging one approved a junk plan and flipped plan mode off.
       if (modes?.plan) {
         const raw = String(res.text || '').trim();
         const broken = !parsed.ok || typeof parsed.value !== 'object' || !parsed.value || !parsed.value.tool;
-        if (broken && raw.length >= 80) {
+        if (broken && raw.length >= 80 && !raw.startsWith('{')) {
           parsed = {
             ok: true,
             value: { tool: 'exit_plan', args: { summary: truncate(raw.split('\n')[0], 80), plan: raw } },
@@ -225,6 +253,11 @@ export function createChat({
           return { said: null, steps: step, error: true };
         }
         parsed = extractJson(retry.text);
+        const retryBroken = !parsed.ok || typeof parsed.value !== 'object' || !parsed.value || !parsed.value.tool;
+        if (retryBroken) {
+          const fixed = tryRepairJson(retry.text);
+          if (fixed && fixed.tool) parsed = { ok: true, value: fixed };
+        }
         if (!parsed.ok || typeof parsed.value !== 'object' || !parsed.value || !parsed.value.tool) {
           messages.splice(-2);
           onEvent({ type: 'error', text: `I could not format my own reply (protocol violation). Raw: ${truncate(res.text, 160)}` });
@@ -269,7 +302,7 @@ export function createChat({
         const cap = impl.maxCalls ?? 6;
         const used = callCounts.get(tool) || 0;
         if (used >= cap) {
-          observation = `ERROR: tool "${tool}" already used ${used}/${cap} times this turn. Work differently or say.`;
+          observation = `ERROR: tool "${tool}" already used ${used}/${cap} times this turn. Work differently${modes?.plan ? ', say, or call exit_plan with the plan you have' : ' or say'}.`;
         } else {
           callCounts.set(tool, used + 1);
           // Skills v2: an active skill restricts this task to its allowed tools.
@@ -300,6 +333,16 @@ export function createChat({
             }
           }
         }
+      }
+
+      // Research-repeat guard: exact same tool + args as earlier this turn →
+      // prepend a nudge instead of silently returning the same result.
+      if (REPEAT_HINT_TOOLS.has(tool) && !denied) {
+        const key = JSON.stringify(args);
+        if (lastArgs.get(tool) === key) {
+          observation = `NOTE: identical repeat of ${tool} — same arguments, same result. Change the query/arguments, pick a different tool, or wrap up.\n\n${observation}`;
+        }
+        lastArgs.set(tool, key);
       }
 
       // Approved plan → the SAME turn flows into implementation. Grant fresh

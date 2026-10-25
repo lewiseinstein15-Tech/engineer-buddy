@@ -164,6 +164,8 @@ Toggle with `/plan` or **shift+tab** (normal → auto-accept → plan). In plan 
 
 Live-testing hardening (v0.9.3): small free models sometimes write the plan as **plain prose** instead of a JSON tool call (escaping a long markdown plan into one JSON string is exactly what they fail at). In plan mode that prose is now **salvaged** — it routes straight into the `exit_plan` gate, so you still see it and approve or deny; normal turns keep the strict repair path. The last step of a turn gets a *"call exit_plan NOW"* nudge, an approval grants **8 bonus steps** so implementation never lands on a spent budget, plan-mode replies get a raised token ceiling (2500) so long plan JSON isn't truncated mid-escape, and compaction summaries carry the plan-mode obligation forward.
 
+Second live-test round (v0.9.4): kilo then emitted a `say`-JSON with **literal newlines inside the string** (invalid JSON) — the salvage wrapped that junk as a "plan" and an approval flipped plan mode off on garbage. Now a **sloppy-JSON repair layer** (all modes) escapes control characters inside string values before anything else, so the reply means what the model intended; the salvage **refuses `{`-starting replies** (broken JSON is never a plan); identical `fs_search`/`fs_read`/`fs_list`/`web_*` repeats get a *"same arguments, same result"* nudge instead of silently returning the same output (kilo burned its own 6/6 search cap re-running one query); the cap error in plan mode points at `exit_plan`; and compaction summaries open with *"Do not repeat it, do not imitate its format"* so small models stop imitating the summary format.
+
 ```text
 /plan
 ⏸ plan mode ON — Buddy researches read-only, then calls exit_plan

@@ -126,6 +126,83 @@ export function extractJson(text) {
   return { ok: false, value: null, error: 'no balanced JSON found' };
 }
 
+/**
+ * Repair the classic small-model JSON sneeze that extractJson cannot fix:
+ * literal newlines/tabs/CRs INSIDE string values (invalid JSON — kilo's
+ * v0.9.3 live test emitted a whole say-message with markdown headers and
+ * real newlines). Finds the first balanced {…} candidate (string-aware, like
+ * extractJson), escapes control characters inside string regions, parses.
+ * Returns the parsed object or null — never throws.
+ */
+export function tryRepairJson(text) {
+  const s = String(text ?? '');
+  const start = s.indexOf('{');
+  if (start === -1) return null;
+  // Find the candidate's closing brace with string/escape tracking, so
+  // braces inside string literals do not end the scan early.
+  let end = -1;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  if (end === -1) return null;
+  const body = s.slice(start, end + 1);
+  // Walk the candidate and escape raw control chars inside string regions.
+  let out = '';
+  inStr = false;
+  esc = false;
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (inStr) {
+      if (esc) {
+        esc = false;
+        out += c;
+        continue;
+      }
+      if (c === '\\') {
+        esc = true;
+        out += c;
+        continue;
+      }
+      if (c === '"') {
+        inStr = false;
+        out += c;
+        continue;
+      }
+      if (c === '\n') out += '\\n';
+      else if (c === '\r') out += '\\r';
+      else if (c === '\t') out += '\\t';
+      else out += c;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    out += c;
+  }
+  try {
+    const v = JSON.parse(out);
+    return v && typeof v === 'object' ? v : null;
+  } catch {
+    return null;
+  }
+}
+
 /** tiny glob matcher supporting ** * ? — enough for excludeFiles lists. */
 export function globMatches(pattern, path) {
   const re = pattern
