@@ -55,6 +55,39 @@ export function listSessions(root) {
   }
 }
 
+/** Most recent session in this directory (buddy -c). */
+export function latestSession(root) {
+  return listSessions(root)[0] || null;
+}
+
+/** Find a session by exact name, name suffix, or substring (buddy -r). */
+export function findSession(root, needle) {
+  const all = listSessions(root);
+  const n = String(needle || '').trim().toLowerCase();
+  if (!n) return null;
+  const slug = n.replace(/\s+/g, '-');
+  return (
+    all.find((f) => path.basename(f).toLowerCase() === `${n}.jsonl`) ||
+    all.find((f) => path.basename(f).toLowerCase().endsWith(`-${slug}.jsonl`)) ||
+    all.find((f) => path.basename(f).toLowerCase().includes(slug)) ||
+    null
+  );
+}
+
+/** Rename a session file (buddy /rename). Returns the new path. */
+export function renameSession(root, file, name) {
+  const clean = String(name || '').trim().replace(/[^\w-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+  if (!clean) throw new Error('name can only contain letters, digits, - and _');
+  const dir = sessionsDir(root);
+  let target = path.join(dir, `${clean}.jsonl`);
+  if (path.resolve(target) !== path.resolve(file) && fs.existsSync(target)) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    target = path.join(dir, `${stamp}-${clean}.jsonl`); // conflict → keep both
+  }
+  fs.renameSync(file, target);
+  return target;
+}
+
 /** Load a session file into a compact handoff transcript. */
 export function loadSession(file) {
   const events = fs

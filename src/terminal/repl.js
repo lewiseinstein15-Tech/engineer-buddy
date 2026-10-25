@@ -31,7 +31,7 @@ import { HookRunner } from '../hooks.js';
 import { connectMcpServers, buildMcpTools, describeMcpServers, MCP_CONFIG_PATH } from '../tools/mcp.js';
 import { ensureHarness, loadHarness, harnessContext } from '../harness/scaffold.js';
 import { HARNESS_DIR } from '../harness/defaults.js';
-import { SessionRecorder, listSessions, loadSession, sessionInfo, resumeMessages, writeExport } from '../session.js';
+import { SessionRecorder, listSessions, loadSession, sessionInfo, resumeMessages, writeExport, latestSession, findSession, renameSession } from '../session.js';
 import { reflect, recentLessons, experiencePath } from '../learn.js';
 import { c, PALETTE, logoBanner, spinner, renderToolCall, renderToolEvent, renderTodo, renderTable, formatMs, renderContextBar } from './ui.js';
 import { renderMarkdown } from './markdown.js';
@@ -52,7 +52,7 @@ export function fmtTok(n) {
 
 export const SLASH_COMMANDS = [
   'help', 'new', 'clear', 'screen', 'compact', 'context', 'map', 'model', 'gateways', 'cost',
-  'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'diff', 'hooks', 'docs', 'memory', 'experience', 'learn', 'review',
+  'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'diff', 'hooks', 'docs', 'rename', 'memory', 'experience', 'learn', 'review',
   'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit',
 ];
 
@@ -75,6 +75,7 @@ export const SLASH_DESCRIPTIONS = {
   skills: 'List skills (SKILL.md playbooks) — /<skill-name> runs one',
   mcp: 'Show MCP servers + their tools (.buddy/mcp.json)',
   docs: 'Fetch official docs (/docs react hooks) — attaches to your next task',
+  rename: 'Name the current session (/rename fix-auth) — resume later with buddy -r fix-auth',
   tasks: 'List background shells (bash_bg / bash_output / kill_shell)',
   plan: 'Toggle plan mode — read-only research until the plan is approved',
   plans: 'List approved plans saved under .buddy/plans/',
@@ -253,9 +254,13 @@ export function appendMemoryNote(root, note) {
 
 // ── Headless one-shot ────────────────────────────────────────────────────────
 
-export async function runOneShot({ router, root = process.cwd(), task, safe = false, yolo = false, quiet = false, config = {} } = {}) {
+export async function runOneShot({ router, root = process.cwd(), task, safe = false, yolo = false, quiet = false, config = {}, outputFormat = 'text', resumeFrom = null } = {}) {
   const events = [];
-  const render = makeRenderer({ quiet });
+  const fmt = ['text', 'json', 'stream-json'].includes(outputFormat) ? outputFormat : 'text';
+  const jsonModes = fmt === 'json' || fmt === 'stream-json';
+  // text mode renders human output; json suppresses it entirely; stream-json
+  // replaces it with JSONL events (the machine-readable transcript).
+  const render = jsonModes ? () => {} : makeRenderer({ quiet });
   const repoMapProvider = config.chat?.repoMap === false ? null : createRepoMapProvider(root, { maxChars: config.chat?.repoMapChars || 2800 });
   const { chat, hooks } = await createBuddySession({
     root,
@@ -263,10 +268,22 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
     yolo,
     approval: defaultApproval({ safe }),
     charBudget: config.chat?.charBudget,
+    resumeFrom,
     repoMap: repoMapProvider,
     onEvent: (ev) => {
       events.push(ev);
       render(ev);
+      if (fmt === 'stream-json') {
+        // One JSON object per line, as events happen — CI-friendly streaming.
+        const slim = {
+          type: ev.type,
+          ...(ev.tool ? { tool: ev.tool, argText: ev.argText || undefined } : {}),
+          ...(ev.type === 'tool' ? { observation: truncate(ev.observation || '', 400) } : {}),
+          ...(ev.type === 'say' ? { text: ev.text } : {}),
+          ...(ev.type === 'error' ? { text: ev.text || ev.message || 'error' } : {}),
+        };
+        process.stdout.write(`${JSON.stringify(slim)}\n`);
+      }
     },
   });
   if (hooks?.size) hooks.fireAndForget('SessionStart', { mode: 'one-shot' });
@@ -281,6 +298,24 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
     /* mentions are best effort — the raw task still runs */
   }
   const out = await chat.turn(taskText, { images: taskImages });
+  if (fmt === 'json') {
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          status: out.said ? 'ok' : 'no_reply',
+          said: out.said || null,
+          steps: out.steps ?? null,
+          gateway: out.gateway || null,
+          model: out.model || null,
+          toolCalls: events.filter((e) => e.type === 'tool').length,
+        },
+        null,
+        2
+      )}\n`
+    );
+  } else if (fmt === 'stream-json') {
+    process.stdout.write(`${JSON.stringify({ type: 'result', status: out.said ? 'ok' : 'no_reply', said: out.said || null, steps: out.steps ?? null })}\n`);
+  }
   return { ...out, events };
 }
 
@@ -303,7 +338,7 @@ export function printMcpStatus(mcp) {
 
 // ── Interactive REPL ─────────────────────────────────────────────────────────
 
-export async function startRepl({ router, root = process.cwd(), config = {}, yolo: yoloFlag = false } = {}) {
+export async function startRepl({ router, root = process.cwd(), config = {}, yolo: yoloFlag = false, resumeFrom = null } = {}) {
   if (!process.stdin.isTTY) {
     console.error('buddy: interactive mode needs a TTY. Use one-shot mode instead:  buddy -p "task"');
     return 2;
@@ -357,6 +392,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     root,
     router,
     modes,
+    resumeFrom,
     repoMap: config.chat?.repoMap === false ? null : createRepoMapProvider(root, { maxChars: config.chat?.repoMapChars || 2800 }),
     onPlanApproved: ({ saved }) => {
       console.log(`\n  ${c.green('✓ plan approved')} — exited plan mode${saved ? c.gray(` · saved to ${path.relative(root, saved)}`) : ''}\n`);
@@ -871,6 +907,24 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
             `\n  ${c.dim('attaches to your NEXT task automatically; /docs (bare) shows status')}` +
             `\n\n${c.gray(truncate(r.text, 1200))}\n`
         );
+        break;
+      }
+      case 'rename': {
+        if (!recorder) {
+          say('\n  no session to rename yet — send a task first (the recorder starts with your first message)\n');
+          break;
+        }
+        if (!args.trim()) {
+          say(`\n  usage: ${c.bold('/rename <name>')}  ${c.dim('— letters, digits, - and _ · resume later: buddy -r <name>')}`);
+          break;
+        }
+        try {
+          const target = renameSession(root, recorder.path, args.trim());
+          recorder.file = target;
+          say(`\n  ${c.green('✓ renamed')} → ${c.bold(path.basename(target, '.jsonl'))} ${c.dim('— resume with: buddy -r ' + args.trim())}\n`);
+        } catch (e) {
+          say(`\n  ${c.red('rename failed')}: ${e.message}\n`);
+        }
         break;
       }
       case 'memory': {

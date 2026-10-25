@@ -27,11 +27,13 @@ import { runDepAudit } from './skills/dep-auditor.js';
 import { runIssueTriage } from './skills/issue-triage.js';
 import { runReleaseNotes } from './skills/release-notes.js';
 import { startRepl, runOneShot, VERSION } from './terminal/repl.js';
+import { latestSession, findSession } from './session.js';
 import { startMcpServer } from './mcpserver.js';
 import { ensureHarness } from './harness/scaffold.js';
 import { log, warn, setVerbose, truncate, BuddyError } from './util.js';
 import { parseArgs } from 'node:util';
 import path from 'node:path';
+import fs from 'node:fs';
 
 function tokenFromEnv() {
   return process.env.BUDDY_GITHUB_TOKEN || process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '';
@@ -43,6 +45,10 @@ function usage() {
 Local coding agent (Buddy Code — like Claude Code, in your terminal):
   engineer-buddy                        interactive session in the current directory
   engineer-buddy -p "task"              one-shot autonomous task (add --safe to deny writes)
+  echo "task" | engineer-buddy -p       pipe the task in on stdin
+  engineer-buddy -p "task" -o json      machine-readable output (text | json | stream-json)
+  engineer-buddy -c                     continue the newest session in this directory
+  engineer-buddy -r <name>              resume a named session (see /rename)
   engineer-buddy init                   scaffold .buddy/harness/ (systemprompt, guardrails,
                                         MEMORY.md, tool guidance, skills)
 
@@ -247,6 +253,12 @@ async function cmdChat(argv, { oneShot = false } = {}) {
       quiet: { type: 'boolean', default: false },
       config: { type: 'string' },
       dir: { type: 'string' },
+      c: { type: 'boolean', default: false },
+      continue: { type: 'boolean', default: false },
+      r: { type: 'string' },
+      resume: { type: 'string' },
+      o: { type: 'string' },
+      'output-format': { type: 'string' },
     },
     allowPositionals: true,
   });
@@ -254,15 +266,58 @@ async function cmdChat(argv, { oneShot = false } = {}) {
   const router = buildRouter(cfg);
   const root = values.dir ? path.resolve(values.dir) : process.cwd();
 
-  if (oneShot || values.p) {
-    const task = values.p || positionals.join(' ');
+  // Session continuity: -c continues the newest session here; -r <name>
+  // resumes a named one (exact name → suffix → substring).
+  const resumeNeedle = values.r ?? values.resume;
+  let resumeFile = null;
+  if (resumeNeedle) {
+    resumeFile = findSession(root, resumeNeedle);
+    if (!resumeFile) {
+      console.error(`buddy: no session matches "${resumeNeedle}" in ${root} — /sessions lists what exists`);
+      return 2;
+    }
+  } else if (values.c || values.continue) {
+    resumeFile = latestSession(root);
+    if (!resumeFile) {
+      console.error(`buddy: nothing to continue — no sessions in ${root}`);
+      return 2;
+    }
+    console.error(`[buddy] continuing: ${path.basename(resumeFile)}`);
+  }
+
+  const fmt = (values.o || values['output-format'] || 'text').toLowerCase();
+  if (!['text', 'json', 'stream-json'].includes(fmt)) {
+    console.error(`buddy: --output-format must be text | json | stream-json (got "${fmt}")`);
+    return 2;
+  }
+
+  if (oneShot || values.p || !process.stdin.isTTY) {
+    let task = values.p || positionals.join(' ');
+    // stdin pipe support: echo "task" | buddy -p  ·  cat task.md | buddy -p
+    if (!task && !process.stdin.isTTY) {
+      try {
+        task = fs.readFileSync(0, 'utf8').trim();
+      } catch {
+        task = '';
+      }
+    }
     if (!task) {
       usage();
       return 2;
     }
-    const out = await runOneShot({ router, root, task, safe: Boolean(values.safe), yolo: Boolean(values.yolo), quiet: Boolean(values.quiet), config: cfg });
+    const out = await runOneShot({
+      router,
+      root,
+      task,
+      safe: Boolean(values.safe),
+      yolo: Boolean(values.yolo),
+      quiet: Boolean(values.quiet),
+      config: cfg,
+      outputFormat: fmt,
+      resumeFrom: resumeFile,
+    });
     if (!out.said) {
-      console.error('buddy: no final reply (see events above)');
+      if (fmt !== 'json' && fmt !== 'stream-json') console.error('buddy: no final reply (see events above)');
       return 1;
     }
     return 0;
@@ -272,7 +327,7 @@ async function cmdChat(argv, { oneShot = false } = {}) {
     console.error('       run `buddy` in your terminal, or use one-shot mode: buddy -p "task"');
     return 2;
   }
-  return (await startRepl({ router, root, config: cfg, yolo: Boolean(values.yolo) })) ?? 0;
+  return (await startRepl({ router, root, config: cfg, yolo: Boolean(values.yolo), resumeFrom: resumeFile })) ?? 0;
 }
 
 async function cmdInit(argv) {
