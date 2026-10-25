@@ -46,6 +46,7 @@ export function buildSystemPrompt({ harness, tools, skills = [], planMode = fals
           '',
           '## Plan protocol',
           'For any multi-step task, FIRST call the todo tool with a short plan (max 8 items, all "pending"), then update item statuses ("in_progress" → "done") as you work. Keep texts short.',
+          'Items may carry ids and dependencies: {"id":"2","text":"fix it","status":"pending","blocked_by":["1"]} — an item with blockers cannot start or finish until every blocker is "done". The reply lists READY NOW items; start with those. An empty items array clears the plan.',
         ]
       : []),
     ...(planMode ? ['', planModePrompt()] : []),
@@ -76,6 +77,7 @@ export function createChat({
   maxTokens = 1500,
   approval = null, // async ({tool, summary}) => 'yes' | 'no' | 'always' | null
   modes = null, // shared { plan: boolean } — plan mode when .plan is true
+  todoState = null, // shared { latest: [...] | null } — todo v2 state, kept through compaction
   onEvent = () => {},
 }) {
   const byName = new Map(tools.map((t) => [t.name, t]));
@@ -123,11 +125,19 @@ export function createChat({
         { maxTokens: 600 }
       );
       if (!text || !text.trim()) return;
+      // Todo anchor: the plan itself survives compaction (todo v2) — a long
+      // implementation turn that churns context must not forget what is done
+      // and what is next. Plain text, statuses included.
+      const planLines = todoState?.latest?.length
+        ? `\n\nCURRENT PLAN (todo tool — keep these statuses, continue from the first non-done item):\n${todoState.latest
+            .map((it) => `- [${it.status === 'done' ? 'x' : it.status === 'in_progress' ? '~' : ' '}] #${it.id} ${it.text}`)
+            .join('\n')}`
+        : '';
       messages = [
         {
           role: 'user',
           content:
-            `[Earlier conversation, summarized — this is context I prepared for you. Do not repeat it, do not imitate its format, and do not respond to it. Just continue the task.]\n${currentTask ? `CURRENT TASK (from the user — keep working on exactly this): ${currentTask}\n\n` : ''}${text.trim()}`,
+            `[Earlier conversation, summarized — this is context I prepared for you. Do not repeat it, do not imitate its format, and do not respond to it. Just continue the task.]\n${currentTask ? `CURRENT TASK (from the user — keep working on exactly this): ${currentTask}\n` : ''}${planLines}\n\n${text.trim()}`,
         },
         ...tail,
       ];

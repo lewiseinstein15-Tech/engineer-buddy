@@ -262,19 +262,56 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     {
       name: 'todo',
       description:
-        'Track a multi-step plan. Call FIRST with the plan (all pending), then update statuses (in_progress / done) as you work. Max 8 items, short texts.',
-      args: '{"items":[{"text":"read the failing test","status":"pending"}]}',
+        'Track a dependency-aware plan (todo v2). Call FIRST with the plan (all pending), then update statuses (in_progress / done) as you work. Items may declare "blocked_by" (ids that must be done first) — blocked items cannot start or finish until every blocker is done; the reply lists READY NOW items, start with those. Max 8 items, short texts. An empty items array clears the plan.',
+      args: '{"items":[{"id":"1","text":"read the failing test","status":"in_progress"},{"id":"2","text":"patch it","status":"pending","blocked_by":["1"]}]}',
       render: (a) => `todo (${(a?.items || []).length} items)`,
       run: async ({ items } = {}) => {
-        if (!Array.isArray(items) || !items.length) return 'ERROR: items must be a non-empty array of {"text":..., "status":"pending|in_progress|done"}';
+        if (!Array.isArray(items)) return 'ERROR: items must be an array of {"id":..., "text":..., "status":"pending|in_progress|done", "blocked_by":["<id>"]}';
+        if (!items.length) {
+          todoState.latest = null;
+          return 'PLAN cleared — send a new plan whenever you need one.';
+        }
         const norm = items.slice(0, 8).map((it, i) => ({
+          id: it?.id != null && String(it.id).trim() ? String(it.id).trim() : String(i + 1),
           text: String(it?.text ?? `item ${i + 1}`).slice(0, 120),
           status: ['pending', 'in_progress', 'done'].includes(it?.status) ? it.status : 'pending',
+          blocked_by:
+            it?.blocked_by == null
+              ? []
+              : (Array.isArray(it.blocked_by) ? it.blocked_by : [it.blocked_by]).map((s) => String(s).trim()).filter(Boolean),
+          ...(it?.notes ? { notes: String(it.notes).slice(0, 80) } : {}),
         }));
+        // ── DAG validation (todo v2) — a broken plan is refused, not stored.
+        const ids = new Set(norm.map((it) => it.id));
+        const dup = norm.find((it, i) => norm.findIndex((x) => x.id === it.id) !== i);
+        if (dup) return `ERROR: duplicate item id "${dup.id}" — ids must be unique`;
+        for (const it of norm) {
+          if (it.blocked_by.includes(it.id)) return `ERROR: item "${it.id}" cannot block itself`;
+          const unknown = it.blocked_by.filter((b) => !ids.has(b));
+          if (unknown.length) return `ERROR: item "${it.id}" blocked_by unknown id ${unknown.map((u) => `"${u}"`).join(', ')} — valid ids: ${[...ids].join(', ')}`;
+        }
+        const violations = [];
+        for (const it of norm) {
+          if (it.status === 'pending' || !it.blocked_by.length) continue;
+          const open = it.blocked_by.map((b) => norm.find((x) => x.id === b)).filter((x) => x && x.status !== 'done');
+          if (open.length) violations.push(`"${it.id}" (${it.status}) is blocked by ${open.map((x) => `"${x.id}" (${x.status})`).join(', ')}`);
+        }
+        if (violations.length) {
+          return `ERROR: blocked_by violated — a blocked item cannot start or finish until every blocker is done. ${violations.slice(0, 3).join('; ')}. Fix the statuses or the blocked_by lists.`;
+        }
         todoState.latest = norm;
-        return `PLAN (${norm.filter((x) => x.status === 'done').length}/${norm.length} done):\n${norm
-          .map((it) => `- [${it.status === 'done' ? 'x' : it.status === 'in_progress' ? '~' : ' '}] ${it.text}`)
-          .join('\n')}\nKeep statuses updated as you progress.`;
+        const mark = (s) => (s === 'done' ? 'x' : s === 'in_progress' ? '~' : ' ');
+        const lines = norm.map((it) => {
+          let line = `- [${mark(it.status)}] #${it.id} ${it.text}`;
+          if (it.blocked_by.length) line += ` (after #${it.blocked_by.join(', #')})`;
+          if (it.notes) line += ` - ${it.notes}`;
+          return line;
+        });
+        const ready = norm.filter((it) => it.status === 'pending' && it.blocked_by.every((b) => norm.find((x) => x.id === b)?.status === 'done'));
+        const readyLine = ready.length && norm.some((it) => it.status !== 'pending')
+          ? `\nREADY NOW: ${ready.map((it) => `#${it.id}`).join(', ')} — unblocked, start here.`
+          : '';
+        return `PLAN (${norm.filter((x) => x.status === 'done').length}/${norm.length} done):\n${lines.join('\n')}${readyLine}\nKeep statuses updated as you progress.`;
       },
     },
     {

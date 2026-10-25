@@ -142,14 +142,16 @@ export function renderFilePreview({ path, op, bytes }) {
   return `  ${c.green(op === 'create' ? '+' : '~')} ${c.bold(path)} ${c.gray(`(${op}, ${bytes ?? '?'} bytes)`)}`;
 }
 
-/** Todo checklist — Claude Code's signature plan UI. */
+/** Todo checklist — Claude Code's signature plan UI (v2: ids + blocked_by). */
 export function renderTodo(items, { indent = '  ' } = {}) {
   const ICON = { done: c.green('✓'), in_progress: c.cyan('▸'), pending: c.gray('○') };
   return items
     .map((it) => {
       const status = ['pending', 'in_progress', 'done'].includes(it.status) ? it.status : 'pending';
       const text = status === 'done' ? c.gray(String(it.text)) : status === 'in_progress' ? c.bold(String(it.text)) : String(it.text);
-      return `${indent}${ICON[status]} ${text}`;
+      const id = it.id != null && String(it.id) !== '' ? c.gray(`#${it.id} `) : '';
+      const blocked = it.blocked_by?.length ? c.gray(` · after #${[].concat(it.blocked_by).join(', #')}`) : '';
+      return `${indent}${ICON[status]} ${id}${text}${blocked}`;
     })
     .join('\n');
 }

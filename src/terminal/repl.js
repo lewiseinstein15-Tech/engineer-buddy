@@ -123,7 +123,9 @@ function makeHarness(root) {
 export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {} } = {}) {
   const { tools, todoState, mcp, shells, skills } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved });
   const harness = makeHarness(root);
-  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, onEvent });
+  // todoState is shared: the todo tool writes it (local.js), compaction reads
+  // it (todo v2 plan anchor) — one object, one truth.
+  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, todoState, onEvent });
   if (resumeFrom) {
     for (const m of resumeMessages(loadSession(resumeFrom))) session.messages.push(m);
   }

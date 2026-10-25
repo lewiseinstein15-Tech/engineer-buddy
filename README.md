@@ -207,6 +207,17 @@ Design notes: identical content is deduped to one object (same sha256 → same b
 
 When the whole keyless chain fails, the `brain offline` line now reports **every gateway in the chain** — including ones skipped because their circuit breaker was already open (`llm7: circuit open (retry in ~43s)`), which previously vanished from the report entirely. And when a rate limit caused the outage, the line ends with an actionable hint: `wait ~60s for the rate limit to lift, then say "continue"` — kilo parks for its exact `Retry-After`, and now the report says so instead of leaving you guessing.
 
+### Dependency-aware plans — todo v2 (v0.10.0)
+
+Buddy's plan list grew up: items can now declare **dependencies** (`blocked_by`) and the DAG is enforced, not just stored. A blocked item cannot start or finish until every blocker is `done` — the tool refuses the whole update with the exact violation (`"2" (done) is blocked by "1" (in_progress)`), so a model cannot accidentally skip a step. Every reply lists the **READY NOW** items (pending, all blockers done) so the next actionable step is always visible, and unknown/duplicate/self blocker ids are caught the same way. Plans survive context compaction: the `CURRENT PLAN` (statuses included) rides next to the task anchor in every summary. Old plans still work — ids are optional and auto-assigned. 13 tests.
+
+```text
+⏺ todo · 3 items
+  ✓ #1 write failing test
+  ▸ #2 patch the bug · after #1
+  ○ #3 run the suite · after #2
+```
+
 ### Safety model (terminal mode)
 
 - **Approval gates** — writes, edits, and shell commands ask `[y]es / [n]o / [a]lways` unless you `/yolo`. One-shot mode (`-p`) is autonomous; add `--safe` to deny all writes. Plan mode (above) is the strongest gate: **nothing mutates until the plan itself is approved**.
