@@ -103,6 +103,44 @@ test('restore refuses traversal paths from a hand-edited manifest', () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+// ── restore is UNDO: the applied manifest is consumed (v0.11.1 live bug) ─────
+// Lewis's live run: two "/rewind 1" calls printed the SAME message because
+// the restored manifest stayed on disk and was re-restored forever.
+
+test('/rewind 1 twice walks back TWO undo steps (stack is consumed)', () => {
+  const root = tmpRoot();
+  snapshotPaths(root, ['rew.txt'], { tool: 'fs_write' }); // file did not exist yet
+  fs.writeFileSync(path.join(root, 'rew.txt'), 'v1');
+  snapshotPaths(root, ['rew.txt'], { tool: 'fs_replace' }); // pre-state v1
+  fs.writeFileSync(path.join(root, 'rew.txt'), 'v2');
+  const l1 = listCheckpoints(root, 1);
+  assert.equal(l1[0].tool, 'fs_replace');
+  const r1 = restoreCheckpoint(root, l1[0].file);
+  assert.deepEqual(r1.restored, ['rew.txt']);
+  assert.equal(fs.readFileSync(path.join(root, 'rew.txt'), 'utf8'), 'v1');
+  const l2 = listCheckpoints(root, 1);
+  assert.equal(l2[0].tool, 'fs_write', 'second /rewind 1 lands on the NEXT manifest, not fs_replace again');
+  const r2 = restoreCheckpoint(root, l2[0].file);
+  assert.deepEqual(r2.removed, ['rew.txt']);
+  assert.equal(fs.existsSync(path.join(root, 'rew.txt')), false, 'agent-created file is removed');
+  assert.equal(listCheckpoints(root, 10).length, 0, 'both manifests consumed — stack is empty');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('consuming a manifest prunes its orphan objects; unreadable manifests never wedge the stack', () => {
+  const root = tmpRoot();
+  fs.writeFileSync(path.join(root, 'a.md'), 'v1');
+  const m = snapshotPaths(root, ['a.md'], { tool: 'fs_write' });
+  fs.writeFileSync(path.join(root, 'a.md'), 'v2');
+  restoreCheckpoint(root, m);
+  assert.equal(fs.readdirSync(path.join(root, '.buddy', 'checkpoints', 'objects')).length, 0, 'object unreferenced after consume → pruned');
+  fs.writeFileSync(path.join(root, '.buddy', 'checkpoints', 'junk.json'), '{not json');
+  const r = restoreCheckpoint(root, 'junk.json');
+  assert.deepEqual(r.lost, ['(manifest unreadable)']);
+  assert.equal(fs.existsSync(path.join(root, '.buddy', 'checkpoints', 'junk.json')), false, 'corrupt manifest is consumed too');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 // ── listCheckpoints + retention ──────────────────────────────────────────────
 
 test('listCheckpoints is newest-first — "/rewind 1" is the latest', () => {

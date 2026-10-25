@@ -16,6 +16,9 @@
 //   - bash edits are NOT captured — only fs_write/fs_replace/fs_append funnel
 //     through LocalScope.write/replace/append, which call snapshotPaths
 //   - retention keeps the newest 50 manifests and prunes orphan objects
+//   - restore is UNDO: the applied manifest is consumed (deleted) and its
+//     orphan objects pruned, so repeating "/rewind 1" walks backwards one
+//     undo step at a time instead of re-restoring the same snapshot
 //   - restore refuses traversal paths (defense against hand-edited manifests)
 import fs from 'node:fs';
 import path from 'node:path';
@@ -99,17 +102,24 @@ export function snapshotPaths(root, relPaths, { tool = 'tool' } = {}) {
 }
 
 /**
- * Restore every file in a checkpoint manifest to its pre-mutation state:
- * existed:true → copy the object blob back; existed:false → remove the file
- * (the agent created it in that step). Never throws — per-file problems land
- * in `lost`. Returns {restored, removed, lost}.
+ * Undo one edit: restore every file in a checkpoint manifest to its
+ * pre-mutation state — existed:true → copy the object blob back,
+ * existed:false → remove the file (the agent created it in that step).
+ * The applied manifest is CONSUMED (deleted, orphan objects pruned) so
+ * repeating "/rewind 1" walks backwards step by step — re-restoring the
+ * same snapshot forever was the v0.11.1 live bug. An unreadable manifest
+ * is consumed too: a corrupt entry must never wedge the undo stack.
+ * Never throws — per-file problems land in `lost`. Returns
+ * {restored, removed, lost}.
  */
 export function restoreCheckpoint(root, manifestFile) {
   const out = { restored: [], removed: [], lost: [] };
+  const file = path.join(ckptDir(root), path.basename(manifestFile));
   let manifest;
   try {
-    manifest = JSON.parse(fs.readFileSync(path.join(ckptDir(root), path.basename(manifestFile)), 'utf8'));
+    manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch {
+    try { fs.rmSync(file, { force: true }); } catch { /* best effort */ }
     out.lost.push('(manifest unreadable)');
     return out;
   }
@@ -144,6 +154,9 @@ export function restoreCheckpoint(root, manifestFile) {
       out.lost.push(rel);
     }
   }
+  // Consume the undo step: drop the manifest, prune objects only it referenced.
+  try { fs.rmSync(file, { force: true }); } catch { /* best effort */ }
+  pruneCheckpoints(root);
   return out;
 }
 

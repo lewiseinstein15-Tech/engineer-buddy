@@ -186,7 +186,7 @@ Fourth round (v0.9.6) — raw-quote recovery: with the needle fixed, kilo's next
 
 ### Checkpoints & /rewind — undo what Buddy touched (v0.9.7)
 
-Kilo's v0.9.6 session ended the hard way: a half-applied `fs_replace` left `src/tools/local.js` broken, and the brain went offline before it could recover. Now every file-mutating tool snapshots its target **before** the edit lands. Each `fs_write`, `fs_replace`, and `fs_append` stores the pre-edit content in a content-addressed store — `.buddy/checkpoints/objects/<sha256>` — plus a manifest recording which file, which tool, and whether the file existed before (so a rewind can also **delete** files the agent created). `/rewind` lists the last 10 checkpoints; `/rewind 1` restores the latest.
+Kilo's v0.9.6 session ended the hard way: a half-applied `fs_replace` left `src/tools/local.js` broken, and the brain went offline before it could recover. Now every file-mutating tool snapshots its target **before** the edit lands. Each `fs_write`, `fs_replace`, and `fs_append` stores the pre-edit content in a content-addressed store — `.buddy/checkpoints/objects/<sha256>` — plus a manifest recording which file, which tool, and whether the file existed before (so a rewind can also **delete** files the agent created). `/rewind` lists the last 10 checkpoints; `/rewind 1` restores the latest. Each restore is **one undo step**: the applied checkpoint is consumed, so repeating `/rewind 1` walks backwards through history — v0.11.2 fixed a live bug where the manifest was never consumed and every `/rewind 1` re-restored the same snapshot forever.
 
 ```text
 > /rewind

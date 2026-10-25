@@ -690,7 +690,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
             ck.tool,
             ck.files.map((f) => f.path).join(', ').slice(0, 60),
           ]);
-          say(`\n${renderTable(rows, { headers: ['#', 'when', 'tool', 'files'] })}\n${c.dim('  restore: /rewind <#>  ("/rewind 1" = latest) — files only, the conversation stays')}\n`);
+          say(`\n${renderTable(rows, { headers: ['#', 'when', 'tool', 'files'] })}\n${c.dim('  restore: /rewind <#>  ("/rewind 1" = latest, each restore is one undo) — files only, the conversation stays')}\n`);
           break;
         }
         const n = parseInt(rarg, 10);
