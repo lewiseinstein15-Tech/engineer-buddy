@@ -214,6 +214,8 @@ Everything lives in `buddy.config.json` (overrides the built-in defaults):
 
 ## Roadmap
 
+**Full gap checklist vs Claude Code — tools, MCP, subagents, plugins, hooks, and beyond: [CHECKLIST.md](CHECKLIST.md)** (tick items off as they ship)
+
 The tool registry + agent core are generic (see `docs/ARCHITECTURE.md`):
 
 1. ~~PR reviewer~~ ✅
