@@ -640,7 +640,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   const rl = createInputBox({
     title: 'Buddy',
     placeholder: 'type a task…   (/ for commands · ! shell · # remember)',
-    hint: '? shortcuts · tab complete · ↑↓ history · esc stop · ctrl+o expand · ctrl+c quit',
+    hint: '? shortcuts · ↑↓ history · esc stop · ctrl+o expand · ctrl+r transcript · ctrl+c quit',
     record: recordPath,
     statusRight: () => {
       try {

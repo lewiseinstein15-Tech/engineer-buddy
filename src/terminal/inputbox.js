@@ -21,6 +21,10 @@
 //   - ctrl+o (v0.30.0) toggles the expanded transcript: the Aurora strip's
 //     narration grows to a 3-row mini transcript and tool observations
 //     render in full (repl.js listens on the 'verbose' handler event)
+//   - ctrl+r (v0.31.0) opens the session transcript viewer: a scrollable,
+//     live-tailing panel over the box, fed by every byte the renderer prints
+//     (renderer.print → onPrint → capture). Editing is inert while open; the
+//     running turn keeps streaming into the tail.
 
 import fs from 'node:fs';
 import readline from 'node:readline';
@@ -28,6 +32,7 @@ import { createRenderer } from './renderer.js';
 import { c } from './ui.js';
 import { buildAuroraStrip, SEM } from './theme.js';
 import { charWidth, strWidth, wrapContent, truncateAnsi } from './text.js';
+import { sanitizeChunk, applyViewerKey, buildTranscriptPanel, viewerBodyRows, VIEWER } from './transcript.js';
 
 export { charWidth, strWidth, wrapContent };
 
@@ -38,7 +43,7 @@ export { charWidth, strWidth, wrapContent };
 // ctx: { paletteOpen? } — switches ↑/↓ from history to palette navigation.
 // Returns { action, data } where action ∈ insert|submit|backspace|delete|left|right|
 // home|end|kill-line|kill-word-before|history-prev|history-next|complete|
-// mode-cycle|palette-prev|palette-next|escape|sigint|eof|null
+// mode-cycle|palette-prev|palette-next|escape|transcript|sigint|eof|null
 export function applyKey(key, ctx = {}) {
   const name = key.name ?? '';
   if (key.ctrl && name === 'c') return { action: 'sigint' };
@@ -55,6 +60,7 @@ export function applyKey(key, ctx = {}) {
   if (key.ctrl && name === 'k') return { action: 'kill-line' };
   if (key.ctrl && name === 'w') return { action: 'kill-word-before' };
   if (key.ctrl && name === 'o') return { action: 'verbose-toggle' }; // v0.30.0: expand/collapse the stream transcript
+  if (key.ctrl && name === 'r') return { action: 'transcript' }; // v0.31.0: open the ctrl+r transcript viewer
   if (name === 'up') return ctx.paletteOpen ? { action: 'palette-prev' } : { action: 'history-prev' };
   if (name === 'down') return ctx.paletteOpen ? { action: 'palette-next' } : { action: 'history-next' };
   if (name === 'tab') return key.shift ? { action: 'mode-cycle' } : { action: 'complete' };
@@ -103,6 +109,21 @@ function withCursor(line, ci) {
 
 export function buildFrame(state, cols) {
   const W = Math.min(Math.max(cols ?? 80, 34), 100); // total width incl. 2-col indent
+
+  // ── transcript viewer (ctrl+r, v0.31.0) ── replaces the whole frame: the
+  // session's scrollback in a scrollable panel; the spin timer repaints it so
+  // a running turn live-tails while you browse.
+  if (state.viewer?.open) {
+    return buildTranscriptPanel({
+      lines: state.transcript || [],
+      cols: W,
+      rows: state.viewer.rows,
+      scroll: state.viewer.scroll,
+      busy: state.busy,
+      tick: state.tick || 0,
+    });
+  }
+
   const CW = W - 6;  // inner width between `│ ` and ` │`
   const TW = W - 8;  // text width after the `> ` prompt
   const lines = [];
@@ -220,6 +241,9 @@ export function createInputBox({
   let busyThought = null; // Aurora: the RAW extractor snapshot (+ bytes), not a preformatted string
   let toolCallsCount = 0;
   let verbose = false; // ctrl+o (v0.30.0): expanded transcript — strip narration + full observations
+  let viewerOpen = false; // ctrl+r (v0.31.0): transcript viewer over the box
+  let viewerScroll = 0; // rows scrolled up from the live tail (0 = tail)
+  const transcript = []; // session scrollback, SGR kept, capped at VIEWER.MAX_BUFFER
   let busyStart = 0;
   let spinIdx = 0;
   let spinTimer = null;
@@ -254,6 +278,10 @@ export function createInputBox({
       tick: spinIdx,
       toolCalls: toolCallsCount,
       verbose,
+      viewer: viewerOpen
+        ? { open: true, rows: viewerBodyRows(process.stdout?.rows, process.stdout?.columns), scroll: viewerScroll }
+        : null,
+      transcript: viewerOpen ? transcript.slice() : null,
       statusRight: typeof statusRight === 'function' ? (statusRight() || '') : (statusRight || ''),
       palette: items.length ? { items, sel: paletteSel } : null,
     };
@@ -264,6 +292,7 @@ export function createInputBox({
       renderer = createRenderer({
         out: outOverride || process.stdout,
         frame: (cols0) => buildFrame(frameState(), Math.min(Math.max(cols0 ?? 80, 34), 100)),
+        onPrint: pushTranscript, // v0.31.0: capture every scrollback byte for ctrl+r
       });
     }
     return renderer;
@@ -277,6 +306,18 @@ export function createInputBox({
   function resetPaletteState() {
     paletteSel = 0;
     paletteClosed = false;
+  }
+
+  // v0.31.0 capture: the renderer hands us every flushed scrollback chunk —
+  // user echoes, tool cards, say blocks, ribbons — exactly as printed. SGR
+  // stays (the viewer shows the session in its own colors); cursor moves,
+  // OSC and \r artifacts are stripped. Capped: old lines fall off the top.
+  function pushTranscript(chunk) {
+    const lines = sanitizeChunk(chunk);
+    if (!lines.length) return;
+    transcript.push(...lines);
+    if (transcript.length > VIEWER.MAX_BUFFER) transcript.splice(0, transcript.length - VIEWER.MAX_BUFFER);
+    if (viewerOpen) redraw(); // live tail while browsing
   }
 
   function insertText(data) {
@@ -329,6 +370,22 @@ export function createInputBox({
         fs.appendFileSync(process.env.BUDDY_KEYLOG, `${Date.now() % 1000000} ${JSON.stringify({ name: key.name ?? null, seq: key.sequence ?? null, ctrl: !!key.ctrl, meta: !!key.meta })}\n`);
       } catch { /* diagnostics only */ }
     }
+    // ── transcript viewer owns EVERY key while open (v0.31.0) ── the editor is
+    // inert: no key can mutate the draft, interrupt the turn or quit; ctrl+c
+    // and esc just close the pager, like Claude Code's.
+    if (viewerOpen) {
+      const { action } = applyViewerKey(key);
+      if (action === 'close') { viewerOpen = false; viewerScroll = 0; }
+      else if (action === 'up') viewerScroll += 1;
+      else if (action === 'down') viewerScroll = Math.max(0, viewerScroll - 1);
+      else if (action === 'pageup') viewerScroll += viewerBodyRows(process.stdout?.rows, process.stdout?.columns);
+      else if (action === 'pagedown') viewerScroll = Math.max(0, viewerScroll - viewerBodyRows(process.stdout?.rows, process.stdout?.columns));
+      else if (action === 'top') viewerScroll = Number.MAX_SAFE_INTEGER; // panel clamps to the top
+      else if (action === 'bottom') viewerScroll = 0; // live tail again
+      else return; // inert key: no repaint needed
+      redraw();
+      return;
+    }
     // bracketed paste → unwrap and insert as one line
     const pm = /^\x1b\[200~([\s\S]*)\x1b\[201~\s*$/.exec(String(key.sequence ?? ''));
     if (pm) {
@@ -377,6 +434,10 @@ export function createInputBox({
       case 'verbose-toggle': // ctrl+o: expand/collapse — repl.js widens observations too
         verbose = !verbose;
         handlers.verbose?.(verbose);
+        break;
+      case 'transcript': // ctrl+r (v0.31.0): open the transcript viewer over the box
+        viewerOpen = true;
+        viewerScroll = 0; // live tail first — the newest work is the news
         break;
       case 'mode-cycle': handlers.modecycle?.(); break; // shift+tab: normal → auto-accept → plan
       case 'submit': submitLine(); return; // submitLine handles its own repaint
@@ -444,8 +505,11 @@ export function createInputBox({
     on(ev, fn) { handlers[ev] = fn; return rl; },
     // test / harness seam: drive the box's key reducer directly
     _handleKeypress(key) { onKeypress(key || {}); },
+    // test seam (v0.31.0): feed the transcript capture directly (what install()'s
+    // onPrint wiring receives from renderer.print in production)
+    _capture: pushTranscript,
     // test / introspection hooks
-    _state: () => ({ text, cursor, mode, history: [...history], busy: busyLabel, thought: busyThought, toolCalls: toolCallsCount, verbose, palette: paletteItems().map((i) => i.name) }),
+    _state: () => ({ text, cursor, mode, history: [...history], busy: busyLabel, thought: busyThought, toolCalls: toolCallsCount, verbose, viewer: viewerOpen ? { scroll: viewerScroll } : null, transcriptLines: transcript.length, palette: paletteItems().map((i) => i.name) }),
   };
 
   rl.install = function install() {

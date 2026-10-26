@@ -25,7 +25,7 @@
 
 import { rowCount } from './text.js';
 
-export function createRenderer({ out, frame = null } = {}) {
+export function createRenderer({ out, frame = null, onPrint = null } = {}) {
   let frameRows = 0;   // screen rows currently occupied by the dynamic frame
   let closed = false;
   let pending = '';    // partial line held until a newline arrives
@@ -57,13 +57,16 @@ export function createRenderer({ out, frame = null } = {}) {
     draw();
   }
 
-  /** Static content: printed above the frame, which is re-anchored below. */
+  /** Static content: printed above the frame, which is re-anchored below.
+   *  onPrint (v0.31.0) sees the exact flushed text — the ctrl+r transcript
+   *  captures every scrollback byte through this single choke point. */
   function print(chunk) {
     if (closed) return;
     pending += String(chunk ?? '');
     if (!pending.includes('\n')) return; // hold partial lines until newline
     const text = pending;
     pending = '';
+    try { onPrint?.(text); } catch { /* capture is best-effort */ }
     erase();
     out.write(text.endsWith('\n') ? text : text + '\n');
     draw();
