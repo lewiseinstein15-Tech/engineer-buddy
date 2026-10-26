@@ -506,7 +506,7 @@ export function createChat({
               const rule = matchingRule(permissions, tool, args, 'deny');
               observation = `REFUSED by a permissions rule (${rule}) — this is policy from .buddy/settings.json, not a judgment call. Pick a different approach or ask the user to change the rules.`;
               denied = true;
-            } else if (impl.risky && approval && !alwaysApproved.has(tool) && verdict === 'ask') {
+            } else if ((typeof impl.riskyWhen === 'function' ? !!impl.riskyWhen(args) : !!impl.risky) && approval && !alwaysApproved.has(tool) && verdict === 'ask') {
               const decision = await approval({ tool, args, summary: impl.render ? impl.render(args) : truncate(JSON.stringify(args), 200), preview });
               if (decision === 'always') alwaysApproved.add(tool);
               denied = decision === 'no';

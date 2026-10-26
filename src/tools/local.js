@@ -196,9 +196,21 @@ export function isSecretPath(rel) {
 }
 
 export class LocalScope {
-  constructor(root = process.cwd()) {
+  constructor(root = process.cwd(), extraRoots = []) {
     this.repo = new LocalRepo(root);
     this.root = this.repo.root;
+    // Multi-root workspace (v0.26.0): /add-dir registers extra directories
+    // under a short ALIAS; every fs tool then addresses their files as
+    // "<alias>/relative/path". Main-root paths keep working exactly as before
+    // (an alias must not shadow an existing main-root entry — addRoot checks).
+    this.extra = new Map(); // alias → LocalRepo
+    for (const r of Array.isArray(extraRoots) ? extraRoots : []) {
+      try {
+        this.addRoot(r?.alias, r?.path);
+      } catch {
+        /* a broken configured root degrades to absent — never blocks startup */
+      }
+    }
     // Freshness guard (v0.10.2): abs path -> sha256 of the content the agent
     // last read or wrote this session. If the file on disk differs when an
     // edit lands, the edit is refused — exactly Claude Code's "file has been
@@ -207,18 +219,63 @@ export class LocalScope {
     this._fresh = new Map();
   }
 
-  /** Reject protected/secret paths up front. */
+  /** Register one extra root under an alias (lowercase [a-z0-9_-], ≤24 chars).
+   *  Refuses alias collisions and main-root shadowing (a file or directory
+   *  with the same name lives in the main workspace). */
+  addRoot(alias, absPath) {
+    const a = String(alias || '').trim().toLowerCase();
+    if (!/^[a-z0-9_-]{1,24}$/.test(a)) throw new BuddyError(`bad alias "${alias}" — use 1-24 chars of [a-z0-9_-]`, { code: 'BAD_ALIAS' });
+    if (a === '.' || this.extra.has(a)) throw new BuddyError(`alias "${a}" is already a workspace root`, { code: 'ALIAS_TAKEN' });
+    if (fs.existsSync(path.join(this.root, a))) {
+      throw new BuddyError(`"${a}" already exists in the main workspace — pick a different alias (/add-dir <path> <alias>)`, { code: 'ALIAS_CLASH' });
+    }
+    this.extra.set(a, new LocalRepo(absPath));
+    return a;
+  }
+
+  /** Forget one extra root. Returns true when an alias was actually removed. */
+  removeRoot(alias) {
+    return this.extra.delete(String(alias || '').trim().toLowerCase());
+  }
+
+  /** The alias→path table (for /add-dir listing and tool descriptions). */
+  rootsInfo() {
+    if (!this.extra.size) return '';
+    return ` Additional workspace roots (added via /add-dir): ${[...this.extra.entries()].map(([a, r]) => `${a}/ → ${r.root}`).join(', ')}. Address files inside them as "<alias>/relative/path".`;
+  }
+
+  /** Split "alias/rest" into its repo + remainder (main root when no alias). */
+  _rootFor(rel) {
+    const p = String(rel || '');
+    const m = p.match(/^([a-z0-9_-]+)(?:\/(.*))?$/s);
+    if (m && this.extra.has(m[1])) return { repo: this.extra.get(m[1]), rest: m[2] || '' };
+    return { repo: this.repo, rest: p };
+  }
+
+  /** Containment-safe resolve across ALL roots (main + every alias). */
+  resolveSafe(rel) {
+    const { repo, rest } = this._rootFor(rel);
+    const abs = path.resolve(repo.root, rest || '.');
+    if (abs !== repo.root && !abs.startsWith(repo.root + path.sep)) {
+      throw new BuddyError(`path escapes root: ${rel}`, { code: 'PATH_ESCAPE' });
+    }
+    return abs;
+  }
+
+  /** Reject protected/secret paths up front (alias remainder checked too —
+   *  secrets and policy-denied files stay protected inside extra roots). */
   _guard(rel) {
     const p = String(rel || '');
     if (!p || p.startsWith('/') || p.includes('..')) throw new BuddyError(`unsafe path "${p}"`, { code: 'UNSAFE_PATH' });
-    if (isSecretPath(p)) throw new BuddyError(`refusing to touch likely secrets: ${p}`, { code: 'SECRET_PATH' });
-    if (isAgentDeniedPath(p)) throw new BuddyError(`path is protected by policy: ${p}`, { code: 'DENIED_PATH' });
+    const { rest } = this._rootFor(p);
+    if (isSecretPath(rest) || isSecretPath(p)) throw new BuddyError(`refusing to touch likely secrets: ${p}`, { code: 'SECRET_PATH' });
+    if (isAgentDeniedPath(rest) || isAgentDeniedPath(p)) throw new BuddyError(`path is protected by policy: ${p}`, { code: 'DENIED_PATH' });
     return p;
   }
 
   _raw(rel) {
     try {
-      const abs = this.repo.resolveSafe(rel);
+      const abs = this.resolveSafe(rel);
       const st = fs.statSync(abs);
       if (!st.isFile() || st.size > 2_000_000) return null;
       return fs.readFileSync(abs, 'utf8');
@@ -231,7 +288,7 @@ export class LocalScope {
     const raw = this._raw(rel);
     if (raw != null) {
       try {
-        this._fresh.set(this.repo.resolveSafe(rel), contentHash(raw));
+        this._fresh.set(this.resolveSafe(rel), contentHash(raw));
       } catch {
         /* best effort */
       }
@@ -242,7 +299,7 @@ export class LocalScope {
   _checkFresh(rel) {
     let abs;
     try {
-      abs = this.repo.resolveSafe(rel);
+      abs = this.resolveSafe(rel);
     } catch {
       return;
     }
@@ -257,7 +314,8 @@ export class LocalScope {
 
   read(rel, maxChars = 30000) {
     this._guard(rel);
-    const r = this.repo.readFile(rel, maxChars);
+    const { repo, rest } = this._rootFor(rel);
+    const r = repo.readFile(rest, maxChars);
     if (!r) throw new BuddyError(`cannot read ${rel} (missing, binary, or too large)`, { code: 'NO_FILE' });
     this._markFresh(rel); // freshness baseline = what the agent just saw
     return r;
@@ -266,7 +324,8 @@ export class LocalScope {
   /** Read WITHOUT touching the freshness state (previews, internal checks). */
   peek(rel, maxChars = 30000) {
     this._guard(rel);
-    const r = this.repo.readFile(rel, maxChars);
+    const { repo, rest } = this._rootFor(rel);
+    const r = repo.readFile(rest, maxChars);
     if (!r) throw new BuddyError(`cannot read ${rel} (missing, binary, or too large)`, { code: 'NO_FILE' });
     return r;
   }
@@ -278,13 +337,14 @@ export class LocalScope {
       // that in the v0.9.6 live test (fs_list tools → (empty)). Errors now.
       let st = null;
       try {
-        st = fs.statSync(this.repo.resolveSafe(dir));
+        st = fs.statSync(this.resolveSafe(dir));
       } catch {
         /* handled below */
       }
       if (!st || !st.isDirectory()) throw new BuddyError(`no such directory: ${dir}`, { code: 'NO_DIR' });
     }
-    return this.repo.listFiles(dir, { max: 250, ...opts });
+    const { repo, rest } = this._rootFor(dir || '.');
+    return repo.listFiles(rest, { max: 250, ...opts });
   }
 
   search(needle, opts = {}) {
@@ -294,21 +354,42 @@ export class LocalScope {
     // v0.9.4 live test). Only sanity-check that there is something to find.
     const q = String(needle ?? '').trim();
     if (!q) throw new BuddyError('search: needle required', { code: 'BAD_NEEDLE' });
-    return this.repo.search(q, { max: 15, ...opts });
+    const max = Math.max(Number(opts?.max) || 15, 1);
+    // Multi-root (v0.26.0): main workspace first, then every /add-dir root —
+    // hits from extra roots are prefixed "alias/" so the path is directly
+    // usable in fs_read/fs_replace.
+    const hits = this.repo.search(q, { max, ...opts });
+    for (const [alias, repo] of this.extra) {
+      if (hits.length >= max) break;
+      for (const h of repo.search(q, { ...opts, max: max - hits.length })) {
+        hits.push({ ...h, file: `${alias}/${h.file}` });
+      }
+    }
+    return hits;
   }
 
-  /** Glob file matching (path question, not a content search). */
+  /** Glob file matching (path question, not a content search). An "alias/…"
+   *  pattern targets that root; a plain pattern covers main + every root. */
   glob(pattern) {
     const p = String(pattern ?? '').trim();
     if (!p) throw new BuddyError('glob: pattern required (e.g. "src/**/*.js")', { code: 'BAD_PATTERN' });
     if (p.includes('..')) throw new BuddyError(`unsafe glob pattern "${p}"`, { code: 'UNSAFE_PATH' });
-    return this.repo.globFiles(p);
+    const m = p.match(/^([a-z0-9_-]+)\/($|[^/])/);
+    if (m && this.extra.has(m[1])) return this.extra.get(m[1]).globFiles(p.slice(m[1].length + 1)).map((f) => `${m[1]}/${f}`);
+    const hits = this.repo.globFiles(p);
+    for (const [alias, repo] of this.extra) {
+      if (hits.length >= 200) break;
+      for (const f of repo.globFiles(p)) hits.push(`${alias}/${f}`);
+    }
+    return hits;
   }
 
   /** Snapshot a file into .buddy/checkpoints BEFORE the agent mutates it.
-   *  Best effort — a checkpoint failure must never block the write. */
+   *  Best effort — a checkpoint failure must never block the write.
+   *  Extra-root files are skipped: the checkpoint store is main-root scoped. */
   _snap(rel, tool) {
     try {
+      if (this._rootFor(rel).repo !== this.repo) return;
       snapshotPaths(this.root, [rel], { tool });
     } catch {
       /* best effort */
@@ -318,7 +399,7 @@ export class LocalScope {
   /** Overwrite or create a file (agent-scoped, policy-checked). */
   write(rel, content) {
     this._guard(rel);
-    const abs = this.repo.resolveSafe(rel);
+    const abs = this.resolveSafe(rel);
     fs_mkdir(abs);
     const before = (() => { try { return require_read(abs); } catch { return ''; } })();
     if (before) this._checkFresh(rel); // full rewrite of a file the agent read → staleness applies
@@ -331,7 +412,7 @@ export class LocalScope {
   /** Replace an exact unique snippet (or all occurrences with replace_all). */
   replace(rel, find, replace, { replace_all = false } = {}) {
     this._guard(rel);
-    const abs = this.repo.resolveSafe(rel);
+    const abs = this.resolveSafe(rel);
     let content;
     try {
       content = fs.readFileSync(abs, 'utf8');
@@ -357,7 +438,7 @@ export class LocalScope {
    *  match exactly once (or set replace_all), or NOTHING is written. */
   multiReplace(rel, edits) {
     this._guard(rel);
-    const abs = this.repo.resolveSafe(rel);
+    const abs = this.resolveSafe(rel);
     let content;
     try {
       content = fs.readFileSync(abs, 'utf8');
@@ -380,7 +461,7 @@ export class LocalScope {
 
   append(rel, content) {
     this._guard(rel);
-    const abs = this.repo.resolveSafe(rel);
+    const abs = this.resolveSafe(rel);
     fs_mkdir(abs);
     let before = '';
     try { before = require_read(abs); } catch { /* new */ }
@@ -523,14 +604,18 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     },
     {
       name: 'fs_list',
-      description: 'List files in a directory of this repo.',
+      get description() {
+        return 'List files in a directory of this repo.' + scope.rootsInfo();
+      },
       args: '{"dir":"src"}',
       render: (a) => `fs_list ${a?.dir || '.'}`,
       run: async ({ dir = '' } = {}) => scope.list(dir).join('\n') || '(empty)',
     },
     {
       name: 'fs_read',
-      description: 'Read a file (capped). Read before editing anything.',
+      get description() {
+        return 'Read a file (capped). Read before editing anything. Paths may address /add-dir roots as "<alias>/relative/path".';
+      },
       args: '{"path":"src/file.js"}',
       render: (a) => `fs_read ${a?.path}`,
       run: async ({ path: p }) => {
@@ -540,7 +625,9 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     },
     {
       name: 'fs_search',
-      description: 'Search the repo (substring or regex). Cheapest way to locate code.',
+      get description() {
+        return 'Search the repo (substring or regex; covers /add-dir roots too — their hits come back prefixed "alias/"). Cheapest way to locate code.';
+      },
       args: '{"needle":"pattern","regex":false}',
       render: (a) => `fs_search ${JSON.stringify(a?.needle ?? '')}`,
       run: async ({ needle, regex = false } = {}) => {
@@ -551,7 +638,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     {
       name: 'glob',
       description:
-        'Find files by path pattern (NO content search — use fs_search for that). Supports ** globstars, *, ?, [abc] and {a,b} braces: "src/**/*.js", "test/**/*.{test,spec}.js".',
+        'Find files by path pattern (NO content search — use fs_search for that). Supports ** globstars, *, ?, [abc] and {a,b} braces: "src/**/*.js", "test/**/*.{test,spec}.js". An "alias/…" prefix targets a /add-dir root; a plain pattern covers every root.',
       args: '{"pattern":"src/**/*.js"}',
       render: (a) => `glob ${a?.pattern}`,
       run: async ({ pattern } = {}) => {

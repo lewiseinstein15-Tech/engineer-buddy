@@ -55,6 +55,7 @@ export function subjectFor(tool, args = {}) {
       return String(args?.command ?? '');
     case 'WebFetch':
     case 'web_fetch':
+    case 'http':
       return String(args?.url ?? '');
     case 'WebSearch':
     case 'web_search':
