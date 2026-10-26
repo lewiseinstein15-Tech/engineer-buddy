@@ -483,6 +483,7 @@ export function createChat({
       let observation;
       let denied = false;
       let preview = null;
+      let durationMs = null; // Aurora: real wall time of the run, for the dotted-leader card
       // Plan mode hard wall: refuse BEFORE caps burn or gates fire.
       if (impl && modes?.plan && !PLAN_TOOLS.has(tool)) {
         observation = `ERROR: plan mode is active — only research tools are allowed (${[...PLAN_TOOLS].join(', ')}). Use fs_search/fs_read/fs_list to investigate, then call exit_plan with your plan.`;
@@ -526,11 +527,13 @@ export function createChat({
               if (decision === 'always') alwaysApproved.add(tool);
               denied = decision === 'no';
             }
+            const runT0 = Date.now();
             observation = denied
               ? verdict === 'deny'
                 ? observation // the rules-engine refusal already says WHY (which rule)
                 : 'DENIED by the user: the action did NOT run. Ask the user how to proceed or pick another approach.'
               : await impl.run(args, { signal }).catch((e) => `ERROR: ${e.message}`);
+            durationMs = Date.now() - runT0;
             // Loading a skill with allowed-tools arms the restriction for the
             // rest of the turn (the skill tool's success output starts with "SKILL: ").
             if (tool === 'skill' && !denied && String(observation).startsWith('SKILL: ')) {
@@ -574,7 +577,7 @@ export function createChat({
       }
 
       debugLog(`chat step ${step}: ${tool}${denied ? ' (denied)' : ''} → ${truncate(observation, 120)}`);
-      onEvent({ type: 'tool', tool, args, observation, denied, salvaged, preview, argText: impl?.render ? String(impl.render(args) || '').slice(0, 200) : '', model: res.model, gateway: res.gateway });
+      onEvent({ type: 'tool', tool, args, observation, denied, salvaged, preview, argText: impl?.render ? String(impl.render(args) || '').slice(0, 200) : '', durationMs, model: res.model, gateway: res.gateway });
       messages.push({ role: 'assistant', content: JSON.stringify({ tool, args }) });
       messages.push({ role: 'user', content: `TOOL OBSERVATION:\n${observation}\n\nContinue with the next JSON step.` });
     }

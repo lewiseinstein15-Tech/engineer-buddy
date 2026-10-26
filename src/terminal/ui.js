@@ -1,6 +1,8 @@
 // ui.js — zero-dependency terminal rendering for Buddy Code.
 // Respects NO_COLOR and non-TTY output. All painters are pure except spinner.
-const useColor = process.env.NO_COLOR !== '1' && process.stdout.isTTY;
+import { toolStyle, SEM, setLevel, colorLevel, hue } from './theme.js';
+
+const useColor = colorLevel() !== 'none';
 
 const wrap = (code) => (s) => (useColor ? `\x1b[${code}m${s}\x1b[0m` : String(s));
 
@@ -49,6 +51,9 @@ let activeTheme = 'dark';
 export function setTheme(name) {
   const t = String(name || '').toLowerCase().trim();
   if (!(t in THEMES)) return null;
+  // Aurora (v0.29.0): /theme mono also silences the semantic layer; every
+  // other theme re-arms it from the terminal's real capability.
+  setLevel(t === 'mono' ? 'none' : colorLevel());
   if (t === 'mono') {
     for (const k of Object.keys(DARK_DEFAULTS)) c[k] = identity;
   } else {
@@ -135,6 +140,11 @@ const BUDDY_ART = [
   ' |____/ \\___/ \\___|_| |_|  |_|\\__,_|_|_|\\_\\___|',
 ];
 
+// Aurora gradient (v0.29.0): the logo sweeps cyan → sky → violet → magenta
+// down its five lines — the first thing you see IS the color language.
+const LOGO_GRADIENT = [80, 75, 111, 141, 177];
+const LOGO_GRADIENT_PAINT = LOGO_GRADIENT.map((n) => hue(n, 36));
+
 /** The big Claude-Code-style welcome panel shown when the REPL starts. */
 export function logoBanner(version, { root, brain, harnessDir, sessions = 0, git = '' } = {}) {
   const rows = [
@@ -147,7 +157,7 @@ export function logoBanner(version, { root, brain, harnessDir, sessions = 0, git
     '',
     `${c.dim('type a task,')} ${c.bold('/help')} ${c.dim('for commands,')} ${c.bold('!')} ${c.dim('for shell,')} ${c.bold('#')} ${c.dim('to remember, Ctrl+C to interrupt')}`,
   ];
-  return ['', ...BUDDY_ART.map((l) => c.cyan(l)), '', box(rows, { color: c.dim }), ''].join('\n');
+  return ['', ...BUDDY_ART.map((l, i) => LOGO_GRADIENT_PAINT[i % LOGO_GRADIENT_PAINT.length](l)), '', box(rows, { color: c.dim }), ''].join('\n');
 }
 
 /** Legacy banner (kept for compatibility) — now delegates to the panel style. */
@@ -155,12 +165,28 @@ export function banner(version) {
   return logoBanner(version, { root: '', brain: '', harnessDir: '' });
 }
 
-/** Render a tool call line: ⏺ bash npm test */
-export function renderToolCall({ tool, args, denied, argText = '' }) {
-  const dot = denied ? c.red('⏺') : c.cyan('⏺');
+/** Render a tool call line (Aurora, v0.29.0):
+ *    ▸ bash echo hi ····················· 0.4s
+ *  The family glyph replaces the old plain dot and its hue says WHAT tool
+ *  family is running; the dotted leader parks the duration on the right
+ *  edge so a long agentic run scans like a table of contents. When no
+ *  duration is known (denied, legacy callers) the line keeps the classic
+ *  compact shape — callers never need to care. */
+export function renderToolCall({ tool, args, denied, argText = '', durationMs = null, cols = null } = {}) {
+  const st = toolStyle(tool);
   let suffix = String(argText ?? '').trim();
   if (suffix.startsWith(String(tool))) suffix = suffix.slice(String(tool).length).trim(); // render() already repeats the name
-  return `${dot} ${c.bold(tool)}${suffix ? c.gray(` ${truncatePlain(suffix, 110)}`) : ''}${denied ? c.red(' (denied)') : ''}`;
+  const name = c.bold(String(tool ?? ''));
+  const argsPart = suffix ? c.gray(` ${truncatePlain(suffix, 110)}`) : '';
+  const deniedPart = denied ? c.red(' (denied)') : '';
+  if (denied || durationMs == null) return `${st.paint(st.glyph)} ${name}${argsPart}${deniedPart}`;
+  // dotted leader + right-aligned duration (leader needs a width)
+  const width = Math.min(120, Math.max(40, Number(cols) || (process.stdout?.columns || 80)));
+  const left = `${st.paint(st.glyph)} ${name}${argsPart}`;
+  const right = ` ${SEM.time(formatMs(durationMs))}`;
+  const gap = width - visibleLen(left) - visibleLen(right) - 2;
+  if (gap < 4) return `${left}${right}`;
+  return `${left} ${c.gray('·'.repeat(gap))}${right}`;
 }
 
 function truncatePlain(s, n) {
@@ -168,15 +194,22 @@ function truncatePlain(s, n) {
   return s2.length <= n ? s2 : `${s2.slice(0, n - 1)}…`;
 }
 
-/** Render a capped observation excerpt. */
-export function renderObservation(observation, { maxLines = 5, maxChars = 400 } = {}) {
+/** Render a capped observation excerpt (Aurora, v0.29.0):
+ *  the first line gains a verdict mark — ✓ green when it ran clean,
+ *  ✗ red when it errored or was denied — so failures pop out of a long
+ *  run without reading a word. */
+export function renderObservation(observation, { maxLines = 5, maxChars = 400, denied = false } = {}) {
   const s = String(observation ?? '').trim();
   if (!s) return c.gray('  ⎿ (no output)');
+  const failed = denied || /^ERROR|^BLOCKED|^REFUSED/.test(s);
+  const mark = failed ? SEM.bad('✗') : SEM.ok('✓');
   const lines = s.split('\n');
   const shown = lines.slice(0, maxLines);
   const more = lines.length - shown.length;
-  let out = shown.map((l) => `${c.gray('  ⎿')} ${l.slice(0, maxChars)}`).join('\n');
-  if (more > 0) out += c.gray(`  ⎿ … +${more} more lines`);
+  const head = shown[0] == null ? '' : String(shown[0]).slice(0, maxChars);
+  const rest = shown.slice(1).map((l) => `${c.gray('  ⎿')} ${l.slice(0, maxChars)}`);
+  let out = [`${c.gray('  ⎿')} ${mark} ${failed ? SEM.bad(head) : head}`, ...rest].join('\n');
+  if (more > 0) out += `\n${c.gray('  ⎿')} ${c.gray(`… +${more} more lines`)}`;
   return out;
 }
 
@@ -242,12 +275,12 @@ export function renderTable(rows, { headers = null, indent = '  ' } = {}) {
   return out.join('\n');
 }
 
-/** Render one chat tool event as a Claude-Code-style card. */
-export function renderToolEvent(ev, { preview = true } = {}) {
+/** Render one chat tool event as a Claude-Code-style card (Aurora skin). */
+export function renderToolEvent(ev, { preview = true, cols = null } = {}) {
   const parts = [];
-  parts.push(renderToolCall({ tool: ev.tool, args: ev.args, denied: ev.denied, argText: ev.argText }));
+  parts.push(renderToolCall({ tool: ev.tool, args: ev.args, denied: ev.denied, argText: ev.argText, durationMs: ev.durationMs ?? null, cols }));
   if (preview && ev.preview) parts.push(String(ev.preview));
-  parts.push(renderObservation(ev.observation));
+  parts.push(renderObservation(ev.observation, { denied: !!ev.denied }));
   return parts.join('\n');
 }
 

@@ -255,6 +255,7 @@ async function cmdChat(argv, { oneShot = false } = {}) {
       p: { type: 'string' },
       safe: { type: 'boolean', default: false },
       yolo: { type: 'boolean', default: false },
+      record: { type: 'string' },
       quiet: { type: 'boolean', default: false },
       config: { type: 'string' },
       dir: { type: 'string' },
@@ -332,7 +333,7 @@ async function cmdChat(argv, { oneShot = false } = {}) {
     console.error('       run `buddy` in your terminal, or use one-shot mode: buddy -p "task"');
     return 2;
   }
-  return (await startRepl({ router, root, config: cfg, yolo: Boolean(values.yolo), resumeFrom: resumeFile })) ?? 0;
+  return (await startRepl({ router, root, config: cfg, yolo: Boolean(values.yolo), resumeFrom: resumeFile, record: values.record || null })) ?? 0;
 }
 
 async function cmdInit(argv) {

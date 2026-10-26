@@ -35,7 +35,8 @@ import { HARNESS_DIR } from '../harness/defaults.js';
 import { SessionRecorder, listSessions, loadSession, sessionInfo, resumeMessages, writeExport, latestSession, findSession, renameSession, forkSession, writeHtmlExport, importSession } from '../session.js';
 import { reflect, recentLessons, experiencePath } from '../learn.js';
 import { c, PALETTE, logoBanner, spinner, renderToolCall, renderToolEvent, renderTodo, renderTable, formatMs, renderContextBar, setTheme, themeNames, currentTheme } from './ui.js';
-import { makeThoughtExtractor, formatThought } from './streamthought.js';
+import { SEM, renderDoneRibbon } from './theme.js';
+import { makeThoughtExtractor } from './streamthought.js';
 import { getChatSetting, setChatSetting } from '../settings.js';
 import { listOutputStyles, loadOutputStyle } from '../harness/outputstyles.js';
 import { renderMarkdown } from './markdown.js';
@@ -262,7 +263,7 @@ function makeRenderer({ quiet = false, toolByName = new Map(), verbosity = 'summ
     // /verbosity silent — replies and errors only, no tool chatter.
     if (level() === 'silent' && ev.type !== 'say' && ev.type !== 'error') return;
     if (ev.type === 'say') {
-      console.log(`\n${c.bold(c.cyan('●'))} ${c.bold('Buddy')}`);
+      console.log(`\n${SEM.narrate('●')} ${c.bold('Buddy')}`);
       console.log(renderMarkdown(ev.text, { color: PALETTE }));
       console.log('');
     } else if (ev.type === 'tool') {
@@ -288,9 +289,10 @@ function makeRenderer({ quiet = false, toolByName = new Map(), verbosity = 'summ
           : c.gray(`  ↺ context compacted (${ev.dropped} messages summarized)`)
       );
     } else if (ev.type === 'subagent') {
-      if (ev.phase === 'step') console.log(c.gray(`  ↳ ${ev.agent} · ${ev.tool}`));
-      else if (ev.phase === 'done') console.log(c.gray(`  ↳ ${ev.agent} finished`));
-      else console.log(c.gray(`  ↳ ${ev.agent} hit a problem (report returned to Buddy)`));
+      // Aurora: amber glyph — agent lifecycle reads at a glance
+      if (ev.phase === 'step') console.log(c.gray(`  ↳ ${SEM.warn('⧉')} ${ev.agent} · ${ev.tool}`));
+      else if (ev.phase === 'done') console.log(c.gray(`  ↳ ${SEM.warn('⧉')} ${ev.agent} finished`));
+      else console.log(c.gray(`  ↳ ${SEM.warn('⧉')} ${ev.agent} hit a problem (report returned to Buddy)`));
     }
   };
 }
@@ -422,11 +424,14 @@ export function printMcpStatus(mcp) {
 
 // ── Interactive REPL ─────────────────────────────────────────────────────────
 
-export async function startRepl({ router, root = process.cwd(), config = {}, yolo: yoloFlag = false, resumeFrom = null } = {}) {
+export async function startRepl({ router, root = process.cwd(), config = {}, yolo: yoloFlag = false, resumeFrom = null, record = null } = {}) {
   if (!process.stdin.isTTY) {
     console.error('buddy: interactive mode needs a TTY. Use one-shot mode instead:  buddy -p "task"');
     return 2;
   }
+  // Flight recorder (v0.29.0): --record <file> captures the TUI's pristine
+  // byte-stream (frames, prints, cursor control) for screenshots/replays/CI.
+  const recordPath = record || null;
 
   ensureHarness(root);
 
@@ -490,16 +495,24 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   const streamRef = { enabled: getChatSetting(root, 'stream', true) !== false };
   const thoughtExtractor = makeThoughtExtractor();
   let lastThoughtPaint = 0;
+  let stepStreamBytes = 0; // Aurora: gateway bytes streamed for the CURRENT step (↓ tok telemetry)
+  let turnStreamBytes = 0; // ...and for the whole turn (done ribbon)
+  let turnDenied = 0;
+  let turnErrors = 0;
   const onStreamDelta = (frag) => {
     if (!streamRef.enabled) return;
+    const n = String(frag ?? '').length;
+    stepStreamBytes += n;
+    turnStreamBytes += n;
     const snap = thoughtExtractor.push(frag);
     if (!snap) return;
     const now = Date.now();
     if (now - lastThoughtPaint < 90) return; // throttle repaints, not data
     lastThoughtPaint = now;
-    const line = formatThought(snap, process.stdout.columns || 100);
     try {
-      rl.setThought(line); // rl exists by the time deltas can flow (first turn)
+      // Aurora: the RAW snapshot rides into the frame — buildFrame expands
+      // it into the 3-line strip with verbs, gradient edge and telemetry.
+      rl.setThought({ ...snap, bytes: stepStreamBytes });
     } catch {
       /* the box is gone — drop the frame */
     }
@@ -547,9 +560,11 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     },
     onEvent: (ev) => {
       events.push(ev);
+      if (ev.type === 'error') turnErrors += 1; // Aurora ribbon: red when the turn errored
       // A step materialized (tool card, say, error) — the thought line has
       // done its job; clear it and start the next step's stream fresh.
       thoughtExtractor.reset();
+      stepStreamBytes = 0;
       lastThoughtPaint = 0;
       try {
         rl.setThought(null);
@@ -561,7 +576,9 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       if (eventsLogOn) appendEvent(root, projectEvent(ev));
       if (ev.type === 'tool') {
         toolCallsThisTurn += 1;
+        if (ev.denied) turnDenied += 1;
         rl.setBusy(`working · ${toolCallsThisTurn} tool call${toolCallsThisTurn === 1 ? '' : 's'}${msgQueue.length ? ` · ${msgQueue.length} queued` : ''}`);
+        rl.setToolCalls(toolCallsThisTurn); // Aurora strip telemetry
         lastGateway = ev.gateway || lastGateway;
         try {
           recorder?.append({ type: 'tool', tool: ev.tool, args: { _preview: truncate(JSON.stringify(ev.args), 160) }, observation: truncate(ev.observation, 160), denied: ev.denied });
@@ -619,6 +636,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     title: 'Buddy',
     placeholder: 'type a task…   (/ for commands · ! shell · # remember)',
     hint: '? shortcuts · tab complete · ↑↓ history · esc stop · ctrl+c quit',
+    record: recordPath,
     statusRight: () => {
       try {
         const ctxK = (chat.historyChars() / 1000).toFixed(1);
@@ -1874,6 +1892,9 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       while (current) {
         events = [];
         toolCallsThisTurn = 0;
+        turnStreamBytes = 0;
+        turnDenied = 0;
+        turnErrors = 0;
         lastTask = { task: current.text, events };
         turnStart.at = Date.now();
         aborter = new AbortController();
@@ -1887,11 +1908,14 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           out = await chat.turn(current.text, { signal: aborter.signal, skill, anchor, images });
           recorder.append({ type: 'say', text: out.said ?? '' });
           lastTask.events = events;
-          // Claude-Code-style turn footer.
+          // Aurora done ribbon (v0.29.0): how the turn ended, at a glance —
+          // green when clean, amber when something was denied, red on errors.
+          // Absorbs the old plain ⏱ footer; ctx + gateway ride behind it.
           const secs = (Date.now() - turnStart.at) / 1000;
           const ctxK = (chat.historyChars() / 1000).toFixed(1);
           const gw = lastGateway || router.order[0];
-          console.log(c.gray(`  ⏱ ${secs.toFixed(1)}s · ${toolCallsThisTurn} tool call${toolCallsThisTurn === 1 ? '' : 's'} · ${ctxK}k ctx${out.steps ? c.gray(` · ${out.steps} steps`) : ''}${gw ? c.gray(` · ${gw}`) : ''}`));
+          const ribbon = renderDoneRibbon({ steps: out.steps || 0, tools: toolCallsThisTurn, ms: secs * 1000, bytes: turnStreamBytes, denied: turnDenied, errors: turnErrors });
+          console.log(`${ribbon}${c.gray(` · ${ctxK}k ctx${gw ? ` · ${gw}` : ''}`)}`);
           // /statusline (v0.22.0) — one configured line under the footer.
           const statusLine = renderStatusline(statuslineRef.template, {
             branch: (git || '').replace(/^on\s+/, ''),
@@ -1948,5 +1972,14 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     }
   }
 
+  // v0.29.0 hardening (found during the Aurora live-evidence session): the
+  // REPL relied on ambient handle liveness — on a PTY whose stdin idles
+  // (pipes feeding terminal multiplexers, CI pseudo-terminals, some ssh -t
+  // setups) the event loop drained and the process silently exit(0)'d right
+  // after the banner. The REPL owns the process from here: every real exit
+  // path (/exit, /quit, Ctrl+C ×2, Ctrl+D, /resume crash) funnels through
+  // rl.close() → the 'close' handler above → process.exit(0). A pending
+  // promise that never resolves is the honest way to park the main module.
+  await new Promise(() => {});
   return null;
 }

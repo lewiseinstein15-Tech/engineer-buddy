@@ -19,9 +19,11 @@
 //   - submitted lines are echoed into scrollback like Claude Code's `> msg`
 //   - bracketed paste is unwrapped and pasted as one line
 
+import fs from 'node:fs';
 import readline from 'node:readline';
 import { createRenderer } from './renderer.js';
 import { c } from './ui.js';
+import { buildAuroraStrip, SEM } from './theme.js';
 import { charWidth, strWidth, wrapContent, truncateAnsi } from './text.js';
 
 export { charWidth, strWidth, wrapContent };
@@ -173,11 +175,20 @@ export function buildFrame(state, cols) {
   } else if (right) {
     lines.push(`  ${truncateAnsi(right, room)}`);
   }
-  // Streaming thought (v0.28.0): the brain's reply as it lands — tool names,
-  // args being typed, say words unescaping live. One dim line under the
-  // spinner; gone the moment the step renders for real.
+  // Streaming thought (v0.28.0 → Aurora v0.29.0): the brain's reply as it
+  // lands, now a 3-line aurora rail — live narration words, the tool being
+  // formed, and telemetry (↓ tokens · tool calls · elapsed). The gradient
+  // edge sweeps with the spin timer. Gone the moment the step renders.
   if (state.busy && state.thought) {
-    lines.push(`  ${c.gray('└')} ${c.dim(truncateAnsi(String(state.thought), room - 2))}`);
+    const strip = buildAuroraStrip({
+      snap: state.thought,
+      ms: (state.busy.secs || 0) * 1000,
+      bytes: state.thought?.bytes || 0,
+      cols: W,
+      tick: state.tick || 0,
+      toolCalls: state.toolCalls || 0,
+    });
+    for (const l of strip) lines.push(`  ${l}`);
   }
 
   // never let a line wrap — the ghost-box killer
@@ -193,6 +204,7 @@ export function createInputBox({
   statusRight = null,   // () => string
   commands = [],        // [{ name: '/help', desc: '...' }] for the palette
   historySize = 400,
+  record = null,        // flight recorder: append the pristine render byte-stream to this file
 } = {}) {
   let text = '';
   let cursor = 0;
@@ -200,7 +212,8 @@ export function createInputBox({
   let questionText = '';
   let questionCb = null;
   let busyLabel = null;
-  let busyThought = null;
+  let busyThought = null; // Aurora: the RAW extractor snapshot (+ bytes), not a preformatted string
+  let toolCallsCount = 0;
   let busyStart = 0;
   let spinIdx = 0;
   let spinTimer = null;
@@ -232,6 +245,8 @@ export function createInputBox({
         ? { label: busyLabel, secs: Math.max(0, Math.floor((Date.now() - busyStart) / 1000)), glyph: FRAMES[spinIdx % FRAMES.length] }
         : null,
       thought: busyThought,
+      tick: spinIdx,
+      toolCalls: toolCallsCount,
       statusRight: typeof statusRight === 'function' ? (statusRight() || '') : (statusRight || ''),
       palette: items.length ? { items, sel: paletteSel } : null,
     };
@@ -290,7 +305,7 @@ export function createInputBox({
     if (submitted.trim()) {
       if (history[0] !== submitted) history.unshift(submitted);
       if (history.length > historySize) history.pop();
-      r.print(`  ${c.gray('>')} ${submitted}`); // echo into scrollback, Claude Code style
+      r.print(`  ${SEM.narrate('❯')} ${submitted}`); // echo into scrollback — violet: the human spoke
       handlers.line?.(submitted);
     } else {
       r.render();
@@ -301,6 +316,12 @@ export function createInputBox({
   function onKeypress(key) {
     if (mode === 'closed') return;
     key = key || {};
+    // BUDDY_KEYLOG=<file> — dev diagnostics: every keypress the box sees
+    if (process.env.BUDDY_KEYLOG) {
+      try {
+        fs.appendFileSync(process.env.BUDDY_KEYLOG, `${Date.now() % 1000000} ${JSON.stringify({ name: key.name ?? null, seq: key.sequence ?? null, ctrl: !!key.ctrl, meta: !!key.meta })}\n`);
+      } catch { /* diagnostics only */ }
+    }
     // bracketed paste → unwrap and insert as one line
     const pm = /^\x1b\[200~([\s\S]*)\x1b\[201~\s*$/.exec(String(key.sequence ?? ''));
     if (pm) {
@@ -393,30 +414,54 @@ export function createInputBox({
       }
       redraw();
     },
-    // Live thought line (v0.28.0) — only visible while busy; the 120ms spin
-    // timer repaints it, so a burst of deltas costs one frame at most.
+    // Live thought (v0.28.0) — Aurora v0.29.0: `t` is now the RAW extractor
+    // snapshot { tool, message, messageClosed, raw, bytes? }; buildFrame
+    // expands it into the 3-line strip. Only visible while busy; the 120ms
+    // spin timer repaints it, so a burst of deltas costs one frame at most.
     setThought(t) {
       busyThought = t || null;
+      if (busyLabel) redraw();
+    },
+    // Tool-call counter for the strip telemetry (kept in sync by repl.js).
+    setToolCalls(n) {
+      toolCallsCount = Math.max(0, Number(n) || 0);
       if (busyLabel) redraw();
     },
     question(q, cb) { mode = 'question'; questionText = q; questionCb = cb; text = ''; cursor = 0; resetPaletteState(); redraw(); },
     cancelQuestion() { if (mode === 'question') { mode = 'input'; questionText = ''; questionCb = null; text = ''; cursor = 0; redraw(); } },
     close,
     on(ev, fn) { handlers[ev] = fn; return rl; },
+    // test / harness seam: drive the box's key reducer directly
+    _handleKeypress(key) { onKeypress(key || {}); },
     // test / introspection hooks
-    _state: () => ({ text, cursor, mode, history: [...history], busy: busyLabel, thought: busyThought, palette: paletteItems().map((i) => i.name) }),
+    _state: () => ({ text, cursor, mode, history: [...history], busy: busyLabel, thought: busyThought, toolCalls: toolCallsCount, palette: paletteItems().map((i) => i.name) }),
   };
 
   rl.install = function install() {
     readline.emitKeypressEvents(process.stdin);
     if (process.stdin.isTTY) process.stdin.setRawMode(true);
     process.stdin.resume();
+    // Flight recorder (v0.29.0): EVERY byte the TUI emits, appended pristine
+    // to `record`. The live terminal can mangle, filter or strip escapes
+    // (sandboxed PTYs do); the recording is the renderer's honest truth —
+    // replayable through any terminal emulator, diffable in CI, attachable
+    // to bug reports. Synchronous appends: process.exit(0) must never
+    // truncate the tail (an async stream loses its last chunks on exit,
+    // which desynchronizes erase/frame pairs on replay).
+    let recFd = null;
+    if (record) {
+      try { recFd = fs.openSync(record, 'a'); } catch { /* best effort */ }
+    }
+    const recWrite = (s) => {
+      if (recFd == null) return;
+      try { fs.writeSync(recFd, s); } catch { /* diagnostics only */ }
+    };
     // capture the ORIGINAL write BEFORE patching — the renderer's own writes
     // go through it and can never recurse through the print-above patch
     const origWrite = process.stdout.write.bind(process.stdout);
     const rout = {
       get columns() { return process.stdout.columns || 80; },
-      write: (s) => origWrite(s),
+      write: (s) => { recWrite(s); return origWrite(s); },
       on: (ev, fn) => process.stdout.on(ev, fn),
       removeListener: (ev, fn) => process.stdout.removeListener(ev, fn),
     };
@@ -436,7 +481,7 @@ export function createInputBox({
     process.stdin.on('keypress', (_ch, key) => onKeypress(key || { sequence: _ch }));
     process.stdout.on('resize', onResize);
     renderer.render();
-    origWrite('\x1b[?25l'); // hide the hardware cursor — the box draws its own block cursor
+    rout.write('\x1b[?25l'); // hide the hardware cursor — the box draws its own block cursor
   };
 
   return rl;
