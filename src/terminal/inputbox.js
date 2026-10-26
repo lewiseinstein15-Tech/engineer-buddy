@@ -58,7 +58,12 @@ export function applyKey(key, ctx = {}) {
   if (name === 'escape' || key.sequence === '\x1b') {
     // palette and question escapes are functional, not chords — never arm rewind
     if (ctx.paletteOpen || ctx.questionMode) return { action: 'escape' };
-    if (isDoubleEscape(ctx.lastEscapeAt, ctx.now)) return { action: 'rewind' }; // v0.32.0
+    // REAL-TERMINAL WIRE FORMAT (caught live by the v0.32.0 drill): a fast
+    // double-press never arrives as two escape keypresses — readline's decoder
+    // coalesces the two ESC bytes into ONE keypress {meta:true, sequence:
+    // '\x1b\x1b'}. That coalesced key IS the chord.
+    if (key.meta && key.sequence === '\x1b\x1b') return { action: 'rewind' };
+    if (isDoubleEscape(ctx.lastEscapeAt, ctx.now)) return { action: 'rewind' }; // v0.32.0: slow double-press
     return { action: 'escape' };
   }
   if (name === 'return' || name === 'enter') return { action: 'submit' };

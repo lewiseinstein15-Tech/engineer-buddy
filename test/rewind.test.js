@@ -40,6 +40,17 @@ test('applyKey: palette and question escapes are functional — they never arm r
   assert.equal(applyKey({ name: 'escape' }, { questionMode: true, lastEscapeAt: 1000, now: 1400 }).action, 'escape');
 });
 
+test('applyKey: THE REAL WIRE FORMAT — a fast double-press arrives as ONE coalesced keypress', () => {
+  // Caught live by the v0.32.0 drill: through a PTY, two ESC bytes 150ms apart
+  // never reach the app as two escapes — readline coalesces them into
+  // {name:'escape', meta:true, sequence:'\x1b\x1b'}. That key IS the chord.
+  const coalesced = { name: 'escape', meta: true, sequence: '\x1b\x1b' };
+  assert.equal(applyKey(coalesced, {}).action, 'rewind'); // no arming needed
+  assert.equal(applyKey(coalesced, { paletteOpen: true }).action, 'escape', 'palette still wins');
+  assert.equal(applyKey(coalesced, { questionMode: true }).action, 'escape', 'questions still win');
+  assert.equal(applyKey({ name: 'escape', meta: true, sequence: '\x1b' }, {}).action, 'escape', 'a lone escape (this PTY flags meta) is still one press');
+});
+
 test('applyKey: the rest of the map is untouched by the new ctx fields', () => {
   assert.equal(applyKey({ sequence: 'a' }, { lastEscapeAt: 1000, now: 1100 }).action, 'insert');
   assert.equal(applyKey({ name: 'return' }, { lastEscapeAt: 1000, now: 1100 }).action, 'submit');
@@ -159,6 +170,16 @@ test('box: double-esc opens the menu with the real entries; a single escape neve
   const st = b._state();
   assert.equal(st.menu?.count, 3, 'menu open with the entries');
   assert.equal(st.menu?.sel, 0, 'selection starts at the newest');
+});
+
+test('box: the COALESCED wire keypress opens the menu — the exact shape a real PTY delivers', () => {
+  const b = box();
+  b.on('rewindOpen', () => ENTRIES);
+  // one keypress, not two — the two ESC bytes the driver sent fused in readline
+  b._handleKeypress({ name: 'escape', meta: true, sequence: '\x1b\x1b' });
+  assert.equal(b._state().menu?.count, 3, 'coalesced chord opens the menu in one keypress');
+  b._handleKeypress({ name: 'escape', meta: true, sequence: '\x1b' }); // lone close (meta-flagged on this PTY)
+  assert.equal(b._state().menu, null, 'lone escape closes it');
 });
 
 test('box: empty checkpoint list → menu stays closed (the repl printed its note)', () => {
