@@ -7,6 +7,9 @@
 // parts — this is Buddy's default path for screenshot/@image.png input.
 import { fetchWithTimeout, RateLimitError, BuddyError } from '../../util.js';
 import { extractUsage, gwCtxLimit } from '../usage.js';
+import { fetchStreaming, openAIStreamOrBuffer } from '../sse.js';
+
+const STREAM_IDLE_MS = 45000;
 
 // Anonymous tier is the tightest window in the chain — overridable via
 // gateways.pollinations.ctxLimit in buddy.config.json.
@@ -18,22 +21,31 @@ export function createPollinationsGateway(cfg, timeouts) {
     name: 'pollinations',
     ctxLimit: gwCtxLimit(cfg, DEFAULT_CTX_LIMIT),
     vision: cfg.vision !== false,
-    async chat(messages, { maxTokens = 2048, temperature = 0.2, timeoutMs = timeouts.chatMs, model } = {}) {
+    async chat(messages, { maxTokens = 2048, temperature = 0.2, timeoutMs = timeouts.chatMs, model, onDelta = null } = {}) {
       const m = model || models[0];
+      const wantsStream = typeof onDelta === 'function';
       let res;
       try {
-        res = await fetchWithTimeout(
-          `${cfg.baseUrl}/openai`,
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              ...(cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {}),
-            },
-            body: JSON.stringify({ model: m, messages, max_tokens: maxTokens, temperature, stream: false }),
+        const init = {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {}),
           },
-          timeoutMs
-        );
+          body: JSON.stringify({
+            model: m,
+            messages,
+            max_tokens: maxTokens,
+            temperature,
+            stream: wantsStream,
+            ...(wantsStream ? { stream_options: { include_usage: true } } : {}),
+          }),
+        };
+        if (wantsStream) {
+          ({ res } = await fetchStreaming(`${cfg.baseUrl}/openai`, init, { timeoutMs }));
+        } else {
+          res = await fetchWithTimeout(`${cfg.baseUrl}/openai`, init, timeoutMs);
+        }
       } catch (e) {
         throw new BuddyError(`pollinations: network error: ${e.message}`, { code: 'NETWORK', cause: e });
       }
@@ -48,6 +60,24 @@ export function createPollinationsGateway(cfg, timeouts) {
       if (!res.ok) {
         const body = await res.text().catch(() => '');
         throw new BuddyError(`pollinations: HTTP ${res.status} ${body.slice(0, 200)}`, { code: 'HTTP_' + res.status });
+      }
+
+      if (wantsStream) {
+        const { text: sseText, usage: sseUsage, streamed, ttms } = await openAIStreamOrBuffer(res, onDelta, {
+          idleMs: STREAM_IDLE_MS,
+          totalMs: timeoutMs * 3,
+        }).catch((e) => {
+          throw new BuddyError(`pollinations: stream error: ${e.message}`, { code: 'NETWORK', cause: e });
+        });
+        if (typeof sseText === 'string' && sseText.trim()) {
+          const out = { text: sseText, model: m, gateway: 'pollinations', usage: sseUsage }; // normalized by the stream reader
+          if (streamed) {
+            out.streamed = true;
+            if (ttms != null) out.ttms = ttms;
+          }
+          return out;
+        }
+        throw new BuddyError('pollinations: empty response', { code: 'EMPTY_RESPONSE' });
       }
 
       const raw = await res.text().catch(() => '');

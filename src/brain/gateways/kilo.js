@@ -5,6 +5,12 @@
 // even when the catalog changes. Verified keyless 2026-10-25.
 import { fetchWithTimeout, RateLimitError, BuddyError, debugLog } from '../../util.js';
 import { extractUsage, gwCtxLimit } from '../usage.js';
+import { fetchStreaming, openAIStreamOrBuffer } from '../sse.js';
+
+// Streaming body watchdogs (v0.28.0): a relay that stops sending bytes must
+// not hang the turn — abort after 45s of silence, 3× the headers timeout in
+// total so even slow long generations stay bounded.
+const STREAM_IDLE_MS = 45000;
 
 // Conservative floor for OpenRouter-style free models (they vary 8k–128k) —
 // overridable via gateways.kilo.ctxLimit in buddy.config.json.
@@ -47,7 +53,7 @@ export function createKiloGateway(cfg, timeouts) {
     // text-only free models; the API rejects image parts per-model and the
     // chain falls through. Disable with gateways.kilo.vision = false.
     vision: cfg.vision !== false,
-    async chat(messages, { maxTokens = 2048, temperature = 0.2, timeoutMs = timeouts.chatMs, model } = {}) {
+    async chat(messages, { maxTokens = 2048, temperature = 0.2, timeoutMs = timeouts.chatMs, model, onDelta = null } = {}) {
       let chosen = model || null;
       if (!chosen || chosen === 'auto') {
         const available = await getFreeModels(cfg, timeouts.httpMs);
@@ -56,22 +62,51 @@ export function createKiloGateway(cfg, timeouts) {
       }
       debugLog(`kilo: model=${chosen}`);
 
+      const wantsStream = typeof onDelta === 'function';
+      const body = {
+        model: chosen,
+        messages,
+        max_tokens: maxTokens,
+        temperature,
+        stream: wantsStream,
+        ...(wantsStream ? { stream_options: { include_usage: true } } : {}),
+      };
+
       let res;
       try {
-        res = await fetchWithTimeout(
-          `${cfg.baseUrl}/v1/chat/completions`,
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${cfg.apiKey || 'anonymous'}`,
-              'HTTP-Referer': 'https://github.com/engineer-buddy',
-              'X-Title': 'Engineer Buddy',
+        if (wantsStream) {
+          // Streaming path (v0.28.0): fetchStreaming returns the AbortController
+          // so the SSE reader's idle/total watchdogs abort the SAME request.
+          ({ res } = await fetchStreaming(
+            `${cfg.baseUrl}/v1/chat/completions`,
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${cfg.apiKey || 'anonymous'}`,
+                'HTTP-Referer': 'https://github.com/engineer-buddy',
+                'X-Title': 'Engineer Buddy',
+              },
+              body: JSON.stringify(body),
             },
-            body: JSON.stringify({ model: chosen, messages, max_tokens: maxTokens, temperature, stream: false }),
-          },
-          timeoutMs
-        );
+            { timeoutMs }
+          ));
+        } else {
+          res = await fetchWithTimeout(
+            `${cfg.baseUrl}/v1/chat/completions`,
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${cfg.apiKey || 'anonymous'}`,
+                'HTTP-Referer': 'https://github.com/engineer-buddy',
+                'X-Title': 'Engineer Buddy',
+              },
+              body: JSON.stringify(body),
+            },
+            timeoutMs
+          );
+        }
       } catch (e) {
         throw new BuddyError(`kilo: network error: ${e.message}`, { code: 'NETWORK', cause: e });
       }
@@ -86,9 +121,30 @@ export function createKiloGateway(cfg, timeouts) {
         if ((res.status === 400 || res.status === 404) && /does not exist|not found|model/i.test(body)) {
           const available = await getFreeModels(cfg, timeouts.httpMs);
           const alt = (cfg.preferredModels || []).concat(available.filter((i) => i.endsWith(':free'))).find((m) => m && m !== chosen);
-          if (alt) return this.chat(messages, { maxTokens, temperature, timeoutMs, model: alt });
+          if (alt) return this.chat(messages, { maxTokens, temperature, timeoutMs, model: alt, onDelta });
         }
         throw new BuddyError(`kilo: HTTP ${res.status} ${body.slice(0, 200)}`, { code: 'HTTP_' + res.status });
+      }
+
+      if (wantsStream) {
+        // SSE when the relay honors stream:true; buffered-JSON fallback when
+        // it silently ignores it — either way onDelta got the pieces that
+        // actually arrived and the returned text is the full reply.
+        const { text: sseText, usage: sseUsage, streamed, ttms } = await openAIStreamOrBuffer(res, onDelta, {
+          idleMs: STREAM_IDLE_MS,
+          totalMs: timeoutMs * 3,
+        }).catch((e) => {
+          throw new BuddyError(`kilo: stream error: ${e.message}`, { code: 'NETWORK', cause: e });
+        });
+        if (typeof sseText === 'string' && sseText.trim()) {
+          const out = { text: sseText, model: chosen, gateway: 'kilo', usage: sseUsage }; // normalized by the stream reader
+          if (streamed) {
+            out.streamed = true;
+            if (ttms != null) out.ttms = ttms;
+          }
+          return out;
+        }
+        throw new BuddyError('kilo: empty response', { code: 'EMPTY_RESPONSE' });
       }
 
       const json = await res.json().catch(() => null);

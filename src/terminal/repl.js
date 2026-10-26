@@ -35,6 +35,7 @@ import { HARNESS_DIR } from '../harness/defaults.js';
 import { SessionRecorder, listSessions, loadSession, sessionInfo, resumeMessages, writeExport, latestSession, findSession, renameSession, forkSession, writeHtmlExport, importSession } from '../session.js';
 import { reflect, recentLessons, experiencePath } from '../learn.js';
 import { c, PALETTE, logoBanner, spinner, renderToolCall, renderToolEvent, renderTodo, renderTable, formatMs, renderContextBar, setTheme, themeNames, currentTheme } from './ui.js';
+import { makeThoughtExtractor, formatThought } from './streamthought.js';
 import { getChatSetting, setChatSetting } from '../settings.js';
 import { listOutputStyles, loadOutputStyle } from '../harness/outputstyles.js';
 import { renderMarkdown } from './markdown.js';
@@ -59,7 +60,7 @@ export function fmtTok(n) {
 // ── Slash commands (pure, testable) ──────────────────────────────────────────
 
 export const SLASH_COMMANDS = [
-  'help', 'new', 'clear', 'screen', 'compact', 'context', 'map', 'model', 'gateways', 'cost', 'stats', 'effort', 'events',
+  'help', 'new', 'clear', 'screen', 'compact', 'context', 'map', 'model', 'gateways', 'cost', 'stats', 'effort', 'events', 'stream',
   'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'diff', 'hooks', 'docs', 'rename', 'branch', 'fork', 'share', 'verbosity', 'theme', 'output-style', 'statusline', 'why', 'compare', 'memory', 'experience', 'learn', 'review',
   'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit', 'add-dir', 'report',
 ];
@@ -78,6 +79,7 @@ export const SLASH_DESCRIPTIONS = {
   cost: 'Usage: brain calls, est. tokens, $0.00',
   stats: 'Usage dashboard — per-task token ledger, gateway mix, project history',
   effort: 'low | medium | high — turn budget + reply room per task (/effort high)',
+  stream: 'on | off — stream Buddy\'s reply live as it arrives (/stream off to buffer)',
   events: 'Tail the structured event log (.buddy/events.jsonl) — /events 30',
   permissions: 'Show session approvals',
   'add-dir': 'Add a working directory as "<alias>/path" (/add-dir ../other-repo) — /add-dir lists, remove with /add-dir remove <alias>',
@@ -227,7 +229,7 @@ function makeHarness(root) {
 }
 
 /** Create a chat session bound to a workspace root. */
-export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {}, repoMap = null, effort = null } = {}) {
+export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {}, repoMap = null, effort = null, streaming = null, onStream = null } = {}) {
   const { tools, todoState, mcp, shells, skills, userToolWarnings, scope, extraRoots, reporters } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved });
   const harness = makeHarness(root);
   // Hooks: the deterministic guarantee layer (.buddy/settings.json). One
@@ -237,7 +239,7 @@ export async function createBuddySession({ root = process.cwd(), router, yolo = 
   const { perms, warnings: permissionWarnings } = loadPermissions(root);
   // todoState is shared: the todo tool writes it (local.js), compaction reads
   // it (todo v2 plan anchor) — one object, one truth.
-  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, todoState, hooks, permissions: perms, yolo, root, onEvent, repoMap, effort });
+  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, todoState, hooks, permissions: perms, yolo, root, onEvent, repoMap, effort, streaming, onStream });
   if (resumeFrom) {
     for (const m of resumeMessages(loadSession(resumeFrom))) session.messages.push(m);
   }
@@ -482,6 +484,26 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   //   self-healing — learned gateway latencies (.buddy/routing.json) reorder the chain
   const eventsLogOn = getChatSetting(root, 'eventsLog', true) !== false;
   const selfHealingOn = getChatSetting(root, 'selfHealing', true) !== false;
+  // Streaming thoughts (v0.28.0): default ON in the TUI — the busy footer
+  // grows a live thought line fed by raw gateway deltas. Persisted under
+  // chat.stream; one-shot/CI paths never pass onStream so they never change.
+  const streamRef = { enabled: getChatSetting(root, 'stream', true) !== false };
+  const thoughtExtractor = makeThoughtExtractor();
+  let lastThoughtPaint = 0;
+  const onStreamDelta = (frag) => {
+    if (!streamRef.enabled) return;
+    const snap = thoughtExtractor.push(frag);
+    if (!snap) return;
+    const now = Date.now();
+    if (now - lastThoughtPaint < 90) return; // throttle repaints, not data
+    lastThoughtPaint = now;
+    const line = formatThought(snap, process.stdout.columns || 100);
+    try {
+      rl.setThought(line); // rl exists by the time deltas can flow (first turn)
+    } catch {
+      /* the box is gone — drop the frame */
+    }
+  };
   // Effort + learned routing are applied AFTER the session exists (the effort
   // ref is created inside createChat). Silent on fresh installs — nothing learned yet.
   const persistedEffort = getChatSetting(root, 'effort', 'medium');
@@ -495,6 +517,8 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     modes,
     resumeFrom,
     effort: { level: 'medium', maxSteps: 14, maxTokens: 1500 },
+    streaming: streamRef,
+    onStream: onStreamDelta,
     repoMap: config.chat?.repoMap === false ? null : createRepoMapProvider(root, { maxChars: config.chat?.repoMapChars || 2800 }),
     onPlanApproved: ({ saved }) => {
       console.log(`\n  ${c.green('✓ plan approved')} — exited plan mode${saved ? c.gray(` · saved to ${path.relative(root, saved)}`) : ''}\n`);
@@ -523,6 +547,15 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     },
     onEvent: (ev) => {
       events.push(ev);
+      // A step materialized (tool card, say, error) — the thought line has
+      // done its job; clear it and start the next step's stream fresh.
+      thoughtExtractor.reset();
+      lastThoughtPaint = 0;
+      try {
+        rl.setThought(null);
+      } catch {
+        /* box not up yet */
+      }
       // Structured event log (v0.25.0): the machine-readable twin of the
       // transcript — tool calls, denials, compactions, errors as JSONL.
       if (eventsLogOn) appendEvent(root, projectEvent(ev));
@@ -556,6 +589,9 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   // they actually changed something — no noise on fresh installs).
   if (applyEffort(chat, persistedEffort) && persistedEffort !== 'medium') {
     console.log(c.gray(`  effort: ${persistedEffort} (from settings) — /effort to change`));
+  }
+  if (!streamRef.enabled) {
+    console.log(c.gray('  streaming: off (from settings) — /stream on to see replies live'));
   }
   if (healedNote) {
     console.log(c.gray(`  routing: learned order applied — ${router.order.join(' → ')} (chat.selfHealing=false to disable)`));
@@ -661,6 +697,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
               ['/cost', 'usage: brain calls, est. tokens, $0.00'],
               ['/stats', 'usage dashboard — per-task token ledger, gateway mix, project history'],
               ['/effort', 'low | medium | high — turn budget + reply room per task'],
+              ['/stream', 'on | off — see Buddy\'s reply stream in live (thought line under the spinner)'],
               ['/events', 'tail the structured event log (.buddy/events.jsonl)'],
               ['/model <name>', 'pin a gateway first (e.g. /model kilo) · /model auto restores'],
               ['/gateways', 'health-probe the keyless chain (feeds self-healing routing)'],
@@ -824,6 +861,24 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         }
         setChatSetting(root, 'effort', chat.effort.level);
         say(`\n  ${c.green('✓ effort:')} ${c.bold(chat.effort.level)} — ${chat.effort.maxSteps} steps/task · ~${chat.effort.maxTokens} tok replies (applies from the next task, persisted)\n`);
+        break;
+      }
+      case 'stream': {
+        const arg = String(args || '').trim().toLowerCase();
+        if (arg === 'on' || arg === 'off') {
+          const on = arg === 'on';
+          streamRef.enabled = on;
+          chat.streaming.enabled = on; // same ref inside the loop — next brain call obeys
+          setChatSetting(root, 'stream', on);
+          say(
+            on
+              ? `\n  ${c.green('✓ streaming on')} — Buddy's reply renders as it arrives${c.gray(' (thought line under the spinner, persisted)')}\n`
+              : `\n  ${c.gray('⏹ streaming off')} — replies appear when complete${c.gray(' (persisted)')}\n`
+          );
+        } else {
+          const st = streamRef.enabled ? c.green('on') : c.gray('off');
+          say(`\n  streaming: ${st} — ${c.dim('/stream on | off (persisted)')}\n`);
+        }
         break;
       }
       case 'events': {
@@ -1826,6 +1881,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         ensureRecorder(recorded).append({ type: 'user', text: recorded });
         busyLabel = skill ? `Buddy working · /${skill.name}…` : 'Buddy working…';
         rl.setBusy(busyLabel);
+        rl.setThought(null); // fresh turn — no stale thought from the last one
         let out = null;
         try {
           out = await chat.turn(current.text, { signal: aborter.signal, skill, anchor, images });
@@ -1851,6 +1907,8 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           console.log(`  ${c.red('turn failed')}: ${truncate(e.message, 300)}`);
         } finally {
           rl.setBusy(null);
+          rl.setThought(null);
+          thoughtExtractor.reset();
           busyLabel = null;
         }
         // v0.25.0 post-turn, best-effort, never blocks the queue:

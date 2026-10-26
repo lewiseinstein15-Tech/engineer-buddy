@@ -157,7 +157,7 @@ export function buildFrame(state, cols) {
 
   lines.push(border('╰', '╯'));
 
-  // ── footer: hint / busy spinner ──
+  // ── footer: hint / busy spinner (+ live streaming thought line) ──
   let left; const right = state.statusRight ? c.dim(state.statusRight) : '';
   if (state.busy) {
     left = `${c.cyan(state.busy.glyph)} ${c.bold(state.busy.label)}${c.dim(` · esc to interrupt · ${state.busy.secs}s`)}`;
@@ -172,6 +172,12 @@ export function buildFrame(state, cols) {
     lines.push(`  ${truncateAnsi(left, room)}`);
   } else if (right) {
     lines.push(`  ${truncateAnsi(right, room)}`);
+  }
+  // Streaming thought (v0.28.0): the brain's reply as it lands — tool names,
+  // args being typed, say words unescaping live. One dim line under the
+  // spinner; gone the moment the step renders for real.
+  if (state.busy && state.thought) {
+    lines.push(`  ${c.gray('└')} ${c.dim(truncateAnsi(String(state.thought), room - 2))}`);
   }
 
   // never let a line wrap — the ghost-box killer
@@ -194,6 +200,7 @@ export function createInputBox({
   let questionText = '';
   let questionCb = null;
   let busyLabel = null;
+  let busyThought = null;
   let busyStart = 0;
   let spinIdx = 0;
   let spinTimer = null;
@@ -224,6 +231,7 @@ export function createInputBox({
       busy: busyLabel
         ? { label: busyLabel, secs: Math.max(0, Math.floor((Date.now() - busyStart) / 1000)), glyph: FRAMES[spinIdx % FRAMES.length] }
         : null,
+      thought: busyThought,
       statusRight: typeof statusRight === 'function' ? (statusRight() || '') : (statusRight || ''),
       palette: items.length ? { items, sel: paletteSel } : null,
     };
@@ -385,12 +393,18 @@ export function createInputBox({
       }
       redraw();
     },
+    // Live thought line (v0.28.0) — only visible while busy; the 120ms spin
+    // timer repaints it, so a burst of deltas costs one frame at most.
+    setThought(t) {
+      busyThought = t || null;
+      if (busyLabel) redraw();
+    },
     question(q, cb) { mode = 'question'; questionText = q; questionCb = cb; text = ''; cursor = 0; resetPaletteState(); redraw(); },
     cancelQuestion() { if (mode === 'question') { mode = 'input'; questionText = ''; questionCb = null; text = ''; cursor = 0; redraw(); } },
     close,
     on(ev, fn) { handlers[ev] = fn; return rl; },
     // test / introspection hooks
-    _state: () => ({ text, cursor, mode, history: [...history], busy: busyLabel, palette: paletteItems().map((i) => i.name) }),
+    _state: () => ({ text, cursor, mode, history: [...history], busy: busyLabel, thought: busyThought, palette: paletteItems().map((i) => i.name) }),
   };
 
   rl.install = function install() {

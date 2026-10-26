@@ -98,6 +98,8 @@ export function createChat({
   yolo = false, // /yolo or CLI flag — flips remaining 'ask' verdicts to allow
   root = process.cwd(), // workspace root — the audit trail lives here
   effort = null, // mutable { level, maxSteps, maxTokens } — /effort low|medium|high retunes the loop live
+  streaming = null, // mutable { enabled: boolean } — /stream on|off; deltas flow only when truthy-enabled AND onStream is set
+  onStream = null, // (fragment: string) => void — raw gateway deltas as they arrive (TUI thought line); null = buffered chat
   onEvent = () => {},
 }) {
   const byName = new Map(tools.map((t) => [t.name, t]));
@@ -127,6 +129,10 @@ export function createChat({
   // more reply room). Mutable by reference so /effort retunes the NEXT turn
   // without rebuilding the session.
   const effortRef = effort || { level: 'medium', maxSteps: maxStepsPerTurn, maxTokens };
+  // Streaming toggle (v0.28.0): mutable by reference so /stream flips the
+  // NEXT brain call without rebuilding the session. Default on — one-shot
+  // and non-TUI callers simply never pass onStream, so nothing changes.
+  const streamingRef = streaming || { enabled: true };
   // Per-task usage ledger (v0.25.0): /cost shows the whole session; this
   // shows what EACH task cost — the $0 story per line item ("this refactor:
   // 9 brain calls, ~41k tok in, ~3k out, 52s"). Diff of the accumulators
@@ -277,7 +283,16 @@ export function createChat({
     // level; plan mode's floor still wins when it is higher.
     const baseTok = effortRef.maxTokens || maxTokens;
     const maxTok = modes?.plan ? Math.max(baseTok, 2500) : baseTok;
-    const out = await router.chat(toWire(history), { maxTokens: maxTok });
+    // Streaming thoughts (v0.28.0): when the TUI listens and the toggle is
+    // on, gateways get onDelta and push raw fragments out as they arrive.
+    // The reply is still assembled from the FULL text — deltas never change
+    // parsing, only how alive the wait looks. One-shot/CI (no onStream) and
+    // /stream off both take the untouched buffered path.
+    const wantStream = Boolean(onStream) && streamingRef?.enabled !== false;
+    const out = await router.chat(toWire(history), {
+      maxTokens: maxTok,
+      ...(wantStream ? { onDelta: (frag) => onStream(String(frag ?? '')) } : {}),
+    });
     // Usage telemetry (the /cost surface) — real tokens when the gateway
     // reports them, chars ÷ 4 estimate otherwise.
     recordUsage(
@@ -653,6 +668,7 @@ export function createChat({
     get compactCount() { return compactCount; },
     get alwaysApproved() { return [...alwaysApproved]; },
     get effort() { return effortRef; },
+    get streaming() { return streamingRef; },
     historyChars,
     contextBreakdown,
     taskLog,
