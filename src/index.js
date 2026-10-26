@@ -398,6 +398,12 @@ async function cmdMcpServe(argv) {
       return 0;            // quitting happens in the REPL's own close handler ("bye" + exit 0)
     }
     if (cmd === '-p' || cmd === '--prompt' || cmd === 'run') process.exit(await cmdChat(argv, { oneShot: true }));
+    // Flags-first invocations (e.g. `buddy -c -p "task"`, `buddy -r name`, `buddy --safe -p "…"`)
+    // used to fall through to usage() because argv[0] isn't a command word. Route the FULL
+    // arg vector to cmdChat — its own parser + TTY detection decide one-shot vs interactive.
+    if (typeof cmd === 'string' && cmd.startsWith('-') && cmd !== '-h' && cmd !== '--help') {
+      process.exit(await cmdChat(process.argv.slice(2)));
+    }
     if (cmd === 'init') process.exit(await cmdInit(argv));
     if (cmd === 'pr-review') process.exit(await cmdPrReview(argv));
     if (cmd === 'fix-issue') process.exit(await cmdFixIssue(argv));

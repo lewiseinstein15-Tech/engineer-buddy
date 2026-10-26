@@ -85,3 +85,26 @@ describe('repl: MCP banner status', () => {
     assert.doesNotThrow(() => captureConsole(() => printMcpStatus({ connected: [{ name: 'x' }], failed: 'oops' })));
   });
 });
+
+// ── v0.24.2 live-test regressions ────────────────────────────────────────────
+// Both bugs were found by driving the real CLI (PTY + one-shot) during the
+// self-test round, not by the unit suite. Source-scan locks the fixes in.
+
+describe('repl: v0.24.2 live-test regressions', () => {
+  test('/rename syncs sessionFile — /export + status bar must follow the renamed file', () => {
+    const idx = REPL_SRC.indexOf("case 'rename':");
+    assert.ok(idx !== -1, '/rename case exists');
+    const handler = REPL_SRC.slice(idx, REPL_SRC.indexOf("case '", idx + 10));
+    // the rename handler updates BOTH the recorder and the shared sessionFile
+    assert.match(handler, /recorder\.file = target;/, 'recorder points at the new file');
+    assert.match(handler, /sessionFile = target;/, 'sessionFile must be re-synced (was stale → /export ENOENT)');
+  });
+
+  test('/export reads the recorder live path, not the startup snapshot', () => {
+    const idx = REPL_SRC.indexOf("case 'export':");
+    assert.ok(idx !== -1, '/export case exists');
+    const handler = REPL_SRC.slice(idx, REPL_SRC.indexOf("case '", idx + 10));
+    assert.match(handler, /recorder && recorder\.file/, '/export must prefer recorder.file (rename-safe)');
+    assert.match(handler, /\|\| sessionFile/, '…falling back to sessionFile');
+  });
+});

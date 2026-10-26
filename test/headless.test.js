@@ -103,3 +103,26 @@ test('CLI: named resume found via -r reaches the brain path (fails on gateways, 
   assert.notEqual(r.stderr, undefined);
   assert.ok(!/no session matches/.test(r.stderr), 'session was found');
 }, { timeout: 100000 });
+
+test('CLI: flags-first dispatch — `-c -p` reaches session logic, never usage() (v0.24.2)', () => {
+  // Before the fix, `buddy -c -p "x"` fell through to usage() because argv[0]
+  // wasn't a command word. Now it must reach cmdChat's own -c handling and
+  // fail with "nothing to continue" on an empty dir (not the help banner).
+  const root = tmpRoot();
+  const r = spawnSync(process.execPath, [CLI, '-c', '-p', 'x', '--dir', root], { encoding: 'utf8' });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /nothing to continue/, 'flags-first args must reach cmdChat session logic');
+  assert.doesNotMatch(r.stderr, /one-shot autonomous task/, 'must NOT print usage()');
+});
+
+test('CLI: flags-first with --safe first also routes correctly (v0.24.2)', () => {
+  const root = tmpRoot();
+  const rec = fakeSession(root, 'original question');
+  renameSession(root, rec.path, 'safe-first');
+  const r = spawnSync(process.execPath, [CLI, '--safe', '-p', 'x', '-r', 'safe-first', '--dir', root], {
+    encoding: 'utf8',
+    timeout: 90000,
+    env: { ...process.env, BUDDY_DISABLE_GATEWAYS: 'kilo,llm7,pollinations,duckai,ollama' },
+  });
+  assert.ok(!/no session matches/.test(r.stderr || ''), 'flags-first --safe must reach the brain path with the named session');
+}, { timeout: 100000 });

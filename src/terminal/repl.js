@@ -1002,6 +1002,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         try {
           const target = renameSession(root, recorder.path, args.trim());
           recorder.file = target;
+          sessionFile = target; // keep /export + the status bar pointing at the real file
           say(`\n  ${c.green('✓ renamed')} → ${c.bold(path.basename(target, '.jsonl'))} ${c.dim('— resume with: buddy -r ' + args.trim())}\n`);
         } catch (e) {
           say(`\n  ${c.red('rename failed')}: ${e.message}\n`);
@@ -1253,12 +1254,15 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         break;
       }
       case 'export': {
-        if (!sessionFile) {
+        // /rename moves the file on disk; prefer the recorder's live path so a
+        // renamed session still exports (v0.24.2 live-test regression fix).
+        const exportSrc = (recorder && recorder.file) || sessionFile;
+        if (!exportSrc) {
           say('\n  no session to export yet — give Buddy a task first\n');
           break;
         }
         try {
-          const out = writeExport(root, sessionFile, { workspace: root });
+          const out = writeExport(root, exportSrc, { workspace: root });
           say(`\n  ${c.green('exported')} → ${out}\n`);
         } catch (e) {
           say(`\n  ${c.red('export failed')}: ${truncate(e.message, 200)}\n`);
@@ -1306,7 +1310,9 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
             `  messages: ${chat.messages.length} · history: ${(chat.historyChars() / 1000).toFixed(1)}k chars · compactions: ${chat.compactCount}`,
             `  approvals: ${chat.alwaysApproved.join(', ') || '—'} · yolo: ${yolo ? c.yellow('ON') : 'off'}`,
             `  chain: ${router.order.join(' → ')}${lastGateway ? c.gray(` (last: ${lastGateway})`) : ''}`,
-            sessionFile ? `  session: ${path.basename(sessionFile)}` : `  session: ${c.dim('(starts on first task)')}`,
+            (recorder && recorder.file) || sessionFile
+              ? `  session: ${path.basename((recorder && recorder.file) || sessionFile)}`
+              : `  session: ${c.dim('(starts on first task)')}`,
             '',
           ].join('\n')
         );
