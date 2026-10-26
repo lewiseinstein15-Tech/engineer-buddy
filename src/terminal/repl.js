@@ -743,6 +743,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
               ['/plan', 'toggle plan mode — read-only research, plan approved at the gate'],
               ['/plans', 'list approved plans in .buddy/plans/'],
               ['/rewind [n]', 'list checkpoints · /rewind 1 restores files to before the latest edit'],
+              ['double-esc', 'open the rewind menu — ↑↓ pick a checkpoint, enter restores (files only)'],
               ['/diff', 'show uncommitted changes (git status + stat + diff)'],
               ['/hooks', 'show lifecycle hooks (.buddy/settings.json) — exit 2 blocks a tool or prompt'],
               ['/permissions', 'show session approvals · /permissions reset'],
@@ -1710,6 +1711,32 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   // ── Esc routing: interrupt a running turn (Claude Code style) ──────────────
   rl.on('escape', () => {
     if (busy && aborter) aborter.abort();
+  });
+
+  // ── Double-esc rewind menu (v0.32.0) ─────────────────────────────────────
+  // The box opens the menu only when idle and only with real entries; these
+  // handlers reuse the /rewind semantics exactly: newest = index 0, each
+  // restore is ONE undo (the applied manifest is consumed), files only.
+  rl.on('rewindOpen', () => {
+    const list = listCheckpoints(root, 10);
+    if (!list.length) {
+      say(`\n  no checkpoints yet — every fs_write / fs_replace / fs_append snapshots its target file to ${c.bold('.buddy/checkpoints/')} first\n`);
+    }
+    return list;
+  });
+  rl.on('rewind', (idx) => {
+    const list = listCheckpoints(root, 10);
+    const ck = list[Number(idx)];
+    if (!ck) {
+      say('\n  that checkpoint is gone — each restore is one undo\n');
+      return;
+    }
+    const res = restoreCheckpoint(root, ck.file);
+    const parts = [];
+    if (res.restored.length) parts.push(`${c.green('restored')} ${res.restored.join(', ')}`);
+    if (res.removed.length) parts.push(`${c.yellow('removed')} ${res.removed.join(', ')}`);
+    if (res.lost.length) parts.push(`${c.red('lost')} ${res.lost.join(', ')}`);
+    say(`\n  ↩ rewound to the state before ${c.bold(ck.tool)} (${(ck.time || '').slice(0, 19).replace('T', ' ')})\n    ${parts.join(' · ') || 'nothing to do'}\n${c.dim('  files only — the conversation was not rewound')}\n`);
   });
 
   // ── Input pipeline ─────────────────────────────────────────────────────────

@@ -25,6 +25,10 @@
 //     live-tailing panel over the box, fed by every byte the renderer prints
 //     (renderer.print → onPrint → capture). Editing is inert while open; the
 //     running turn keeps streaming into the tail.
+//   - double-esc (v0.32.0) opens the rewind menu: two consecutive escapes
+//     inside REWIND.DOUBLE_ESC_MS pop the checkpoint panel over the box —
+//     ↑↓ pick, enter restores files to before that step (one undo), esc
+//     closes. A palette or question-mode escape never arms the chord.
 
 import fs from 'node:fs';
 import readline from 'node:readline';
@@ -33,6 +37,7 @@ import { c } from './ui.js';
 import { buildAuroraStrip, SEM } from './theme.js';
 import { charWidth, strWidth, wrapContent, truncateAnsi } from './text.js';
 import { sanitizeChunk, applyViewerKey, buildTranscriptPanel, viewerBodyRows, VIEWER } from './transcript.js';
+import { isDoubleEscape, applyRewindMenuKey, buildRewindMenu } from './rewind.js';
 
 export { charWidth, strWidth, wrapContent };
 
@@ -40,15 +45,22 @@ export { charWidth, strWidth, wrapContent };
 
 // Key reducer: maps a keypress to an editing action (pure, unit-tested).
 // key: { name?, ctrl?, meta?, sequence? } — the node keypress event shape.
-// ctx: { paletteOpen? } — switches ↑/↓ from history to palette navigation.
-// Returns { action, data } where action ∈ insert|submit|backspace|delete|left|right|
-// home|end|kill-line|kill-word-before|history-prev|history-next|complete|
-// mode-cycle|palette-prev|palette-next|escape|transcript|sigint|eof|null
+// ctx: { paletteOpen?, questionMode?, lastEscapeAt?, now? } — switches ↑/↓
+// from history to palette navigation; lastEscapeAt+now arm the double-esc
+// rewind chord (v0.32.0). Returns { action, data } where action ∈ insert|submit|
+// backspace|delete|left|right|home|end|kill-line|kill-word-before|history-prev|
+// history-next|complete|mode-cycle|palette-prev|palette-next|escape|rewind|
+// transcript|sigint|eof|null
 export function applyKey(key, ctx = {}) {
   const name = key.name ?? '';
   if (key.ctrl && name === 'c') return { action: 'sigint' };
   if (key.ctrl && name === 'd') return { action: 'eof' };
-  if (name === 'escape' || key.sequence === '\x1b') return { action: 'escape' };
+  if (name === 'escape' || key.sequence === '\x1b') {
+    // palette and question escapes are functional, not chords — never arm rewind
+    if (ctx.paletteOpen || ctx.questionMode) return { action: 'escape' };
+    if (isDoubleEscape(ctx.lastEscapeAt, ctx.now)) return { action: 'rewind' }; // v0.32.0
+    return { action: 'escape' };
+  }
   if (name === 'return' || name === 'enter') return { action: 'submit' };
   if (name === 'backspace' || (key.ctrl && name === 'h')) return { action: 'backspace' };
   if (name === 'delete') return { action: 'delete' };
@@ -104,6 +116,8 @@ function withCursor(line, ci) {
 //   busy: null | { label, secs, glyph }
 //   statusRight: string
 //   palette: null | { items: [{name, desc}], sel }
+//   viewer: null | { open, rows, scroll }   — ctrl+r transcript viewer (v0.31.0)
+//   menu: null | { open, entries, sel }     — double-esc rewind menu (v0.32.0)
 // }
 // Returns string[] — every line guaranteed ≤ W so nothing ever wraps.
 
@@ -121,6 +135,16 @@ export function buildFrame(state, cols) {
       scroll: state.viewer.scroll,
       busy: state.busy,
       tick: state.tick || 0,
+    });
+  }
+
+  // ── rewind menu (double-esc, v0.32.0) ── replaces the whole frame: the
+  // checkpoint list over the box; the spin timer repaints it like the viewer.
+  if (state.menu?.open) {
+    return buildRewindMenu({
+      entries: state.menu.entries || [],
+      sel: state.menu.sel,
+      cols: W,
     });
   }
 
@@ -244,6 +268,10 @@ export function createInputBox({
   let viewerOpen = false; // ctrl+r (v0.31.0): transcript viewer over the box
   let viewerScroll = 0; // rows scrolled up from the live tail (0 = tail)
   const transcript = []; // session scrollback, SGR kept, capped at VIEWER.MAX_BUFFER
+  let menuOpen = false; // double-esc (v0.32.0): rewind menu over the box
+  let menuSel = 0;
+  let menuEntries = [];
+  let lastEscapeAt = 0; // arms the double-esc chord; any other key disarms
   let busyStart = 0;
   let spinIdx = 0;
   let spinTimer = null;
@@ -282,6 +310,7 @@ export function createInputBox({
         ? { open: true, rows: viewerBodyRows(process.stdout?.rows, process.stdout?.columns), scroll: viewerScroll }
         : null,
       transcript: viewerOpen ? transcript.slice() : null,
+      menu: menuOpen ? { open: true, entries: menuEntries, sel: menuSel } : null,
       statusRight: typeof statusRight === 'function' ? (statusRight() || '') : (statusRight || ''),
       palette: items.length ? { items, sel: paletteSel } : null,
     };
@@ -391,6 +420,24 @@ export function createInputBox({
       redraw();
       return;
     }
+    // ── rewind menu owns EVERY key while open (v0.32.0) ── the editor is
+    // inert; enter confirms the restore (the menu closes first so the result
+    // note prints through the renderer into plain scrollback), esc closes.
+    if (menuOpen) {
+      const { action } = applyRewindMenuKey(key);
+      if (action === 'close') { menuOpen = false; menuSel = 0; menuEntries = []; }
+      else if (action === 'up') menuSel = Math.max(0, menuSel - 1);
+      else if (action === 'down') menuSel = Math.min(menuEntries.length - 1, menuSel + 1);
+      else if (action === 'confirm') {
+        menuOpen = false;
+        const idx = menuSel;
+        menuSel = 0; menuEntries = [];
+        handlers.rewind?.(idx);
+        return; // the restore note prints through the renderer
+      } else return; // inert key: no repaint needed
+      redraw();
+      return;
+    }
     // bracketed paste → unwrap and insert as one line
     const pm = /^\x1b\[200~([\s\S]*)\x1b\[201~\s*$/.exec(String(key.sequence ?? ''));
     if (pm) {
@@ -400,7 +447,14 @@ export function createInputBox({
       return;
     }
     const items = paletteItems();
-    const { action, data } = applyKey(key, { paletteOpen: items.length > 0 });
+    const now = Date.now();
+    const { action, data } = applyKey(key, {
+      paletteOpen: items.length > 0,
+      questionMode: mode === 'question',
+      lastEscapeAt,
+      now,
+    });
+    if (action !== 'escape' && action !== 'rewind') lastEscapeAt = 0; // chord needs CONSECUTIVE escapes
     switch (action) {
       case 'insert': insertText(data); break;
       case 'backspace': if (cursor > 0) { text = text.slice(0, cursor - 1) + text.slice(cursor); cursor--; resetPaletteState(); } break;
@@ -447,11 +501,18 @@ export function createInputBox({
       case 'mode-cycle': handlers.modecycle?.(); break; // shift+tab: normal → auto-accept → plan
       case 'submit': submitLine(); return; // submitLine handles its own repaint
       case 'escape':
-        if (items.length) { paletteClosed = true; break; }
+        if (items.length) { paletteClosed = true; lastEscapeAt = 0; break; } // palette close is not a chord
+        lastEscapeAt = now; // arm (or re-arm) the double-esc window
         if (busyLabel) { handlers.escape?.(); return; }
         if (mode === 'question') break; // Ctrl+C owns deny; esc keeps the question
         if (text) { text = ''; cursor = 0; }
         break;
+      case 'rewind': { // v0.32.0: double-esc — open the rewind menu over the box
+        if (busyLabel) { handlers.escape?.(); break; } // mid-turn both escapes interrupt; the menu is an idle affordance
+        const entries = handlers.rewindOpen?.() ?? [];
+        if (entries.length) { menuOpen = true; menuSel = 0; menuEntries = entries; }
+        break;
+      }
       case 'sigint': handlers.SIGINT?.(); return;
       case 'eof':
         if (!text) { close(); return; }
@@ -483,6 +544,7 @@ export function createInputBox({
     setPrompt() { /* kept for readline API compatibility; the box owns its labels */ },
     setBusy(label) {
       busyLabel = label || null;
+      if (busyLabel && menuOpen) { menuOpen = false; menuSel = 0; menuEntries = []; } // defensive: a turn never starts under the menu
       if (busyLabel) {
         busyStart = Date.now();
         if (!spinTimer) spinTimer = setInterval(() => { spinIdx++; redraw(); }, 120);
@@ -504,7 +566,7 @@ export function createInputBox({
       toolCallsCount = Math.max(0, Number(n) || 0);
       if (busyLabel) redraw();
     },
-    question(q, cb) { mode = 'question'; questionText = q; questionCb = cb; text = ''; cursor = 0; resetPaletteState(); redraw(); },
+    question(q, cb) { mode = 'question'; questionText = q; questionCb = cb; text = ''; cursor = 0; menuOpen = false; resetPaletteState(); redraw(); },
     cancelQuestion() { if (mode === 'question') { mode = 'input'; questionText = ''; questionCb = null; text = ''; cursor = 0; redraw(); } },
     close,
     on(ev, fn) { handlers[ev] = fn; return rl; },
@@ -514,7 +576,7 @@ export function createInputBox({
     // onPrint wiring receives from renderer.print in production)
     _capture: pushTranscript,
     // test / introspection hooks
-    _state: () => ({ text, cursor, mode, history: [...history], busy: busyLabel, thought: busyThought, toolCalls: toolCallsCount, verbose, viewer: viewerOpen ? { scroll: viewerScroll } : null, transcriptLines: transcript.length, palette: paletteItems().map((i) => i.name) }),
+    _state: () => ({ text, cursor, mode, history: [...history], busy: busyLabel, thought: busyThought, toolCalls: toolCallsCount, verbose, viewer: viewerOpen ? { scroll: viewerScroll } : null, menu: menuOpen ? { sel: menuSel, count: menuEntries.length } : null, transcriptLines: transcript.length, palette: paletteItems().map((i) => i.name) }),
   };
 
   rl.install = function install() {
