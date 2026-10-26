@@ -328,18 +328,23 @@ test('update: up-to-date, fetch failure, checkout failure are all honest', () =>
 });
 
 test('update: cmdUpdate end-to-end with a fake runner', async () => {
+  // The fake "newer release" must always be NEWER than the real package.json
+  // version — computed, not hard-coded, so version bumps never break this test.
+  const realV = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+  const [maj, min] = realV.split('.').map(Number);
+  const nextTag = `v${maj}.${min + 1}.0`;
   const lines = [];
   const out = (s) => lines.push(s);
   const script = {
     'fetch origin --tags': { ok: true, stdout: '' },
-    'tag -l --sort=-v:refname': { ok: true, stdout: 'v0.30.0\n' },
+    'tag -l --sort=-v:refname': { ok: true, stdout: `${nextTag}\n` },
     'status --porcelain': { ok: true, stdout: '' },
-    '-c advice.detachedHead=false checkout v0.30.0': { ok: true, stdout: '' },
+    [`-c advice.detachedHead=false checkout ${nextTag}`]: { ok: true, stdout: '' },
   };
   const { run } = fakeRun(script);
   const code = await cmdUpdate([], { cwd: '/x', out, run });
   assert.equal(code, 0);
-  assert.ok(lines.join('\n').includes('v0.30.0'));
+  assert.ok(lines.join('\n').includes(nextTag));
   assert.ok(lines.join('\n').includes('updated:'));
   // --check reports without checkout
   const lines2 = [];

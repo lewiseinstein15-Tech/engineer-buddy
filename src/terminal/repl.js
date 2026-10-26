@@ -255,9 +255,11 @@ function defaultApproval(busy) {
 
 // ── Event rendering (shared by REPL and one-shot) ────────────────────────────
 
-function makeRenderer({ quiet = false, toolByName = new Map(), verbosity = 'summary' } = {}) {
-  // verbosity may be a live ref object ({level}) so /verbosity changes apply mid-session.
+function makeRenderer({ quiet = false, toolByName = new Map(), verbosity = 'summary', verbose = false } = {}) {
+  // verbosity/verbose may be live ref objects ({level}/{on}) so /verbosity and
+  // ctrl+o changes apply immediately, not on the next turn.
   const level = () => (typeof verbosity === 'object' && verbosity !== null ? verbosity.level : verbosity);
+  const expanded = () => (typeof verbose === 'object' && verbose !== null ? verbose.on : verbose);
   return function renderEvent(ev) {
     if (quiet && ev.type !== 'say' && ev.type !== 'error') return;
     // /verbosity silent — replies and errors only, no tool chatter.
@@ -272,7 +274,7 @@ function makeRenderer({ quiet = false, toolByName = new Map(), verbosity = 'summ
         console.log(renderTodo(ev.args.items));
         return;
       }
-      console.log(renderToolEvent(ev, { preview: !quiet }));
+      console.log(renderToolEvent(ev, { preview: !quiet, verbose: expanded() }));
       // /verbosity verbose — observations follow their tool cards.
       if (level() === 'verbose' && ev.observation && !ev.denied) {
         console.log(c.gray(`  ↳ ${String(ev.observation).split('\n')[0].slice(0, 160)}${String(ev.observation).length > 160 ? '…' : ''}`));
@@ -479,9 +481,12 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   let lastReport = null; // /report result — attached to the next task (v0.26.0)
   const branches = new Map(); // /branch save <name> → in-memory conversation snapshots (v0.21.0)
   // UX/narration config (v0.22.0): theme now, verbosity live, statusline template.
+  // verboseRef (v0.30.0): ctrl+o transcript toggle — the box notifies on every
+  // toggle and the renderer + strip read the ref on every paint.
   const themeSetting = getChatSetting(root, 'theme');
   if (themeSetting) setTheme(themeSetting);
   const verbosityRef = { level: getChatSetting(root, 'verbosity', 'summary') };
+  const verboseRef = { on: false };
   const statuslineRef = { template: getChatSetting(root, 'statusline', '') };
   // Observability & routing (v0.25.0):
   //   effort — persisted level (chat.effort setting) retunes the loop live
@@ -622,7 +627,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     }
   }
 
-  const render = makeRenderer({ toolByName: new Map(tools.map((t) => [t.name, t])), verbosity: verbosityRef.level });
+  const render = makeRenderer({ toolByName: new Map(tools.map((t) => [t.name, t])), verbosity: verbosityRef, verbose: verboseRef });
 
   const ensureRecorder = (firstMsg) => {
     if (!recorder) {
@@ -635,7 +640,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   const rl = createInputBox({
     title: 'Buddy',
     placeholder: 'type a task…   (/ for commands · ! shell · # remember)',
-    hint: '? shortcuts · tab complete · ↑↓ history · esc stop · ctrl+c quit',
+    hint: '? shortcuts · tab complete · ↑↓ history · esc stop · ctrl+o expand · ctrl+c quit',
     record: recordPath,
     statusRight: () => {
       try {
@@ -653,6 +658,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
 
   // shift+tab cycles normal → auto-accept → plan (Claude Code parity)
   rl.on('modecycle', cycleMode);
+  rl.on('verbose', (on) => { verboseRef.on = !!on; }); // ctrl+o (v0.30.0): expanded transcript
 
   // Interactive-path spinner: drives the box busy footer instead of writing
   // raw cursor sequences that would fight the renderer for the screen.
@@ -1402,7 +1408,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         }
         verbosityRef.level = v;
         try { setChatSetting(root, 'verbosity', v); } catch { /* persistence is best effort */ }
-        say(`\n  ${c.green('✓ verbosity:')} ${c.bold(v)} — takes effect on the next turn\n`);
+        say(`\n  ${c.green('✓ verbosity:')} ${c.bold(v)} — applies immediately\n`);
         break;
       }
       case 'theme': {

@@ -18,6 +18,9 @@
 //     box; ↑↓ select, tab accepts, esc dismisses
 //   - submitted lines are echoed into scrollback like Claude Code's `> msg`
 //   - bracketed paste is unwrapped and pasted as one line
+//   - ctrl+o (v0.30.0) toggles the expanded transcript: the Aurora strip's
+//     narration grows to a 3-row mini transcript and tool observations
+//     render in full (repl.js listens on the 'verbose' handler event)
 
 import fs from 'node:fs';
 import readline from 'node:readline';
@@ -51,6 +54,7 @@ export function applyKey(key, ctx = {}) {
   if (key.ctrl && name === 'u') return { action: 'kill-line' };
   if (key.ctrl && name === 'k') return { action: 'kill-line' };
   if (key.ctrl && name === 'w') return { action: 'kill-word-before' };
+  if (key.ctrl && name === 'o') return { action: 'verbose-toggle' }; // v0.30.0: expand/collapse the stream transcript
   if (name === 'up') return ctx.paletteOpen ? { action: 'palette-prev' } : { action: 'history-prev' };
   if (name === 'down') return ctx.paletteOpen ? { action: 'palette-next' } : { action: 'history-next' };
   if (name === 'tab') return key.shift ? { action: 'mode-cycle' } : { action: 'complete' };
@@ -187,6 +191,7 @@ export function buildFrame(state, cols) {
       cols: W,
       tick: state.tick || 0,
       toolCalls: state.toolCalls || 0,
+      verbose: !!state.verbose, // ctrl+o: narration expands to the 3-row mini transcript
     });
     for (const l of strip) lines.push(`  ${l}`);
   }
@@ -214,6 +219,7 @@ export function createInputBox({
   let busyLabel = null;
   let busyThought = null; // Aurora: the RAW extractor snapshot (+ bytes), not a preformatted string
   let toolCallsCount = 0;
+  let verbose = false; // ctrl+o (v0.30.0): expanded transcript — strip narration + full observations
   let busyStart = 0;
   let spinIdx = 0;
   let spinTimer = null;
@@ -247,6 +253,7 @@ export function createInputBox({
       thought: busyThought,
       tick: spinIdx,
       toolCalls: toolCallsCount,
+      verbose,
       statusRight: typeof statusRight === 'function' ? (statusRight() || '') : (statusRight || ''),
       palette: items.length ? { items, sel: paletteSel } : null,
     };
@@ -367,6 +374,10 @@ export function createInputBox({
       case 'palette-prev': paletteSel = Math.max(0, paletteSel - 1); break;
       case 'palette-next': paletteSel = Math.min(items.length - 1, paletteSel + 1); break;
       case 'complete': acceptPalette(items); break;
+      case 'verbose-toggle': // ctrl+o: expand/collapse — repl.js widens observations too
+        verbose = !verbose;
+        handlers.verbose?.(verbose);
+        break;
       case 'mode-cycle': handlers.modecycle?.(); break; // shift+tab: normal → auto-accept → plan
       case 'submit': submitLine(); return; // submitLine handles its own repaint
       case 'escape':
@@ -434,7 +445,7 @@ export function createInputBox({
     // test / harness seam: drive the box's key reducer directly
     _handleKeypress(key) { onKeypress(key || {}); },
     // test / introspection hooks
-    _state: () => ({ text, cursor, mode, history: [...history], busy: busyLabel, thought: busyThought, toolCalls: toolCallsCount, palette: paletteItems().map((i) => i.name) }),
+    _state: () => ({ text, cursor, mode, history: [...history], busy: busyLabel, thought: busyThought, toolCalls: toolCallsCount, verbose, palette: paletteItems().map((i) => i.name) }),
   };
 
   rl.install = function install() {

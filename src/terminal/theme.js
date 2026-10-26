@@ -166,6 +166,26 @@ function oneLine(s, max) {
   return t.length > max ? `${t.slice(0, max - 1)}…` : t;
 }
 
+/** Word-wrap plain text to `width` visible columns. Pure (unit-tested).
+ *  A single overlong word is kept intact (the painter truncates it later). */
+export function wrapWords(s, width) {
+  const w = Math.max(8, Number(width) || 40);
+  const words = String(s ?? '').split(/\s+/).filter(Boolean);
+  const rows = [];
+  let row = '';
+  for (const word of words) {
+    const cand = row ? `${row} ${word}` : word;
+    if (strWidth(cand) > w && row) {
+      rows.push(row);
+      row = word;
+    } else {
+      row = cand;
+    }
+  }
+  if (row) rows.push(row);
+  return rows;
+}
+
 // ── The Aurora strip — the live 3-line narration panel ──────────────────────
 // Replaces v0.28's single dim thought line. Pure: state → string[], painted
 // inside buildFrame so the spin timer animates the gradient for free.
@@ -177,7 +197,16 @@ function oneLine(s, max) {
 // Lines disappear when there is nothing to say (empty message, no tool yet)
 // so the strip breathes instead of showing empty rails.
 
-export function buildAuroraStrip({ snap, ms = 0, bytes = 0, cols = 80, tick = 0, toolCalls = 0 } = {}) {
+// ── Expanded narration (v0.30.0, ctrl+o) ────────────────────────────────────
+// Collapsed (default) the strip narrates on ONE width-capped line. Expanded
+// (ctrl+o — "show the transcript"), the words wrap into a mini transcript of
+// up to 3 rows and the LAST rows win, so the newest words of a long stream
+// stay on screen instead of vanishing behind an ellipsis. Pure: the caller
+// (inputbox buildFrame) passes verbose = state of the ctrl+o toggle.
+
+const NARRATION_ROWS = 3;
+
+export function buildAuroraStrip({ snap, ms = 0, bytes = 0, cols = 80, tick = 0, toolCalls = 0, verbose = false } = {}) {
   if (!snap) return [];
   const room = Math.max(24, Math.floor(cols) - 6);
   const lines = [];
@@ -185,21 +214,45 @@ export function buildAuroraStrip({ snap, ms = 0, bytes = 0, cols = 80, tick = 0,
   const verb = pickVerb(snap);
   const words = snap.message ? oneLine(snap.message, room) : '';
   if (words) {
-    lines.push(`${auroraEdge(tick, 0)} ${verb.paint(`✻ ${verb.v}`)} ${SEM.time('·')} ${SEM.narrate(`"${truncateVisible(words, room - 24)}"`)}`);
+    const textCap = Math.max(12, room - 26); // row 1 carries `▐ ✻ verb · "` + quote
+    if (verbose) {
+      // Tail-first: the newest words are the news, so cut the message to the
+      // last ~NARRATION_ROWS × textCap chars at a word boundary BEFORE
+      // wrapping (oneLine would keep the HEAD — useless for a live tail).
+      const budget = textCap * NARRATION_ROWS;
+      let tail = String(snap.message ?? '').replace(/\s+/g, ' ').trim();
+      if (tail.length > budget) {
+        tail = tail.slice(-budget);
+        const sp = tail.indexOf(' ');
+        if (sp > 0) tail = tail.slice(sp + 1); // drop the partial word at the cut
+      }
+      const rows = wrapWords(tail, textCap).slice(-NARRATION_ROWS);
+      rows.forEach((row, i) => {
+        const body = truncateVisible(row, textCap) + (i === rows.length - 1 && snap.messageClosed ? '"' : '');
+        if (i === 0) {
+          lines.push(`${auroraEdge(tick, 0)} ${verb.paint(`✻ ${verb.v}`)} ${SEM.time('·')} ${SEM.narrate(`"${body}`)}`);
+        } else {
+          lines.push(`${auroraEdge(tick, i)} ${SEM.time('⌄')} ${SEM.narrate(body)}`);
+        }
+      });
+    } else {
+      lines.push(`${auroraEdge(tick, 0)} ${verb.paint(`✻ ${verb.v}`)} ${SEM.time('·')} ${SEM.narrate(`"${truncateVisible(words, room - 24)}"`)}`);
+    }
   }
+  const narr = lines.length;
 
   if (snap.tool) {
     const st = toolStyle(snap.tool);
     const raw = oneLine(snap.raw ?? '', room);
     const argsTail = raw.replace(new RegExp(`^\\s*\\{?\\s*"tool"\\s*:\\s*"${String(snap.tool).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`), '').replace(/^[\s,:]*/, '');
     const body = `${st.paint(st.glyph)} ${st.paint(String(snap.tool))}${argsTail ? ` ${SEM.time(oneLine(argsTail, Math.max(8, room - String(snap.tool).length - 4)))}` : ''}`;
-    lines.push(`${auroraEdge(tick, 1)} ${truncateVisible(body, room)}`);
+    lines.push(`${auroraEdge(tick, narr)} ${truncateVisible(body, room)}`);
   }
 
   if (!lines.length) return []; // raw JSON prefix with no signal — stay quiet
 
   const tele = `↓ ${fmtTok(bytes)} tok · ${toolCalls} tool call${toolCalls === 1 ? '' : 's'} · ${fmtDur(ms)}`;
-  lines.push(`${auroraEdge(tick, 2)} ${SEM.time(truncateVisible(tele, room))}`);
+  lines.push(`${auroraEdge(tick, narr + (snap.tool ? 0 : 1))} ${SEM.time(truncateVisible(tele, room))}`);
   return lines;
 }
 

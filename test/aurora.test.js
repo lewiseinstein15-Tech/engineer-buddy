@@ -18,11 +18,13 @@ import {
   fmtDur,
   fmtTok,
   buildAuroraStrip,
+  wrapWords,
   renderDoneRibbon,
   truncateVisible,
 } from '../src/terminal/theme.js';
 import { renderToolCall, renderObservation, renderToolEvent, setTheme } from '../src/terminal/ui.js';
-import { stripAnsi } from '../src/terminal/text.js';
+import { applyKey, buildFrame, createInputBox } from '../src/terminal/inputbox.js';
+import { stripAnsi, strWidth } from '../src/terminal/text.js';
 
 // ── capability detection ─────────────────────────────────────────────────────
 
@@ -246,4 +248,119 @@ test('setTheme(mono) forces the semantic layer to identity, others re-arm it', (
   assert.equal(getLevel(), colorLevel());
   // restore for other tests in the process
   setLevel('none');
+});
+
+// ── expand / collapse — collapsible thinking (v0.30.0, ctrl+o) ───────────────
+
+test('wrapWords: word wrap to width, overlong word kept intact', () => {
+  assert.deepEqual(wrapWords('one two three four five', 8), ['one two', 'three', 'four', 'five']);
+  assert.deepEqual(wrapWords('one two three four five', 9), ['one two', 'three', 'four five']);
+  assert.deepEqual(wrapWords('supercalifragilistic', 8), ['supercalifragilistic']); // intact — painter truncates
+  assert.deepEqual(wrapWords('', 40), []);
+  assert.deepEqual(wrapWords('a', 0), ['a']); // degenerate width still yields the word
+});
+
+test('buildAuroraStrip collapsed: long narration stays ONE row, oldest words kept, newest lost behind …', () => {
+  setLevel('none');
+  const words = Array.from({ length: 40 }, (_, i) => `w${String(i).padStart(2, '0')}`).join(' ');
+  const [row] = buildAuroraStrip({ snap: { tool: null, message: words, messageClosed: false, raw: '' }, ms: 1000, bytes: 400, cols: 80, tick: 0, toolCalls: 1 });
+  assert.match(row, /w00/);          // head survives
+  assert.ok(!row.includes('w39'));   // newest words truncated away — THE loss ctrl+o fixes
+  assert.ok(row.endsWith('…"'));     // truncation inside the closing quote
+});
+
+test('buildAuroraStrip verbose: narration expands to 3 tail rows — newest words visible', () => {
+  setLevel('none');
+  const words = Array.from({ length: 40 }, (_, i) => `w${String(i).padStart(2, '0')}`).join(' ');
+  const lines = buildAuroraStrip({ snap: { tool: 'bash', message: words, messageClosed: false, raw: '{"tool":"bash"' }, ms: 46000, bytes: 5600, cols: 80, tick: 2, toolCalls: 3, verbose: true });
+  assert.equal(lines.length, 5); // 3 narration + tool + telemetry
+  assert.match(lines[0], /✻ forming/); // tool present → forming wins (pickVerb)
+  assert.match(lines[0], /"/);
+  assert.match(lines[1], /⌄/);
+  assert.match(lines[2], /⌄/);
+  assert.match(stripAnsi(lines[2]), /w39/);  // the NEWEST words are on screen
+  assert.ok(!stripAnsi(lines.join('\n')).includes('w00 ')); // oldest dropped instead
+  assert.match(lines[3], /bash/);            // tool line shifted, intact
+  assert.match(lines[4], /↓ 1\.4k tok · 3 tool calls · 46\.0s/);
+});
+
+test('buildAuroraStrip verbose: every row fits the width (ghost-box killer holds expanded)', () => {
+  setLevel('none');
+  const lines = buildAuroraStrip({
+    snap: { tool: 'web_search', message: ('x '.repeat(200)).trim(), messageClosed: false, raw: '{"tool":"web_search"' },
+    ms: 12000, bytes: 90000, cols: 40, tick: 0, toolCalls: 9, verbose: true,
+  });
+  for (const l of lines) assert.ok(strWidth(l) <= 40, `row too wide: ${strWidth(l)}`);
+});
+
+test('buildAuroraStrip verbose: closing quote lands on the last row when the message completes', () => {
+  setLevel('none');
+  const words = Array.from({ length: 30 }, (_, i) => `word${i}`).join(' ');
+  const lines = buildAuroraStrip({ snap: { tool: null, message: words, messageClosed: true, raw: '' }, ms: 3000, bytes: 1200, cols: 60, tick: 1, toolCalls: 2, verbose: true });
+  const narr = lines.filter((l) => l.includes('✻') || l.includes('⌄'));
+  assert.equal(narr.length, 3);
+  assert.ok(stripAnsi(narr[2]).endsWith('"'));
+  // open stream (not closed) has no trailing quote
+  const open = buildAuroraStrip({ snap: { tool: null, message: words, messageClosed: false, raw: '' }, ms: 3000, bytes: 1200, cols: 60, tick: 1, toolCalls: 2, verbose: true });
+  const openNarr = open.filter((l) => l.includes('⌄'));
+  assert.ok(!stripAnsi(openNarr[openNarr.length - 1]).endsWith('"'));
+});
+
+test('buildAuroraStrip verbose: short message keeps the collapsed shape (one row)', () => {
+  setLevel('none');
+  const lines = buildAuroraStrip({ snap: { tool: null, message: 'wrapping up', messageClosed: false, raw: '' }, ms: 1200, bytes: 400, cols: 80, tick: 0, toolCalls: 1, verbose: true });
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /✻ streaming · "wrapping up/);
+  assert.match(lines[1], /↓ 100 tok/);
+});
+
+test('applyKey: ctrl+o is the verbose-toggle; plain o still inserts', () => {
+  assert.deepEqual(applyKey({ ctrl: true, name: 'o' }), { action: 'verbose-toggle' });
+  assert.deepEqual(applyKey({ sequence: 'o' }), { action: 'insert', data: 'o' });
+});
+
+test('buildFrame: verbose state expands the strip inside the frame, collapsed does not', () => {
+  setLevel('none');
+  const words = Array.from({ length: 60 }, (_, i) => `w${String(i).padStart(2, '0')}`).join(' ');
+  const busy = { label: 'Buddy working…', secs: 5, glyph: '⠋' };
+  const snap = { tool: null, message: words, messageClosed: false, raw: '' };
+  const expanded = buildFrame({ text: '', cursor: 0, busy, thought: snap, toolCalls: 2, tick: 3, verbose: true, hint: '' }, 80);
+  assert.equal(expanded.filter((l) => l.includes('✻')).length, 1);
+  assert.equal(expanded.filter((l) => l.includes('⌄')).length, 2);
+  for (const l of expanded) assert.ok(strWidth(l) <= 80, 'frame row overflow');
+  const collapsed = buildFrame({ text: '', cursor: 0, busy, thought: snap, toolCalls: 2, tick: 3, hint: '' }, 80);
+  assert.equal(collapsed.filter((l) => l.includes('⌄')).length, 0);
+});
+
+test('box: ctrl+o toggles verbose state and notifies the repl (twice = back to collapsed)', () => {
+  setLevel('none');
+  const writes = [];
+  const fakeStdout = { isTTY: true, columns: 100, write: (s) => { writes.push(s); }, on: () => {}, removeListener: () => {} };
+  const seen = [];
+  const rl = createInputBox({ title: 'Buddy', placeholder: '', hint: '' });
+  rl.on('verbose', (on) => seen.push(on));
+  const origStdout = process.stdout;
+  Object.defineProperty(process, 'stdout', { value: fakeStdout, configurable: true });
+  try {
+    assert.equal(rl._state().verbose, false);
+    rl._handleKeypress({ ctrl: true, name: 'o' });
+    assert.equal(rl._state().verbose, true);
+    rl._handleKeypress({ ctrl: true, name: 'o' });
+    assert.equal(rl._state().verbose, false);
+  } finally {
+    Object.defineProperty(process, 'stdout', { value: origStdout, configurable: true });
+  }
+  assert.deepEqual(seen, [true, false]);
+});
+
+test('renderToolEvent verbose: observation keeps more than the collapsed 5-line cap', () => {
+  setLevel('none');
+  const obs = Array.from({ length: 8 }, (_, i) => `line ${i + 1}`).join('\n');
+  const collapsed = renderToolEvent({ tool: 'bash', argText: 'node cart.test.js', observation: obs, durationMs: 900 });
+  assert.match(collapsed, /… \+3 more lines/);
+  const expanded = renderToolEvent({ tool: 'bash', argText: 'node cart.test.js', observation: obs, durationMs: 900 }, { verbose: true });
+  assert.match(expanded, /line 8/);
+  assert.ok(!expanded.includes('more lines'));
+  // collapsed still caps — the default is the compact card
+  assert.ok(!collapsed.includes('line 8'));
 });

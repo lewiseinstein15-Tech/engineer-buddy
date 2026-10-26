@@ -275,12 +275,14 @@ export function renderTable(rows, { headers = null, indent = '  ' } = {}) {
   return out.join('\n');
 }
 
-/** Render one chat tool event as a Claude-Code-style card (Aurora skin). */
-export function renderToolEvent(ev, { preview = true, cols = null } = {}) {
+/** Render one chat tool event as a Claude-Code-style card (Aurora skin).
+ *  verbose (ctrl+o transcript, v0.30.0): the observation keeps up to 24
+ *  lines / 1200 chars instead of the collapsed 5 / 400 caps. */
+export function renderToolEvent(ev, { preview = true, cols = null, verbose = false } = {}) {
   const parts = [];
   parts.push(renderToolCall({ tool: ev.tool, args: ev.args, denied: ev.denied, argText: ev.argText, durationMs: ev.durationMs ?? null, cols }));
   if (preview && ev.preview) parts.push(String(ev.preview));
-  parts.push(renderObservation(ev.observation, { denied: !!ev.denied }));
+  parts.push(renderObservation(ev.observation, verbose ? { maxLines: 24, maxChars: 1200, denied: !!ev.denied } : { denied: !!ev.denied }));
   return parts.join('\n');
 }
 
