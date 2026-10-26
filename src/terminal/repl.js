@@ -40,6 +40,8 @@ import { listOutputStyles, loadOutputStyle } from '../harness/outputstyles.js';
 import { renderMarkdown } from './markdown.js';
 import { expandMentions } from './mentions.js';
 import { loadCustomCommands, applyCustomCommand, renderCustomCommandHelp } from './customcommands.js';
+import { loadRoutingMemory, saveRoutingMemory, selfHeal } from '../brain/routing-memory.js';
+import { appendEvent, readEvents, projectEvent } from '../eventslog.js';
 import { truncate, debugLog } from '../util.js';
 
 // Version always comes from package.json so the banner can never drift from the release.
@@ -54,7 +56,7 @@ export function fmtTok(n) {
 // ── Slash commands (pure, testable) ──────────────────────────────────────────
 
 export const SLASH_COMMANDS = [
-  'help', 'new', 'clear', 'screen', 'compact', 'context', 'map', 'model', 'gateways', 'cost',
+  'help', 'new', 'clear', 'screen', 'compact', 'context', 'map', 'model', 'gateways', 'cost', 'stats', 'effort', 'events',
   'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'diff', 'hooks', 'docs', 'rename', 'branch', 'fork', 'share', 'verbosity', 'theme', 'output-style', 'statusline', 'why', 'compare', 'memory', 'experience', 'learn', 'review',
   'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit',
 ];
@@ -71,6 +73,9 @@ export const SLASH_DESCRIPTIONS = {
   model: 'Pin a gateway first (e.g. /model kilo)',
   gateways: 'Health-probe the keyless chain',
   cost: 'Usage: brain calls, est. tokens, $0.00',
+  stats: 'Usage dashboard — per-task token ledger, gateway mix, project history',
+  effort: 'low | medium | high — turn budget + reply room per task (/effort high)',
+  events: 'Tail the structured event log (.buddy/events.jsonl) — /events 30',
   permissions: 'Show session approvals',
   todo: "Show Buddy's current plan",
   tools: "List Buddy's tools",
@@ -107,6 +112,21 @@ export const SLASH_DESCRIPTIONS = {
   quit: 'Leave',
   exit: 'Leave',
 };
+
+/** /effort — presets per level. Exported for tests + the /effort surface. */
+export const EFFORT_PRESETS = {
+  low: { level: 'low', maxSteps: 8, maxTokens: 900 },
+  medium: { level: 'medium', maxSteps: 14, maxTokens: 1500 },
+  high: { level: 'high', maxSteps: 24, maxTokens: 2200 },
+};
+
+/** Apply an effort preset to a live session's chat.effort (pure side-effect on the ref). */
+export function applyEffort(chat, level) {
+  const p = EFFORT_PRESETS[String(level || '').toLowerCase()];
+  if (!p) return false;
+  Object.assign(chat.effort, p);
+  return true;
+}
 
 /** /statusline — fill a template: {branch} {gateway} {ctx} {session} {todo} {cwd}. Pure. */
 export function renderStatusline(template, ctx = {}) {
@@ -197,7 +217,7 @@ function makeHarness(root) {
 }
 
 /** Create a chat session bound to a workspace root. */
-export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {}, repoMap = null } = {}) {
+export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {}, repoMap = null, effort = null } = {}) {
   const { tools, todoState, mcp, shells, skills, userToolWarnings } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved });
   const harness = makeHarness(root);
   // Hooks: the deterministic guarantee layer (.buddy/settings.json). One
@@ -207,7 +227,7 @@ export async function createBuddySession({ root = process.cwd(), router, yolo = 
   const { perms, warnings: permissionWarnings } = loadPermissions(root);
   // todoState is shared: the todo tool writes it (local.js), compaction reads
   // it (todo v2 plan anchor) — one object, one truth.
-  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, todoState, hooks, permissions: perms, yolo, root, onEvent, repoMap });
+  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, todoState, hooks, permissions: perms, yolo, root, onEvent, repoMap, effort });
   if (resumeFrom) {
     for (const m of resumeMessages(loadSession(resumeFrom))) session.messages.push(m);
   }
@@ -310,6 +330,9 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
   // replaces it with JSONL events (the machine-readable transcript).
   const render = jsonModes ? () => {} : makeRenderer({ quiet });
   const repoMapProvider = config.chat?.repoMap === false ? null : createRepoMapProvider(root, { maxChars: config.chat?.repoMapChars || 2800 });
+  // Structured event log (v0.25.0): CI one-shots write the same JSONL trail
+  // as the REPL — a cascade failure in Actions gets the same debugging story.
+  const eventsLogOn = config.chat?.eventsLog !== false;
   const { chat, hooks } = await createBuddySession({
     root,
     router,
@@ -321,6 +344,7 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
     onEvent: (ev) => {
       events.push(ev);
       render(ev);
+      if (eventsLogOn) appendEvent(root, projectEvent(ev));
       if (fmt === 'stream-json') {
         // One JSON object per line, as events happen — CI-friendly streaming.
         const slim = {
@@ -441,12 +465,25 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   if (themeSetting) setTheme(themeSetting);
   const verbosityRef = { level: getChatSetting(root, 'verbosity', 'summary') };
   const statuslineRef = { template: getChatSetting(root, 'statusline', '') };
+  // Observability & routing (v0.25.0):
+  //   effort — persisted level (chat.effort setting) retunes the loop live
+  //   events log — every tool/denial/compaction/turn as JSONL (chat.eventsLog, default on)
+  //   self-healing — learned gateway latencies (.buddy/routing.json) reorder the chain
+  const eventsLogOn = getChatSetting(root, 'eventsLog', true) !== false;
+  const selfHealingOn = getChatSetting(root, 'selfHealing', true) !== false;
+  // Effort + learned routing are applied AFTER the session exists (the effort
+  // ref is created inside createChat). Silent on fresh installs — nothing learned yet.
+  const persistedEffort = getChatSetting(root, 'effort', 'medium');
+  let healedNote = false;
+  const routingMemAtStart = loadRoutingMemory(root);
+  if (selfHealingOn) healedNote = selfHeal(router, routingMemAtStart, { enabled: true });
 
   const { chat, tools, todoState, mcp, shells, skills: skillCatalog, hooks: hookRunner, userToolWarnings, permissions: perms, permissionWarnings } = await createBuddySession({
     root,
     router,
     modes,
     resumeFrom,
+    effort: { level: 'medium', maxSteps: 14, maxTokens: 1500 },
     repoMap: config.chat?.repoMap === false ? null : createRepoMapProvider(root, { maxChars: config.chat?.repoMapChars || 2800 }),
     onPlanApproved: ({ saved }) => {
       console.log(`\n  ${c.green('✓ plan approved')} — exited plan mode${saved ? c.gray(` · saved to ${path.relative(root, saved)}`) : ''}\n`);
@@ -475,6 +512,9 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     },
     onEvent: (ev) => {
       events.push(ev);
+      // Structured event log (v0.25.0): the machine-readable twin of the
+      // transcript — tool calls, denials, compactions, errors as JSONL.
+      if (eventsLogOn) appendEvent(root, projectEvent(ev));
       if (ev.type === 'tool') {
         toolCallsThisTurn += 1;
         rl.setBusy(`working · ${toolCallsThisTurn} tool call${toolCallsThisTurn === 1 ? '' : 's'}${msgQueue.length ? ` · ${msgQueue.length} queued` : ''}`);
@@ -494,6 +534,15 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   // it returns. (v0.8.1 fix — this block used to sit before the destructure,
   // a temporal-dead-zone ReferenceError on every interactive startup.)
   printMcpStatus(mcp);
+
+  // v0.25.0 startup notes: effort level + self-healed chain order (only when
+  // they actually changed something — no noise on fresh installs).
+  if (applyEffort(chat, persistedEffort) && persistedEffort !== 'medium') {
+    console.log(c.gray(`  effort: ${persistedEffort} (from settings) — /effort to change`));
+  }
+  if (healedNote) {
+    console.log(c.gray(`  routing: learned order applied — ${router.order.join(' → ')} (chat.selfHealing=false to disable)`));
+  }
 
   // SessionStart hook (fire-and-forget — a slow hook must not delay the REPL).
   if (hookRunner?.size) {
@@ -593,8 +642,11 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
               ['/context', 'token budget breakdown — system prompt, harness, conversation'],
               ['/map', 'repo map — files + top symbols, ranked by git churn (aider-style)'],
               ['/cost', 'usage: brain calls, est. tokens, $0.00'],
+              ['/stats', 'usage dashboard — per-task token ledger, gateway mix, project history'],
+              ['/effort', 'low | medium | high — turn budget + reply room per task'],
+              ['/events', 'tail the structured event log (.buddy/events.jsonl)'],
               ['/model <name>', 'pin a gateway first (e.g. /model kilo) · /model auto restores'],
-              ['/gateways', 'health-probe the keyless chain'],
+              ['/gateways', 'health-probe the keyless chain (feeds self-healing routing)'],
             ].map(([k, d]) => `    ${c.bold(k.padEnd(20))} ${c.dim(d)}`),
             `  ${c.bold(c.cyan('Harness (Harness²)'))}`,
             ...[
@@ -702,6 +754,78 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         );
         break;
       }
+      case 'stats': {
+        const u = chat.usage();
+        const tl = chat.taskLog();
+        // Project history (best-effort): this project's session transcripts.
+        let hist = { files: 0, kb: 0 };
+        try {
+          const dir = path.join(root, '.buddy', 'sessions');
+          const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl')) : [];
+          hist.files = files.length;
+          for (const f of files) hist.kb += Math.round(fs.statSync(path.join(dir, f)).size / 102.4) / 10;
+        } catch { /* history is best-effort */ }
+        const gwMix = Object.entries(u.byGateway).map(([g, v]) => `${g} ×${v.calls}`).join(' · ') || c.dim('—');
+        const taskRows = [...tl].reverse().slice(0, 8).map((t) => [
+          truncate(t.task, 46),
+          String(t.steps),
+          String(t.calls),
+          `~${fmtTok(t.tokIn)}/~${fmtTok(t.tokOut)}`,
+          `${(t.durationMs / 1000).toFixed(1)}s`,
+          t.error ? c.red('err') : c.green('ok'),
+        ]);
+        say(
+          [
+            '',
+            `  ${c.bold('session')}      ${u.calls} brain calls · ~${fmtTok(u.tokIn)} tok in · ~${fmtTok(u.tokOut)} out · ${chat.compactCount} compactions · spend $0.00`,
+            `  ${c.bold('gateway mix')}  ${gwMix}`,
+            `  ${c.bold('tasks run')}    ${tl.length}${tl.length ? c.gray(` (last ${Math.min(tl.length, 8)} below)`) : ''}`,
+            `  ${c.bold('project')}      ${hist.files} session${hist.files === 1 ? '' : 's'} · ${hist.kb}kB of transcripts`,
+            ...(taskRows.length
+              ? ['', c.dim('  task · steps · calls · tok in/out · time · status'), ...taskRows.map((r) => '    ' + renderTable([r]).trim())]
+              : [c.dim('\n  no tasks yet this session — the ledger fills as you work')]),
+            '',
+          ].join('\n')
+        );
+        break;
+      }
+      case 'effort': {
+        if (!args) {
+          const e = chat.effort;
+          say(
+            `\n  effort: ${c.bold(e.level)} — ${e.maxSteps} steps/task · ~${e.maxTokens} tok replies\n` +
+              `  ${c.dim('low = quick chores (8 steps, tight replies) · medium = default · high = hard tasks (24 steps, more room)')}\n` +
+              `  ${c.dim('set it: /effort low | /effort medium | /effort high')}\n`
+          );
+          break;
+        }
+        if (!applyEffort(chat, args)) {
+          say(`\n  unknown effort "${args}" — choose: low · medium · high\n`);
+          break;
+        }
+        setChatSetting(root, 'effort', chat.effort.level);
+        say(`\n  ${c.green('✓ effort:')} ${c.bold(chat.effort.level)} — ${chat.effort.maxSteps} steps/task · ~${chat.effort.maxTokens} tok replies (applies from the next task, persisted)\n`);
+        break;
+      }
+      case 'events': {
+        const n = Math.min(Math.max(parseInt(args, 10) || 15, 1), 100);
+        const evs = readEvents(root, n);
+        if (!evs.length) {
+          say(`\n  no events logged yet — .buddy/events.jsonl fills after the first task\n  ${c.dim('disable: chat.eventsLog=false in .buddy/settings.json')}\n`);
+          break;
+        }
+        const detail = (e) => {
+          if (e.type === 'tool') return `${e.tool}${e.denied ? c.red(' DENIED') : ''}${e.gateway ? c.gray(` · ${e.gateway}`) : ''}`;
+          if (e.type === 'turn_end') return `${e.steps} steps · ${e.calls} calls · ~${fmtTok(e.tokIn)}/~${fmtTok(e.tokOut)} tok · ${(e.durationMs / 1000).toFixed(1)}s`;
+          if (e.type === 'error') return truncate(e.text || '', 60);
+          if (e.type === 'compaction') return `kept ${e.kept} · dropped ${e.dropped}${e.auto ? ' · auto' : ''}`;
+          if (e.type === 'user' || e.type === 'say') return `${e.chars} chars`;
+          return '';
+        };
+        const rows = evs.map((e) => [String(e.ts || '').slice(11, 19), e.type, detail(e)]);
+        say(`\n${c.bold('Event log')} ${c.dim('.buddy/events.jsonl — last ' + rows.length)}\n${renderTable(rows, { headers: ['time', 'event', 'detail'] })}\n`);
+        break;
+      }
       case 'model': {
         if (!args) {
           say(`\n  brain chain: ${router.order.map((n, i) => (i === 0 ? c.bold(n) : c.dim(n))).join(' → ')}\n  pin one: ${c.bold('/model <name>')} · restore: ${c.bold('/model auto')}\n`);
@@ -730,14 +854,27 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
                 new Promise((_, rej) => setTimeout(() => rej(new Error('timeout 8s')), 8000)),
               ]);
               const ok = String(out.text || '').toUpperCase().includes('BUDDY_OK');
-              return [ok ? c.green('✓') : c.yellow('?'), name, `${formatMs(Date.now() - t0)}`, `${out.model || '-'} ${ok ? 'round-trip OK' : 'unexpected reply'}`];
+              if (ok) router.noteLatency(name, Date.now() - t0); // feed the self-healing memory (v0.25.0)
+              const ema = router.latency.get(name);
+              return [ok ? c.green('✓') : c.yellow('?'), name, `${formatMs(Date.now() - t0)}`, ema ? `${formatMs(ema)} ema` : c.dim('—'), `${out.model || '-'} ${ok ? 'round-trip OK' : 'unexpected reply'}`];
             } catch (e) {
-              return [c.red('✗'), name, formatMs(Date.now() - t0), truncate(e.message, 48)];
+              return [c.red('✗'), name, formatMs(Date.now() - t0), c.dim('—'), truncate(e.message, 48)];
             }
           })
         );
         s.stop();
-        say(`\n${renderTable(rows, { headers: ['alive', 'gateway', 'time', 'model / note'] })}\n`);
+        // Persist probe latencies — /gateways doubles as the learning trigger.
+        try {
+          const snap = router.latencySnapshot();
+          if (Object.keys(snap).length) {
+            const mem = loadRoutingMemory(root);
+            for (const [g, v] of Object.entries(snap)) mem[g] = { ...mem[g], ...v, updatedAt: new Date().toISOString() };
+            saveRoutingMemory(root, mem);
+          }
+        } catch { /* learning is best-effort */ }
+        say(`\n${renderTable(rows, { headers: ['alive', 'gateway', 'probe', 'learned', 'model / note'] })}` +
+          `\n${c.dim('  learned = EMA of observed latencies (.buddy/routing.json) — the chain self-orders by it; pin one with /model <name>')}` +
+          `\n${c.dim('  offline-first: if every gateway fails, Buddy probes local Ollama automatically (chat.selfHealing=false disables learning)')}\n`);
         break;
       }
       case 'tools':
@@ -1594,6 +1731,24 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         } finally {
           rl.setBusy(null);
           busyLabel = null;
+        }
+        // v0.25.0 post-turn, best-effort, never blocks the queue:
+        //   routing memory — fold this turn's measured latencies into
+        //   .buddy/routing.json so the NEXT session starts smarter
+        //   turn_end — one structured line closing the turn in events.jsonl
+        //   (the task ledger already recorded it even on a thrown turn)
+        try {
+          const snap = router.latencySnapshot();
+          if (Object.keys(snap).length) {
+            const mem = loadRoutingMemory(root);
+            for (const [g, v] of Object.entries(snap)) mem[g] = { ...mem[g], ...v, updatedAt: new Date().toISOString() };
+            saveRoutingMemory(root, mem);
+          }
+        } catch { /* learning is best-effort */ }
+        if (eventsLogOn) {
+          const tl = chat.taskLog();
+          const last = tl[tl.length - 1];
+          if (last) appendEvent(root, projectEvent({ type: 'turn_end', ...last }));
         }
         // Interrupt = stop everything: the turn AND anything still queued.
         if (out?.aborted && msgQueue.length) {

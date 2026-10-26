@@ -27,6 +27,7 @@ import { runDepAudit } from './skills/dep-auditor.js';
 import { runIssueTriage } from './skills/issue-triage.js';
 import { runReleaseNotes } from './skills/release-notes.js';
 import { startRepl, runOneShot, VERSION } from './terminal/repl.js';
+import { cmdUpdate } from './update.js';
 import { latestSession, findSession } from './session.js';
 import { importSession } from './session.js';
 import { startMcpServer } from './mcpserver.js';
@@ -52,6 +53,8 @@ Local coding agent (Buddy Code — like Claude Code, in your terminal):
   engineer-buddy -r <name>              resume a named session (see /rename)
   engineer-buddy init                   scaffold .buddy/harness/ (systemprompt, guardrails,
                                         MEMORY.md, tool guidance, skills)
+  engineer-buddy update [--check]       self-update from the latest git tag
+                                        (--check reports only; --force overrides dirty-tree refusal)
 
 In the REPL: /help for commands · !cmd runs your own shell · #note saves to
 project memory · Ctrl+C interrupts the running task (twice quits).
@@ -414,6 +417,7 @@ async function cmdMcpServe(argv) {
     if (cmd === 'ask') process.exit(await cmdAsk(argv));
     if (cmd === 'mcp-serve') process.exit(await cmdMcpServe(argv));
     if (cmd === 'import') process.exit(await cmdImport(argv));
+    if (cmd === 'update') process.exit(await cmdUpdate(argv));
     usage();
     process.exit(2);
   } catch (e) {

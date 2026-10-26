@@ -97,6 +97,7 @@ export function createChat({
   permissions = null, // rules engine (src/permissions.js) — deny/allow/defaultMode policy
   yolo = false, // /yolo or CLI flag — flips remaining 'ask' verdicts to allow
   root = process.cwd(), // workspace root — the audit trail lives here
+  effort = null, // mutable { level, maxSteps, maxTokens } — /effort low|medium|high retunes the loop live
   onEvent = () => {},
 }) {
   const byName = new Map(tools.map((t) => [t.name, t]));
@@ -121,6 +122,17 @@ export function createChat({
   // can't hoard base64 forever.
   const imageStore = new Map();
   const IMAGE_TOKEN_RE = /⟪img:[^⟫]*⟫/g;
+  // Effort levels (v0.25.0): low = quick chores (fewer steps, tighter
+  // replies), medium = the historic defaults, high = hard tasks (more steps,
+  // more reply room). Mutable by reference so /effort retunes the NEXT turn
+  // without rebuilding the session.
+  const effortRef = effort || { level: 'medium', maxSteps: maxStepsPerTurn, maxTokens };
+  // Per-task usage ledger (v0.25.0): /cost shows the whole session; this
+  // shows what EACH task cost — the $0 story per line item ("this refactor:
+  // 9 brain calls, ~41k tok in, ~3k out, 52s"). Diff of the accumulators
+  // around the turn — zero double-counting with compaction calls included.
+  const tasks = [];
+  const TASK_LOG_CAP = 100;
   function registerImage(name, dataUrl) {
     const token = `⟪img:${imageStore.size + 1}:${name}⟫`;
     imageStore.set(token, dataUrl);
@@ -261,8 +273,10 @@ export function createChat({
     const history = [systemMsg(), ...messages];
     // Plan mode raises the ceiling: a full markdown plan inside one JSON
     // string is token-heavy, and a truncated escape = protocol violation
-    // (v0.9.2 live-test lesson).
-    const maxTok = modes?.plan ? Math.max(maxTokens, 2500) : maxTokens;
+    // (v0.9.2 live-test lesson). Effort (v0.25.0): maxTokens follows the
+    // level; plan mode's floor still wins when it is higher.
+    const baseTok = effortRef.maxTokens || maxTokens;
+    const maxTok = modes?.plan ? Math.max(baseTok, 2500) : baseTok;
     const out = await router.chat(toWire(history), { maxTokens: maxTok });
     // Usage telemetry (the /cost surface) — real tokens when the gateway
     // reports them, chars ÷ 4 estimate otherwise.
@@ -282,10 +296,10 @@ export function createChat({
   }
 
   /**
-   * Run one user turn to completion.
+   * Run one user turn to completion (wrapped by turn() for the task ledger).
    * @returns {{said:string|null, steps:number}}
    */
-  async function turn(userText, { signal = null, skill = null, anchor = null, images = [] } = {}) {
+  async function turnImpl(userText, { signal = null, skill = null, anchor = null, images = [] } = {}) {
     // UserPromptSubmit hook: exit 2 refuses the prompt BEFORE it enters the
     // conversation or costs a brain call (deterministic gatekeeper).
     if (hooks) {
@@ -322,8 +336,9 @@ export function createChat({
       skillRestriction = { name: skill.name, allowed: new Set([...skill.allowedTools, 'skill', 'say']) };
     }
     // Dynamic loop bound: an approved plan grants fresh steps so the approval
-    // can flow straight into implementation (planmode.js contract).
-    let stepLimit = maxStepsPerTurn;
+    // can flow straight into implementation (planmode.js contract). Effort
+    // (v0.25.0): the level owns the base step budget.
+    let stepLimit = effortRef.maxSteps || maxStepsPerTurn;
     let planNudged = false; // mid-turn wrap-up nudge fires once
 
     for (let step = 1; step <= stepLimit; step++) {
@@ -552,10 +567,51 @@ export function createChat({
     onEvent({
       type: 'error',
       text: modes?.plan
-        ? `Turn budget reached (${maxStepsPerTurn} steps) with no plan approved. Plan mode is still ON — say "continue" and I will call exit_plan with the plan.`
-        : `Turn budget reached (${maxStepsPerTurn} steps). I paused mid-task — say "continue" to keep going.`,
+        ? `Turn budget reached (${stepLimit} steps) with no plan approved. Plan mode is still ON — say "continue" and I will call exit_plan with the plan.`
+        : `Turn budget reached (${stepLimit} steps). I paused mid-task — say "continue" to keep going.`,
     });
-    return { said: null, steps: maxStepsPerTurn, error: false };
+    return { said: null, steps: stepLimit, error: false };
+  }
+
+  /**
+   * turn() — the ledger wrapper. Diff the usage accumulators around one
+   * turn → a per-task line (/stats). Records even on throw, then rethrows:
+   * an account of a crashed turn is exactly what you want when debugging.
+   */
+  async function turn(userText, opts = {}) {
+    const t0 = Date.now();
+    const start = { calls: usage.calls, tokIn: usage.tokIn, tokOut: usage.tokOut };
+    const gwStart = Object.fromEntries(Object.entries(usage.byGateway).map(([g, v]) => [g, { ...v }]));
+    let out = null;
+    try {
+      out = await turnImpl(userText, opts);
+      return out;
+    } finally {
+      const byGateway = {};
+      for (const [g, v] of Object.entries(usage.byGateway)) {
+        const s = gwStart[g];
+        const d = { calls: v.calls - (s?.calls || 0), tokIn: v.tokIn - (s?.tokIn || 0), tokOut: v.tokOut - (s?.tokOut || 0) };
+        if (d.calls > 0) byGateway[g] = d;
+      }
+      tasks.push({
+        ts: new Date().toISOString(),
+        task: truncate(String(opts?.anchor ?? userText ?? '').replace(/\s+/g, ' '), 120),
+        steps: out?.steps ?? 0,
+        said: out?.said ?? null,
+        error: Boolean(out?.error),
+        calls: usage.calls - start.calls,
+        tokIn: usage.tokIn - start.tokIn,
+        tokOut: usage.tokOut - start.tokOut,
+        durationMs: Date.now() - t0,
+        byGateway,
+      });
+      while (tasks.length > TASK_LOG_CAP) tasks.shift();
+    }
+  }
+
+  /** Per-task usage ledger, oldest first (capped at the last 100 tasks). */
+  function taskLog() {
+    return tasks.map((t) => ({ ...t, byGateway: { ...t.byGateway } }));
   }
 
   /** Context breakdown for /context — where the window actually goes. */
@@ -596,8 +652,10 @@ export function createChat({
     get messages() { return messages; },
     get compactCount() { return compactCount; },
     get alwaysApproved() { return [...alwaysApproved]; },
+    get effort() { return effortRef; },
     historyChars,
     contextBreakdown,
+    taskLog,
     usage() {
       return { ...usage, byGateway: { ...usage.byGateway } };
     },

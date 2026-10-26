@@ -37,18 +37,39 @@ export function buildGateways(config) {
 export class GatewayRouter {
   /**
    * @param {Map<string, object>} gateways name -> gateway adapter
-   * @param {object} opts { gatewayOrder, failureThreshold, cooldownMs, maxRoundTrips }
+   * @param {object} opts { gatewayOrder, failureThreshold, cooldownMs, maxRoundTrips,
+   *   offlineFallback: async () => adapter|null — engaged ONCE after every
+   *   gateway failed every round trip; a truthy adapter is registered and
+   *   gets one full extra round (offline-first: ollama on a plane, v0.25.0) }
    */
-  constructor(gateways, { gatewayOrder = [], failureThreshold = 2, cooldownMs = 120000, maxRoundTrips = 2 } = {}) {
+  constructor(gateways, { gatewayOrder = [], failureThreshold = 2, cooldownMs = 120000, maxRoundTrips = 2, offlineFallback = null } = {}) {
     this.gateways = gateways;
     this.order = (gatewayOrder.length ? gatewayOrder : [...gateways.keys()]).filter((n) => gateways.has(n));
     if (!this.order.length) this.order = [...gateways.keys()];
     this.failureThreshold = failureThreshold;
     this.cooldownMs = cooldownMs;
     this.maxRoundTrips = maxRoundTrips;
+    this.offlineFallback = offlineFallback;
     this.state = new Map(); // name -> { failures, openUntil }
     for (const n of this.order) this.state.set(n, { failures: 0, openUntil: 0 });
     this.lastUsed = null;
+    this.latency = new Map(); // name -> EMA ms (self-healing routing, v0.25.0)
+    this.offlineFallbackUsed = false; // one engagement per router — a dead machine stays dead
+  }
+
+  /** Fold one latency observation into the EMA (α = 0.3). Never throws. */
+  noteLatency(name, ms) {
+    const v = Number(ms);
+    if (!name || !Number.isFinite(v) || v <= 0) return;
+    const clamped = Math.min(Math.max(v, 5), 300000);
+    const prev = this.latency.get(name);
+    const ema = prev === undefined ? clamped : Math.round(prev * 0.7 + clamped * 0.3);
+    this.latency.set(name, ema);
+  }
+
+  /** { name -> ema } view for persistence (routing-memory.js). */
+  latencySnapshot() {
+    return Object.fromEntries([...this.latency.entries()].map(([k, v]) => [k, { ema: v }]));
   }
 
   _isOpen(name) {
@@ -160,6 +181,7 @@ export class GatewayRouter {
           const out = await gw.chat(prepared, opts);
           const latencyMs = Date.now() - t0;
           this._recordSuccess(name);
+          this.noteLatency(name, latencyMs);
           return { ...out, gateway: name, latencyMs, attempts, round };
         } catch (e) {
           const latencyMs = Date.now() - t0;
@@ -184,6 +206,38 @@ export class GatewayRouter {
             }
           }
         }
+      }
+    }
+    // Offline-first (v0.25.0): every keyless gateway failed — maybe the
+    // network is gone entirely. Engage the fallback factory ONCE (probe
+    // localhost ollama, wired in brain/index.js); if a local brain answers,
+    // register it into the chain and give it one full round. A failed probe
+    // returns null and we fall through to the honest error.
+    if (this.offlineFallback && !this.offlineFallbackUsed) {
+      this.offlineFallbackUsed = true;
+      try {
+        const adapter = await this.offlineFallback();
+        if (adapter?.chat) {
+          const name = adapter.name || 'offline';
+          this.gateways.set(name, adapter);
+          if (!this.order.includes(name)) this.order.push(name);
+          this.state.set(name, { failures: 0, openUntil: 0 });
+          debugLog(`router: offline fallback engaged → ${name}, one extra round`);
+          for (let round = 1; round <= this.maxRoundTrips; round++) {
+            const t0 = Date.now();
+            try {
+              const out = await adapter.chat(messages, opts);
+              const latencyMs = Date.now() - t0;
+              this._recordSuccess(name);
+              this.noteLatency(name, latencyMs);
+              return { ...out, gateway: name, latencyMs, attempts, round, offline: true };
+            } catch (e) {
+              attempts.push({ gateway: name, ok: false, latencyMs: Date.now() - t0, error: e.message || String(e) });
+            }
+          }
+        }
+      } catch (e) {
+        debugLog(`router: offline fallback probe failed: ${e.message}`);
       }
     }
     // Final report covers EVERY gateway in the chain: tried-and-failed AND
