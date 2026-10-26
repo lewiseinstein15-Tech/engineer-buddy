@@ -353,7 +353,12 @@ export function createInputBox({
     if (submitted.trim()) {
       if (history[0] !== submitted) history.unshift(submitted);
       if (history.length > historySize) history.pop();
-      r.print(`  ${SEM.narrate('❯')} ${submitted}`); // echo into scrollback — violet: the human spoke
+      // echo into scrollback — violet: the human spoke. The trailing \n is
+      // NOT cosmetic: print() holds unterminated text in its pending buffer,
+      // so the next print (a tool card has no leading \n) would glue onto
+      // the echo and both would render as one wrapped line (caught live by
+      // the v0.31.0 transcript capture — the buffer showed echo+todo fused).
+      r.print(`  ${SEM.narrate('❯')} ${submitted}\n`);
       handlers.line?.(submitted);
     } else {
       r.render();

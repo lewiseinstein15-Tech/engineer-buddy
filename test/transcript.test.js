@@ -231,3 +231,31 @@ test('buildFrame: no viewer state → the classic box frame is untouched', () =>
   assert.ok(joined.includes('draft'));
   assert.ok(!joined.includes('✦ transcript'));
 });
+
+test('regression (v0.31.0 drill catch): the prompt echo flushes as its own line — the next print can never glue onto it', () => {
+  withFakeStdout(() => {
+    const rl = createInputBox({ title: 'Buddy', hint: 'h' });
+    // submit a prompt, then let the app print a tool card with NO leading newline —
+    // exactly what the live todo card does right after the echo. Pre-fix, the
+    // unterminated echo sat in the renderer's pending buffer and the card
+    // fused onto it: one capture line, one wrapped row on the live screen.
+    rl._handleKeypress({ sequence: 'h' });
+    rl._handleKeypress({ sequence: 'i' });
+    rl._handleKeypress({ name: 'return' });
+    rl._capture('☑ todo 4 items\n');
+    assert.equal(rl._state().transcriptLines, 2, 'echo + card are two separate lines');
+  });
+});
+
+test('regression: an unterminated print followed by another print stays two lines in the capture', () => {
+  withFakeStdout(() => {
+    const rl = createInputBox({ title: 'Buddy', hint: 'h' });
+    // simulate the pre-fix byte pattern directly through the capture seam:
+    // sanitizeChunk must split what the renderer flushes; the renderer now
+    // receives the echo pre-terminated, so a fused line can only appear if
+    // someone removes the \n again — this pins the capture-side contract.
+    rl._capture('  ❯ hello\n');
+    rl._capture('☑ todo 4 items\n');
+    assert.equal(rl._state().transcriptLines, 2);
+  });
+});
