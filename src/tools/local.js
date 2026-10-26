@@ -15,6 +15,7 @@ import { renderTextDiff, renderDiff, diffLines } from '../terminal/difflib.js';
 import { createTestTool } from './testrunner.js';
 import { createSymbolIndexProvider, searchDefs, formatDef, findRefsIn } from '../agent/symbols.js';
 import { buildGitTool } from './gittool.js';
+import { buildGitWriteTool } from './gitwrite.js';
 import { createLspHub, lspExtFor, formatDiagnostics } from '../agent/lsp.js';
 import { snapshotPaths } from '../agent/checkpoints.js';
 import { getChatSetting } from '../settings.js';
@@ -115,8 +116,8 @@ export function blockedBashReason(cmd) {
   if (/\b(curl|wget|nc|netcat|ssh|scp|ftp|telnet)\b/.test(c)) return 'network commands are not allowed in bash — fetch content through the user instead';
   if (/\b(chmod|chown|ln|mount|umount)\b/.test(c)) return 'permission/link/mount changes are not allowed';
   if (/\beval\b|\bexec\b/.test(c)) return 'eval/exec is not allowed';
-  if (/\bgit\s+(push|reset|rebase|merge|clean|filter-branch|checkout\s+--\s+\.|amend)/.test(c)) return 'history- or remote-changing git is not allowed (only read-only git: status/diff/log/branch/show)';
-  if (/\bgit\s+commit\b/.test(c)) return 'git commit is not allowed — the user commits; you only report what changed';
+  if (/\bgit\s+(push|reset|rebase|merge|clean|filter-branch|checkout\s+--\s+\.|amend)/.test(c)) return 'history- or remote-changing git is not allowed in bash (read-only git: status/diff/log/branch/show; commit/merge/rebase belong to the approval-gated git_write tool)';
+  if (/\bgit\s+commit\b/.test(c)) return 'git commit is not allowed in bash — use the git_write tool (op:"commit"), which previews the staged diff and asks the user first';
   if (/^:(\(\)\s*\{.*)?\|/.test(c)) return 'fork bomb pattern is not allowed';
   return null;
 }
@@ -492,6 +493,7 @@ function fmtResult(r) {
 export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { latest: null }, symbolIndex = null, lspEnabled = true } = {}) {
   const testTool = createTestTool({ root: scope.root });
   const gitTool = buildGitTool({ root: scope.root });
+  const gitWriteTool = buildGitWriteTool({ root: scope.root });
   // Symbol index (v0.16.0) — lazy provider, shared TTL cache; read-only.
   const syms = symbolIndex || createSymbolIndexProvider(scope.root);
   // LSP hub (v0.17.0) — lazy per-language connections to the repo's own
@@ -538,6 +540,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
   return [
     testTool,
     gitTool,
+    gitWriteTool,
     {
       name: 'todo',
       description:
@@ -825,7 +828,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     {
       name: 'bash',
       description:
-        'Run ONE simple command (no pipes/redirects/chains/sudo/network/git-write). Use for tests, builds, version checks, read-only git (status/diff/log/branch/show).',
+        'Run ONE simple command (no pipes/redirects/chains/sudo/network; git is read-only here — commit/merge/rebase via the git_write tool). Use for tests, builds, version checks, read-only git (status/diff/log/branch/show).',
       args: '{"command":"npm test"}',
       risky: true,
       render: (a) => `bash ${a?.command}`,

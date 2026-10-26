@@ -4,7 +4,7 @@
 // calls on `git log` parsing. One tool, six READ-ONLY ops (status, diff,
 // log, blame, branch, show), output parsed and capped so the model sees the
 // diagnosis instead of raw porcelain. Write operations are refused BY DESIGN
-// — git mutations go through the bash gate (or the user's own terminal).
+// — since v0.27.0 they have their own approval-gated home: the git_write tool.
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { truncate } from '../util.js';
@@ -48,7 +48,7 @@ export function gitOp(root, op, args = {}, { maxChars = 6000 } = {}) {
   const spec = READ_OPS[op];
   if (!spec) {
     const list = Object.keys(READ_OPS).join(', ');
-    return `ERROR: unknown git op "${op}" — read-only ops: ${list}. Write operations (commit/push/merge/…) are deliberate work for the bash tool with its approval gate.`;
+    return `ERROR: unknown git op "${op}" — read-only ops: ${list}. Write operations (commit/push/merge/…) belong to the approval-gated git_write tool.`;
   }
   if (spec.args.includes('path') && !args?.path) return 'ERROR: path required for this op';
   const r = runGit(root, spec.git(args));
@@ -70,7 +70,7 @@ export function buildGitTool({ root = process.cwd(), maxCalls = 8 } = {}) {
   return {
     name: 'git',
     description:
-      'READ-ONLY git in one tool: status, diff (stat), diff_patch, log, blame, branch, show. Parsed and capped — no shell soup. Write ops (commit/push/merge) are refused here on purpose: they belong to the bash approval gate.',
+      'READ-ONLY git in one tool: status, diff (stat), diff_patch, log, blame, branch, show. Parsed and capped — no shell soup. Write ops (commit/merge/…) live in the git_write tool, which previews and asks first.',
     args: '{"op":"diff","path":"src/app.js"}  ·  {"op":"log","count":20}  ·  {"op":"blame","path":"src/app.js"}',
     maxCalls,
     render: (a) => `git ${a?.op || '?'}${a?.path ? ` ${a.path}` : ''}${a?.ref ? ` ${a.ref}` : ''}`,

@@ -53,6 +53,16 @@ export function subjectFor(tool, args = {}) {
       return String(args?.command ?? '');
     case 'bash_bg':
       return String(args?.command ?? '');
+    case 'git_write':
+      // Subject is "<op> <first target>" so rules read naturally:
+      //   allow: ["git_write(commit)", "git_write(stage src/*)"]
+      //   deny:  ["git_write(restore)"]
+      {
+        const op = String(args?.op ?? '');
+        const t = args?.paths ?? args?.branch ?? args?.upstream ?? args?.ref ?? args?.name ?? '';
+        const first = Array.isArray(t) ? t[0] : t;
+        return first ? `${op} ${String(first)}` : op;
+      }
     case 'WebFetch':
     case 'web_fetch':
     case 'http':
@@ -87,7 +97,11 @@ function ruleMatches(rule, tool, args) {
     return host === want || host.endsWith(`.${want}`);
   }
   const subject = subjectFor(tool, args);
-  return globMatch(spec, subject) || (tool.toLowerCase().startsWith('bash') && subject.startsWith(spec.replace(/\*+$/, '').trimEnd()) && spec.endsWith('*'));
+  if (globMatch(spec, subject)) return true;
+  // git_write subjects are "<op> <target>" — an op-level rule ("git_write(restore)")
+  // must also cover targeted calls ("restore ."), not only bare-op calls.
+  if (normTool(ruleTool) === 'gitwrite' && subject.startsWith(`${spec} `)) return true;
+  return tool.toLowerCase().startsWith('bash') && subject.startsWith(spec.replace(/\*+$/, '').trimEnd()) && spec.endsWith('*');
 }
 
 /**
