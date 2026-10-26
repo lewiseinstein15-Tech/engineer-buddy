@@ -448,7 +448,12 @@ export function createChat({
         }
         if (!parsed.ok || typeof parsed.value !== 'object' || !parsed.value || !parsed.value.tool) {
           messages.splice(-2);
-          onEvent({ type: 'error', text: `I could not format my own reply (protocol violation). Raw: ${truncate(res.text, 160)}` });
+          // Both raws matter for debugging: the first reply shows what the
+          // model originally tried, the retry shows what finally failed.
+          onEvent({
+            type: 'error',
+            text: `I could not format my own reply (protocol violation). First: ${truncate(res.text, 140)} Retry: ${truncate(retry.text, 140)}`,
+          });
           return { said: null, steps: step, error: true };
         }
         res = retry;

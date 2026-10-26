@@ -158,22 +158,28 @@ function decodeSloppyString(raw) {
 }
 
 /**
- * Last-resort shape-aware recovery for TERMINAL replies (say/finish/exit_plan)
- * whose string payload contains raw quotes — the one sloppiness control-char
- * escaping cannot fix (kilo's v0.9.5 live test: a say quoting search results,
- * `ERROR: unsafe path "/stats"`, left stray " inside the message string, so
- * string-aware scanning derailed and every parse failed). Rebuilds the payload
- * from the first quote after the known key to the last quote in the text,
- * re-escaping only what is actually broken. Non-terminal tools return null on
- * purpose — a broken fs_write goes to the repair retry, never to a silent,
- * mangled rebuild. Returns the parsed object or null — never throws.
+ * Last-resort shape-aware recovery for replies whose string payload derailed
+ * every string-aware scanner: raw quotes inside a string value (kilo's v0.9.5
+ * live test: a say quoting `"/stats"`) or MIXED escaping in shell commands
+ * (v0.29.1 drill lesson: a bash call that escaped `node -e \"` but later wrote
+ * raw `join(" ")` — extractJson's balanced scan closes the string early, and
+ * control-char escaping cannot realign it).
+ *
+ * Terminal tools (say/finish/exit_plan) rebuild their flat payload. bash
+ * rebuilds args.command — a command is approval-gated and audited, unlike a
+ * file write, and an aborted turn loses ALL the work, so a faithful rebuild
+ * is the lesser risk. fs_write/edit-style tools are deliberately NOT
+ * recoverable this way — a mangled file write is worse than a failed turn.
+ * Returns the parsed object or null — never throws.
  */
 export function recoverShapedReply(text) {
   const s = String(text ?? '');
   const tm = s.match(/"(?:tool|name)"\s*:\s*"([a-zA-Z_]+)"/);
-  if (!tm || !RECOVERABLE_TOOLS.has(tm[1])) return null;
+  if (!tm) return null;
   const tool = tm[1];
-  const keyOrder = tool === 'exit_plan' ? ['plan', 'summary'] : ['message', 'summary', 'text'];
+  if (tool !== 'bash' && !RECOVERABLE_TOOLS.has(tool)) return null;
+  const keyOrder =
+    tool === 'exit_plan' ? ['plan', 'summary'] : tool === 'bash' ? ['command'] : ['message', 'summary', 'text'];
   const out = { tool };
   let gotPayload = false;
   for (const key of keyOrder) {
@@ -183,11 +189,24 @@ export function recoverShapedReply(text) {
     if (open === -1) continue;
     const close = s.lastIndexOf('"');
     if (close <= open) continue;
+    // bash guard: the span must end at the JSON's structural tail. If there
+    // is prose (or more JSON) after the last quote, the span is a guess —
+    // refuse and let the protocol retry handle it.
+    if (tool === 'bash' && !/^[\s,"}\]]*$/.test(s.slice(close + 1))) continue;
     let inner = s.slice(open + 1, close);
     // If another "key": follows inside the span (payload listed before other
     // keys), cut the content at the boundary quote.
-    const nextKey = inner.match(/"\s*,\s*"(?:tool|args|name|message|summary|plan|text|result)"\s*:/);
+    const nextKey = inner.match(/"\s*,\s*"(?:tool|args|name|message|summary|plan|text|result|command)"\s*:/);
     if (nextKey) inner = inner.slice(0, nextKey.index);
+    // bash tail: a model that closed the shell quote with `\"}}` meant that
+    // escaped pair as BOTH the payload's closing quote and the JSON closer.
+    // The span cut leaves an odd trailing backslash + loses the quote —
+    // rebalance: drop the stray escape and restore the closing quote. An
+    // even run is a real escaped backslash and stays.
+    if (tool === 'bash' && /\\+$/.test(inner)) {
+      const run = /\\+$/.exec(inner)[0];
+      if (run.length % 2 === 1) inner = inner.slice(0, -run.length) + '"';
+    }
     const value = decodeSloppyString(inner);
     if (value === null) continue;
     out[key] = value;
@@ -197,6 +216,15 @@ export function recoverShapedReply(text) {
   if (tool === 'exit_plan') {
     if (!out.plan) out.plan = out.summary ?? '';
     if (!out.summary) out.summary = String(out.plan).split('\n')[0].trim().slice(0, 80) || 'plan';
+  }
+  if (tool === 'bash') {
+    // Quote-parity rebalance: models that conflate the shell-closing quote
+    // with the JSON closer (`... "done")"}}`) leave the command with an ODD
+    // number of double quotes — the last one was spent as the JSON closer.
+    // Restore it. An even count (or zero, e.g. plain `ls -la`) is intact.
+    const q = (out.command.match(/"/g) || []).length;
+    if (q % 2 === 1) out.command += '"';
+    return { tool: 'bash', args: { command: out.command } };
   }
   return out;
 }

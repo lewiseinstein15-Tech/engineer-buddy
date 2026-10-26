@@ -267,6 +267,43 @@ test('tryRepairJson: never rebuilds non-terminal tools (broken fs_write stays nu
   assert.equal(tryRepairJson(raw), null);
 });
 
+// ── v0.29.1: bash shaped recovery (real drill turn-abort, 2026-10-26) ────────
+// A bash call that escaped `node -e \"` at the start but wrote RAW quotes
+// later (`join(" ")`) derailed extractJson's balanced scan AND the control-char
+// pass; recoverShapedReply refused non-terminal tools, so the whole turn
+// aborted with "I could not format my own reply" after 10 good tool calls.
+const MIXED_BASH =
+  '{"tool":"bash","args":{"command":"node -e \\"const {tokenize} = require(\'./wf.js\'); const fs = require(\'fs\'); const text = fs.readFileSync(\'fixtures/sample.txt\', \'utf8\'); console.log(rows.map(r=>r.join(" ")).join("\\n"))\\"}}';
+const MIXED_COMMAND =
+  'node -e "const {tokenize} = require(\'./wf.js\'); const fs = require(\'fs\'); const text = fs.readFileSync(\'fixtures/sample.txt\', \'utf8\'); console.log(rows.map(r=>r.join(" ")).join("\n"))"'; // the model's JSON `\n` decodes to a REAL newline — faithful JSON semantics
+
+test('tryRepairJson: bash with mixed escaping rebuilds args.command (v0.29.1 drill case)', () => {
+  assert.deepEqual(tryRepairJson(MIXED_BASH), { tool: 'bash', args: { command: MIXED_COMMAND } });
+});
+
+test('tryRepairJson: bash rebuild keeps real newlines and shell quotes intact', () => {
+  const raw = '{"tool":"bash","args":{"command":"node -e "for (const f of ["a","b"]) console.log(f, "done")"}}';
+  const fixed = tryRepairJson(raw);
+  assert.deepEqual(fixed, { tool: 'bash', args: { command: 'node -e "for (const f of ["a","b"]) console.log(f, "done")"' } });
+});
+
+test('tryRepairJson: bash with prose after the JSON is refused (span would be a guess)', () => {
+  const raw =
+    '{"tool":"bash","args":{"command":"node -e "const x = require(\'p.js\')"}} I hope this helps — let me explain the fix.';
+  assert.equal(tryRepairJson(raw), null);
+});
+
+test('chat turn: mixed-escaping bash reply executes instead of aborting the turn', async () => {
+  const root = tmpRoot();
+  const { tools, harness } = makeBuddy(root);
+  const router = fakeRouter([MIXED_BASH, '{"tool":"say","message":"tokenized"}']);
+  const chat = createChat({ router, tools, harness, approval: async () => 'yes' });
+  const out = await chat.turn('verify the tokenizer');
+  assert.equal(out.said, 'tokenized', 'turn must complete, not abort');
+  assert.equal(router.calls.length, 2, 'one recovery + one say, no protocol retry needed');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test('normal mode: quoted say reaches the user as a say (kilo v0.9.5 transcript)', async () => {
   const root = tmpRoot();
   const { tools, harness } = makeBuddy(root);
