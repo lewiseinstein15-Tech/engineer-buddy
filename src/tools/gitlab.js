@@ -29,6 +29,10 @@ export class GitLabClient {
   async _req(path, { method = 'GET', body } = {}) {
     const url = path.startsWith('http') ? path : `${this.apiBase}${path}`;
     let lastErr = null;
+    // WRITES NEVER AUTO-RETRY (v0.35.0 drill catch, same rule as github.js):
+    // a timed-out POST may have landed — resending it can duplicate comments
+    // or MRs. Only idempotent GETs retry; writes fail fast and honestly.
+    const isRead = method === 'GET' || method === 'HEAD';
     for (let attempt = 1; attempt <= 3; attempt++) {
       let res;
       try {
@@ -43,6 +47,7 @@ export class GitLabClient {
         );
       } catch (e) {
         lastErr = new BuddyError(`gitlab: network error ${e.message}`, { code: 'NETWORK', cause: e });
+        if (!isRead) break; // writes: fail fast — the request may have landed
         await sleep(1000 * attempt);
         continue;
       }
@@ -59,7 +64,9 @@ export class GitLabClient {
         await sleep(Math.min(retryAfter * 1000, 60000));
         continue;
       }
-      if (res.status >= 500 && attempt < 3) {
+      if (res.status >= 500 && attempt < 3 && isRead) {
+        // reads: retry through transient 5xx. writes fall THROUGH to the
+        // honest HTTP-error path below — state unknown, never resend.
         await sleep(1500 * attempt);
         continue;
       }

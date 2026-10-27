@@ -279,6 +279,31 @@ function jsonRes(body, status = 200, headers = {}) {
 }
 
 describe('GitHubClient v0.35 reads (stubbed fetch)', () => {
+  test('WRITES never auto-retry: a timed-out POST may have landed — exactly one request', async () => {
+    // The v0.35.0 drill caught the old behavior red-handed: one pr_comment
+    // with a dead-upstream transport produced NINE identical POSTs (3 model
+    // calls × 3 client retries) on the mock's posted.log. A write that timed
+    // out MAY have succeeded server-side — resending it can double-post
+    // comments or open duplicate PRs. Contract: writes fail fast (1 request),
+    // the error surfaces honestly, the model/user decides on a retry.
+    const calls = stubFetch(() => { throw new Error('timeout after 30000ms'); });
+    const c = new GitHubClient({ token: 't', repo: 'acme/w' });
+    await assert.rejects(() => c.createComment(7, 'hello'), /network error/);
+    assert.equal(calls.length, 1, 'a write must fire exactly ONE request');
+    // and the 5xx twin: state unknown → never resend
+    const calls5xx = stubFetch(() => jsonRes({ message: 'boom' }, 502));
+    const c2 = new GitHubClient({ token: 't', repo: 'acme/w' });
+    await assert.rejects(() => c2.createPull({ head: 'a', base: 'b', title: 't', body: '' }), /502/);
+    assert.equal(calls5xx.length, 1, 'a 5xx write must fire exactly ONE request');
+    // reads keep their retry resilience (idempotent → safe to resend)
+    let n = 0;
+    const callsGet = stubFetch(() => (++n < 2 ? jsonRes({ message: 'bad gateway' }, 502) : jsonRes({ total_count: 0, workflow_runs: [] })));
+    const c3 = new GitHubClient({ token: 't', repo: 'acme/w' });
+    const raw = await c3.listActionRuns({});
+    assert.equal(n, 2);
+    assert.deepEqual(raw.workflow_runs, []);
+  });
+
   test('listActionRuns sends the branch filter; runsRows parses the envelope', async () => {
     const calls = stubFetch(() => jsonRes({ total_count: 1, workflow_runs: [{ status: 'completed', conclusion: 'failure', head_branch: 'main', name: 'CI', run_number: 3, created_at: '2026-01-01T00:00:00Z', html_url: 'https://run' }] }));
     const c = new GitHubClient({ token: 't', repo: 'acme/w' });
@@ -325,6 +350,13 @@ describe('GitHubClient v0.35 reads (stubbed fetch)', () => {
 });
 
 describe('GitLabClient (stubbed fetch)', () => {
+  test('MR writes never auto-retry (v0.35.0 drill contract, gitlab twin)', async () => {
+    const calls = stubFetch(() => { throw new Error('timeout after 30000ms'); });
+    const c = new GitLabClient({ token: 'gl-tok', repo: 'group/sub/api' });
+    await assert.rejects(() => c.createMrNote(3, 'hello'), /network error/);
+    assert.equal(calls.length, 1, 'a write must fire exactly ONE request');
+  });
+
   test('project path is URL-encoded; PRIVATE-TOKEN header present', async () => {
     const calls = stubFetch(() => jsonRes([]));
     const c = new GitLabClient({ token: 'gl-tok', repo: 'group/sub/api' });

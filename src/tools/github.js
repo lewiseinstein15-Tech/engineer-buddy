@@ -32,6 +32,11 @@ export class GitHubClient {
   async _req(path, { method = 'GET', body, raw = false, accept } = {}) {
     const url = path.startsWith('http') ? path : `${this.apiBase}${path}`;
     let lastErr = null;
+    // WRITES NEVER AUTO-RETRY (v0.35.0 drill catch): a timed-out POST may
+    // still have landed server-side — retrying it can double-post comments
+    // or open duplicate PRs. Only idempotent GETs (and the 401-anon fallback)
+    // retry; every write failure surfaces honestly so the model/user decides.
+    const isRead = method === 'GET' || method === 'HEAD';
     for (let attempt = 1; attempt <= 3; attempt++) {
       let res;
       try {
@@ -46,6 +51,7 @@ export class GitHubClient {
         );
       } catch (e) {
         lastErr = new BuddyError(`github: network error ${e.message}`, { code: 'NETWORK', cause: e });
+        if (!isRead) break; // writes: fail fast — the request may have landed
         await sleep(1000 * attempt);
         continue;
       }
@@ -65,7 +71,7 @@ export class GitHubClient {
         if (remaining === '0' && reset) {
           const waitMs = Math.min(Math.max(Number(reset) * 1000 - Date.now(), 2000), 60000);
           await sleep(waitMs);
-          continue;
+          continue; // rate-limit waits are safe for writes too (nothing landed)
         }
         const retryAfter = Number(res.headers.get('retry-after'));
         if (retryAfter) {
@@ -73,7 +79,9 @@ export class GitHubClient {
           continue;
         }
       }
-      if (res.status >= 500 && attempt < 3) {
+      if (res.status >= 500 && attempt < 3 && isRead) {
+        // reads: retry through transient 5xx. writes fall THROUGH to the
+        // honest HTTP-error path below — state unknown, never resend.
         await sleep(1500 * attempt);
         continue;
       }
