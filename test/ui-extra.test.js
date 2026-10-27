@@ -57,11 +57,13 @@ test('renderToolEvent: card includes preview and observation', () => {
   assert.match(out, /OK replaced/);
 });
 
-test('renderObservation: caps lines and reports the remainder', () => {
+test('renderObservation: caps lines and reports the remainder (v0.33 policy: tail kept)', () => {
   const many = Array.from({ length: 12 }, (_, i) => `L${i}`).join('\n');
   const out = renderObservation(many, { maxLines: 3 });
-  assert.match(out, /L0/);
-  assert.match(out, /\+9 more lines/);
+  assert.match(out, /L0/);            // head kept
+  assert.match(out, /L11/);           // v0.33: the TAIL stays visible (verdicts live there)
+  assert.match(out, /\+8 hidden lines/);
+  assert.match(out, /tail is kept/);
   assert.match(renderObservation(''), /no output/);
 });
 

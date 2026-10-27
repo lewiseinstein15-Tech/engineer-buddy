@@ -35,9 +35,10 @@ import readline from 'node:readline';
 import { createRenderer } from './renderer.js';
 import { c } from './ui.js';
 import { buildAuroraStrip, SEM } from './theme.js';
-import { charWidth, strWidth, wrapContent, truncateAnsi } from './text.js';
+import { charWidth, strWidth, wrapContent, truncateAnsi, lineStarts, posToLineCol, caretUp, caretDown } from './text.js';
 import { sanitizeChunk, applyViewerKey, buildTranscriptPanel, viewerBodyRows, VIEWER } from './transcript.js';
 import { isDoubleEscape, applyRewindMenuKey, buildRewindMenu } from './rewind.js';
+import { createVimState, applyVimKey } from './vim.js';
 
 export { charWidth, strWidth, wrapContent };
 
@@ -48,7 +49,7 @@ export { charWidth, strWidth, wrapContent };
 // ctx: { paletteOpen?, questionMode?, lastEscapeAt?, now? } — switches ↑/↓
 // from history to palette navigation; lastEscapeAt+now arm the double-esc
 // rewind chord (v0.32.0). Returns { action, data } where action ∈ insert|submit|
-// backspace|delete|left|right|home|end|kill-line|kill-word-before|history-prev|
+// newline|backspace|delete|left|right|home|end|kill-line|kill-word-before|history-prev|
 // history-next|complete|mode-cycle|palette-prev|palette-next|escape|rewind|
 // transcript|sigint|eof|null
 export function applyKey(key, ctx = {}) {
@@ -66,15 +67,26 @@ export function applyKey(key, ctx = {}) {
     if (isDoubleEscape(ctx.lastEscapeAt, ctx.now)) return { action: 'rewind' }; // v0.32.0: slow double-press
     return { action: 'escape' };
   }
-  if (name === 'return' || name === 'enter') return { action: 'submit' };
+  if (name === 'return' || name === 'enter') {
+    // WIRE TRUTH (v0.33.0): in raw mode the real Enter arrives as \r
+    // (readline: name 'return'). A literal LF byte arrives as name 'enter' /
+    // sequence '\n' — that byte IS ctrl+j, and it is what /terminal-setup
+    // teaches shift+enter to send, so it inserts a newline instead of
+    // submitting. alt+enter arrives as the coalesced ESC chord ESC+\r
+    // (meta on) — newline too. Unknown shapes default to submit, exactly
+    // today's behavior, so exotic terminals can never lose their Enter.
+    if (key.meta) return { action: 'newline' };
+    if (name === 'enter' || key.sequence === '\n') return { action: 'newline' };
+    return { action: 'submit' };
+  }
   if (name === 'backspace' || (key.ctrl && name === 'h')) return { action: 'backspace' };
   if (name === 'delete') return { action: 'delete' };
   if (name === 'left' || (key.ctrl && name === 'b')) return { action: 'left' };
   if (name === 'right' || (key.ctrl && name === 'f')) return { action: 'right' };
   if (name === 'home' || (key.ctrl && name === 'a')) return { action: 'home' };
   if (name === 'end' || (key.ctrl && name === 'e')) return { action: 'end' };
-  if (key.ctrl && name === 'u') return { action: 'kill-line' };
-  if (key.ctrl && name === 'k') return { action: 'kill-line' };
+  if (key.ctrl && name === 'u') return { action: 'kill-to-line-start' }; // v0.33.0: line-scoped (was: everything after cursor)
+  if (key.ctrl && name === 'k') return { action: 'kill-to-line-end' };  // v0.33.0: line-scoped
   if (key.ctrl && name === 'w') return { action: 'kill-word-before' };
   if (key.ctrl && name === 'o') return { action: 'verbose-toggle' }; // v0.30.0: expand/collapse the stream transcript
   if (key.ctrl && name === 'r') return { action: 'transcript' }; // v0.31.0: open the ctrl+r transcript viewer
@@ -188,14 +200,40 @@ export function buildFrame(state, cols) {
     const ph = truncateAnsi(c.dim(c.gray(String(state.placeholder ?? ''))), Math.max(1, TW - 2));
     shown = [ph + cursorBlock('')];
   } else {
-    const wrapped = wrapContent(state.text, TW);
-    // map absolute cursor to wrapped position
-    let remaining = state.cursor;
-    let li = 0; let ci = 0;
-    for (let i = 0; i < wrapped.length; i++) {
-      const wLen = strWidth(wrapped[i]);
-      if (remaining <= wLen || i === wrapped.length - 1) { li = i; ci = remaining; break; }
-      remaining -= wLen;
+    // v0.33.0: newline-aware wrap + cursor mapping. wrapContent splits on \n,
+    // but a \n costs one INDEX while occupying ZERO columns — the old loop
+    // subtracted visible widths only, so every newline drifted the caret one
+    // row off. Walk logical lines instead: locate the caret's line, then its
+    // wrapped row inside that line.
+    const starts = lineStarts(state.text);
+    const { line: caretLine, col: caretCol } = posToLineCol(state.text, state.cursor);
+    const perLine = []; // wrapped rows per logical line
+    for (let i = 0; i < starts.length; i++) {
+      const segEnd = i + 1 < starts.length ? starts[i + 1] - 1 : state.text.length;
+      perLine.push(wrapContent(state.text.slice(starts[i], segEnd), TW));
+    }
+    const wrapped = perLine.flat();
+    // locate the caret's wrapped row + column. UNITS MATTER: posToLineCol
+    // returns a CHAR column, but wrapped rows and withCursor work in VISUAL
+    // columns (CJK = 2 cols per char) — convert before comparing, or the
+    // caret lands "early" on any line containing wide characters.
+    let before = 0; // wrapped rows before the caret's line
+    for (let i = 0; i < caretLine && i < perLine.length; i++) before += perLine[i].length;
+    const segRows = perLine[Math.min(caretLine, perLine.length - 1)] ?? [''];
+    const segStart = starts[Math.min(caretLine, starts.length - 1)];
+    const segEnd = caretLine + 1 < starts.length ? starts[caretLine + 1] - 1 : state.text.length;
+    const caretVis = strWidth(state.text.slice(segStart, segStart + caretCol)); // visual column of the caret
+    let li = before;
+    let ci = caretVis;
+    let acc = 0; // visible columns consumed by earlier rows of the caret's line
+    for (let rr = 0; rr < segRows.length; rr++) {
+      const wLen = strWidth(segRows[rr]);
+      if (caretVis <= wLen || rr === segRows.length - 1) {
+        li = before + rr;
+        ci = Math.max(0, Math.min(caretVis - acc, wLen));
+        break;
+      }
+      acc += wLen;
     }
     const total = wrapped.length;
     let windowStart = 0;
@@ -277,6 +315,8 @@ export function createInputBox({
   let menuSel = 0;
   let menuEntries = [];
   let lastEscapeAt = 0; // arms the double-esc chord; any other key disarms
+  let vimOn = false; // /vim (v0.33.0): modal editing on the draft
+  let vim = createVimState();
   let busyStart = 0;
   let spinIdx = 0;
   let spinTimer = null;
@@ -299,6 +339,8 @@ export function createInputBox({
   function frameState() {
     const items = paletteItems();
     if (paletteSel >= items.length) paletteSel = Math.max(0, items.length - 1);
+    let sr = typeof statusRight === 'function' ? (statusRight() || '') : (statusRight || '');
+    if (vimOn) sr = sr ? `${sr} · vim` : 'vim'; // mode is visible or it isn't real
     return {
       text,
       cursor,
@@ -316,7 +358,7 @@ export function createInputBox({
         : null,
       transcript: viewerOpen ? transcript.slice() : null,
       menu: menuOpen ? { open: true, entries: menuEntries, sel: menuSel } : null,
-      statusRight: typeof statusRight === 'function' ? (statusRight() || '') : (statusRight || ''),
+      statusRight: sr,
       palette: items.length ? { items, sel: paletteSel } : null,
     };
   }
@@ -392,12 +434,51 @@ export function createInputBox({
       // so the next print (a tool card has no leading \n) would glue onto
       // the echo and both would render as one wrapped line (caught live by
       // the v0.31.0 transcript capture — the buffer showed echo+todo fused).
-      r.print(`  ${SEM.narrate('❯')} ${submitted}\n`);
+      // Multi-line drafts (v0.33.0): continuation lines indent under the ❯
+      // so the echo reads as one spoken block.
+      const echo = submitted.split('\n').join('\n    ');
+      r.print(`  ${SEM.narrate('❯')} ${echo}\n`);
       handlers.line?.(submitted);
     } else {
       r.render();
     }
     histIdx = -1; draft = '';
+  }
+
+  // ── vim routing (v0.33.0) ── /vim: modal editing on the draft. NORMAL mode
+  // consumes keys through the pure reducer; INSERT mode is the classic editor
+  // except esc (mode exit). The palette bypasses vim so '/' navigation stays
+  // live, and question mode bypasses vim entirely (answers keep the classic
+  // semantics — ctrl+c owns deny there, and a pending question must never
+  // depend on a mode the user forgot is on).
+  function routeVim(key, items) {
+    if (!vimOn || mode !== 'input') return null;
+    if (vim.mode === 'insert') {
+      const coalesced = key.meta && key.sequence === '\x1b\x1b'; // busy interrupt pair — never modal
+      if (!coalesced && (key.name === 'escape' || key.sequence === '\x1b')) {
+        vim.mode = 'normal';
+        // vim semantics: leaving insert parks the caret ON the last typed
+        // char (one left) — so a following x/dd act on what was just typed
+        // instead of the void past the end.
+        if (cursor > 0) cursor -= 1;
+        lastEscapeAt = 0;
+        redraw();
+        return { handled: true };
+      }
+      return null; // insert mode IS the classic editor
+    }
+    const r = applyVimKey(key, vim, text, cursor);
+    vim = r.st;
+    if (r.op === 'inert') return { handled: true }; // consumed, nothing to repaint
+    if (r.op === 'edit') {
+      text = r.text;
+      cursor = r.cursor;
+      lastEscapeAt = 0;
+      resetPaletteState();
+      redraw();
+      return { handled: true };
+    }
+    return { action: r.action, data: r.data }; // passthrough: the shared switch owns semantics
   }
 
   function onKeypress(key) {
@@ -453,22 +534,64 @@ export function createInputBox({
     }
     const items = paletteItems();
     const now = Date.now();
-    const { action, data } = applyKey(key, {
-      paletteOpen: items.length > 0,
-      questionMode: mode === 'question',
-      lastEscapeAt,
-      now,
-    });
+    const vr = routeVim(key, items);
+    if (vr?.handled) return; // vim applied the key (and repainted) itself
+    let action; let data;
+    if (vr) {
+      ({ action, data } = vr);
+    } else {
+      ({ action, data } = applyKey(key, {
+        paletteOpen: items.length > 0,
+        questionMode: mode === 'question',
+        lastEscapeAt,
+        now,
+      }));
+    }
     if (action !== 'escape' && action !== 'rewind') lastEscapeAt = 0; // chord needs CONSECUTIVE escapes
     switch (action) {
       case 'insert': insertText(data); break;
+      case 'newline': insertText('\n'); break; // v0.33.0: ctrl+j / alt+enter / taught shift+enter
       case 'backspace': if (cursor > 0) { text = text.slice(0, cursor - 1) + text.slice(cursor); cursor--; resetPaletteState(); } break;
       case 'delete': text = text.slice(0, cursor) + text.slice(cursor + 1); resetPaletteState(); break;
       case 'left': if (cursor > 0) cursor--; break;
       case 'right': if (cursor < text.length) cursor++; break;
-      case 'home': cursor = 0; break;
-      case 'end': cursor = text.length; break;
-      case 'kill-line': text = text.slice(0, cursor); resetPaletteState(); break;
+      case 'home': { // v0.33.0: line-scoped — the draft can hold many lines now
+        const starts0 = lineStarts(text);
+        const { line: l0 } = posToLineCol(text, cursor);
+        cursor = starts0[l0];
+        break;
+      }
+      case 'end': { // line-scoped end
+        const starts0 = lineStarts(text);
+        const { line: l0 } = posToLineCol(text, cursor);
+        cursor = l0 + 1 < starts0.length ? starts0[l0 + 1] - 1 : text.length;
+        break;
+      }
+      case 'kill-to-line-start': { // ctrl+u: clear the caret's line LEFT only —
+        // the old draft-global kill was a data-loss footgun on multi-line tasks
+        const ks = lineStarts(text);
+        const { line: kl } = posToLineCol(text, cursor);
+        text = text.slice(0, ks[kl]) + text.slice(cursor);
+        cursor = ks[kl];
+        resetPaletteState();
+        break;
+      }
+      case 'kill-to-line-end': { // ctrl+k: clear the caret's line RIGHT only
+        const ks = lineStarts(text);
+        const { line: kl } = posToLineCol(text, cursor);
+        const kend = kl + 1 < ks.length ? ks[kl + 1] - 1 : text.length;
+        text = text.slice(0, cursor) + text.slice(kend);
+        resetPaletteState();
+        break;
+      }
+      case 'kill-line': { // legacy alias (pre-0.33 callers): kill to line end
+        const ks = lineStarts(text);
+        const { line: kl } = posToLineCol(text, cursor);
+        const kend = kl + 1 < ks.length ? ks[kl + 1] - 1 : text.length;
+        text = text.slice(0, cursor) + text.slice(kend);
+        resetPaletteState();
+        break;
+      }
       case 'kill-word-before': {
         const before = text.slice(0, cursor).replace(/\S*\s*$/, '');
         text = before + text.slice(cursor);
@@ -476,22 +599,34 @@ export function createInputBox({
         resetPaletteState();
         break;
       }
-      case 'history-prev':
-        if (mode === 'input' && history.length) {
+      case 'history-prev': {
+        // v0.33.0: a multi-line draft navigates ITS OWN lines first — ↑ moves
+        // the caret line by line (even with empty history); history recalls
+        // only once the caret is already on the first line (Claude Code's
+        // up-at-top rule).
+        if (mode !== 'input') break;
+        const up = text.includes('\n') ? caretUp(text, cursor) : null;
+        if (up != null) { cursor = up; break; }
+        if (history.length) {
           if (histIdx === -1) draft = text;
           histIdx = Math.min(histIdx + 1, history.length - 1);
           text = history[histIdx]; cursor = text.length;
           resetPaletteState();
         }
         break;
-      case 'history-next':
-        if (mode === 'input' && histIdx !== -1) {
+      }
+      case 'history-next': {
+        if (mode !== 'input') break;
+        const down = text.includes('\n') ? caretDown(text, cursor) : null;
+        if (down != null) { cursor = down; break; }
+        if (histIdx !== -1) {
           histIdx--;
           text = histIdx === -1 ? draft : history[histIdx];
           cursor = text.length;
           resetPaletteState();
         }
         break;
+      }
       case 'palette-prev': paletteSel = Math.max(0, paletteSel - 1); break;
       case 'palette-next': paletteSel = Math.min(items.length - 1, paletteSel + 1); break;
       case 'complete': acceptPalette(items); break;
@@ -577,11 +712,19 @@ export function createInputBox({
     on(ev, fn) { handlers[ev] = fn; return rl; },
     // test / harness seam: drive the box's key reducer directly
     _handleKeypress(key) { onKeypress(key || {}); },
+    // /vim (v0.33.0): toggle modal editing; a fresh state every time so a
+    // half-finished pending op or count can never leak across sessions
+    // (question mode bypasses the reducer by design — routeVim checks mode)
+    setVim(on) {
+      vimOn = !!on;
+      vim = createVimState();
+      redraw();
+    },
     // test seam (v0.31.0): feed the transcript capture directly (what install()'s
     // onPrint wiring receives from renderer.print in production)
     _capture: pushTranscript,
     // test / introspection hooks
-    _state: () => ({ text, cursor, mode, history: [...history], busy: busyLabel, thought: busyThought, toolCalls: toolCallsCount, verbose, viewer: viewerOpen ? { scroll: viewerScroll } : null, menu: menuOpen ? { sel: menuSel, count: menuEntries.length } : null, transcriptLines: transcript.length, palette: paletteItems().map((i) => i.name) }),
+    _state: () => ({ text, cursor, mode, history: [...history], busy: busyLabel, thought: busyThought, toolCalls: toolCallsCount, verbose, viewer: viewerOpen ? { scroll: viewerScroll } : null, menu: menuOpen ? { sel: menuSel, count: menuEntries.length } : null, vim: vimOn ? { mode: vim.mode, pending: vim.pending, count: vim.count } : null, transcriptLines: transcript.length, palette: paletteItems().map((i) => i.name) }),
   };
 
   rl.install = function install() {

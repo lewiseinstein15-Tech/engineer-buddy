@@ -93,3 +93,59 @@ export function truncateAnsi(s, max) {
   }
   return out + '…';
 }
+
+// ── Multi-line text math (v0.33.0) ───────────────────────────────────────────
+// The input box learned newlines (ctrl+j / alt+enter). Every cursor question
+// on a multi-line draft goes through these pure helpers — the box's old
+// wrapped-cursor math subtracted only VISIBLE widths and desynced by one
+// column per newline (a \n costs an index but occupies zero columns).
+
+/** Start index of every logical line. `['ab', 'cd']` → [0, 3]. */
+export function lineStarts(text) {
+  const s = String(text ?? '');
+  const starts = [0];
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '\n') starts.push(i + 1);
+  }
+  return starts;
+}
+
+/** Absolute index → { line, col } (0-based). Pure. */
+export function posToLineCol(text, pos) {
+  const s = String(text ?? '');
+  const p = Math.max(0, Math.min(Number(pos) || 0, s.length));
+  const starts = lineStarts(s);
+  let line = 0;
+  for (let i = 0; i < starts.length; i++) {
+    if (p >= starts[i]) line = i;
+    else break;
+  }
+  return { line, col: p - starts[line] };
+}
+
+/** { line, col } → absolute index. Clamped to the text. Pure. */
+export function lineColToPos(text, line, col) {
+  const s = String(text ?? '');
+  const starts = lineStarts(s);
+  const li = Math.max(0, Math.min(Number(line) || 0, starts.length - 1));
+  const lineEnd = li + 1 < starts.length ? starts[li + 1] - 1 : s.length; // before the \n
+  const c = Math.max(0, Number(col) || 0);
+  return Math.min(starts[li] + c, lineEnd);
+}
+
+/** Caret one visual line up; already on the first line → null (caller decides:
+ *  the box recalls history there, matching Claude Code's up-at-top rule). */
+export function caretUp(text, cursor) {
+  const s = String(text ?? '');
+  const { line, col } = posToLineCol(s, cursor);
+  if (line === 0) return null;
+  return lineColToPos(s, line - 1, col);
+}
+
+/** Caret one visual line down; already on the last line → null. */
+export function caretDown(text, cursor) {
+  const s = String(text ?? '');
+  const { line, col } = posToLineCol(s, cursor);
+  if (line >= lineStarts(s).length - 1) return null;
+  return lineColToPos(s, line + 1, col);
+}

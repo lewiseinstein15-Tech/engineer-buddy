@@ -1,6 +1,7 @@
 // ui.js — zero-dependency terminal rendering for Buddy Code.
 // Respects NO_COLOR and non-TTY output. All painters are pure except spinner.
 import { toolStyle, SEM, setLevel, colorLevel, hue } from './theme.js';
+import { pickLines, collapseHint, CARDS } from './toolcards.js';
 
 const useColor = colorLevel() !== 'none';
 
@@ -194,22 +195,29 @@ function truncatePlain(s, n) {
   return s2.length <= n ? s2 : `${s2.slice(0, n - 1)}…`;
 }
 
-/** Render a capped observation excerpt (Aurora, v0.29.0):
+/** Render a capped observation excerpt (Aurora, v0.29.0 → smarter v0.33.0):
  *  the first line gains a verdict mark — ✓ green when it ran clean,
  *  ✗ red when it errored or was denied — so failures pop out of a long
- *  run without reading a word. */
-export function renderObservation(observation, { maxLines = 5, maxChars = 400, denied = false } = {}) {
+ *  run without reading a word. Collapse policy (v0.33.0): short outputs
+ *  show whole; medium ones keep the head window (v0.29 shape); LONG ones
+ *  keep head + TAIL — test runners and compilers print their verdict at
+ *  the end, and v0.29 hid exactly those lines. obsIndex (v0.33.0) names
+ *  the /copy register entry so the hint doubles as the clipboard key. */
+export function renderObservation(observation, { maxLines = 5, maxChars = 400, denied = false, obsIndex = null, headOnlyMax, head: headN, tail: tailN } = {}) {
   const s = String(observation ?? '').trim();
   if (!s) return c.gray('  ⎿ (no output)');
   const failed = denied || /^ERROR|^BLOCKED|^REFUSED/.test(s);
   const mark = failed ? SEM.bad('✗') : SEM.ok('✓');
   const lines = s.split('\n');
-  const shown = lines.slice(0, maxLines);
-  const more = lines.length - shown.length;
+  // headOnlyMax/head/tail forward to the policy (verbose cards pass bigger
+  // windows — dropping them made a verbose card show LESS than collapsed).
+  const pick = pickLines(lines, { showAll: maxLines, headOnlyMax, head: headN, tail: tailN });
+  const shown = pick.shown;
   const head = shown[0] == null ? '' : String(shown[0]).slice(0, maxChars);
   const rest = shown.slice(1).map((l) => `${c.gray('  ⎿')} ${l.slice(0, maxChars)}`);
   let out = [`${c.gray('  ⎿')} ${mark} ${failed ? SEM.bad(head) : head}`, ...rest].join('\n');
-  if (more > 0) out += `\n${c.gray('  ⎿')} ${c.gray(`… +${more} more lines`)}`;
+  const hint = collapseHint(pick.hidden, pick.kind, obsIndex);
+  if (hint) out += `\n${c.gray('  ⎿')} ${c.gray(hint)}`;
   return out;
 }
 
@@ -277,12 +285,16 @@ export function renderTable(rows, { headers = null, indent = '  ' } = {}) {
 
 /** Render one chat tool event as a Claude-Code-style card (Aurora skin).
  *  verbose (ctrl+o transcript, v0.30.0): the observation keeps up to 24
- *  lines / 1200 chars instead of the collapsed 5 / 400 caps. */
-export function renderToolEvent(ev, { preview = true, cols = null, verbose = false } = {}) {
+ *  lines / 1200 chars instead of the collapsed 5 / 400 caps.
+ *  obsIndex (v0.33.0): the observation's /copy register number — printed
+ *  in the collapse hint so a long card tells you how to grab ALL of it. */
+export function renderToolEvent(ev, { preview = true, cols = null, verbose = false, obsIndex = null } = {}) {
   const parts = [];
   parts.push(renderToolCall({ tool: ev.tool, args: ev.args, denied: ev.denied, argText: ev.argText, durationMs: ev.durationMs ?? null, cols }));
   if (preview && ev.preview) parts.push(String(ev.preview));
-  parts.push(renderObservation(ev.observation, verbose ? { maxLines: 24, maxChars: 1200, denied: !!ev.denied } : { denied: !!ev.denied }));
+  parts.push(renderObservation(ev.observation, verbose
+    ? { maxLines: 24, maxChars: 1200, denied: !!ev.denied, obsIndex, headOnlyMax: CARDS.VERBOSE_SHOW, head: CARDS.VERBOSE_HEAD, tail: CARDS.VERBOSE_TAIL }
+    : { denied: !!ev.denied, obsIndex }));
   return parts.join('\n');
 }
 

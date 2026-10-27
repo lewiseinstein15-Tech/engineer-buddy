@@ -48,7 +48,8 @@ test('applyKey: editing keys map to actions', () => {
   assert.equal(applyKey({ name: 'right' }).action, 'right');
   assert.equal(applyKey({ ctrl: true, name: 'a' }).action, 'home');
   assert.equal(applyKey({ ctrl: true, name: 'e' }).action, 'end');
-  assert.equal(applyKey({ ctrl: true, name: 'u' }).action, 'kill-line');
+  assert.equal(applyKey({ ctrl: true, name: 'u' }).action, 'kill-to-line-start'); // v0.33.0: line-scoped
+  assert.equal(applyKey({ ctrl: true, name: 'k' }).action, 'kill-to-line-end');
   assert.equal(applyKey({ ctrl: true, name: 'w' }).action, 'kill-word-before');
   assert.equal(applyKey({ name: 'up' }).action, 'history-prev');
   assert.equal(applyKey({ name: 'down' }).action, 'history-next');
@@ -57,7 +58,12 @@ test('applyKey: editing keys map to actions', () => {
 
 test('applyKey: control flow keys', () => {
   assert.equal(applyKey({ name: 'return' }).action, 'submit');
-  assert.equal(applyKey({ name: 'enter' }).action, 'submit');
+  // WIRE TRUTH (v0.33.0): name 'enter' is the LF byte (ctrl+j / taught
+  // shift+enter) — it inserts a newline; only \r ('return') submits.
+  assert.equal(applyKey({ name: 'enter' }).action, 'newline');
+  assert.equal(applyKey({ name: 'enter', sequence: '\n' }).action, 'newline');
+  assert.equal(applyKey({ name: 'return', sequence: '\x1b\r', meta: true }).action, 'newline'); // alt+enter chord
+  assert.equal(applyKey({ name: 'return', sequence: '\r' }).action, 'submit');
   assert.equal(applyKey({ ctrl: true, name: 'c' }).action, 'sigint');
   assert.equal(applyKey({ ctrl: true, name: 'd' }).action, 'eof');
   assert.equal(applyKey({ name: 'escape' }).action, 'escape');

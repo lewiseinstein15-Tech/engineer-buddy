@@ -35,6 +35,8 @@ import { HARNESS_DIR } from '../harness/defaults.js';
 import { SessionRecorder, listSessions, loadSession, sessionInfo, resumeMessages, writeExport, latestSession, findSession, renameSession, forkSession, writeHtmlExport, importSession } from '../session.js';
 import { reflect, recentLessons, experiencePath } from '../learn.js';
 import { c, PALETTE, logoBanner, spinner, renderToolCall, renderToolEvent, renderTodo, renderTable, formatMs, renderContextBar, setTheme, themeNames, currentTheme } from './ui.js';
+import { osc52, resolveCopyRef, formatCopyTable, copyFits, fmtBytes, CARDS } from './toolcards.js';
+import { detectTerminal, setupSteps, NO_SETUP } from './termkeys.js';
 import { SEM, renderDoneRibbon } from './theme.js';
 import { makeThoughtExtractor } from './streamthought.js';
 import { getChatSetting, setChatSetting } from '../settings.js';
@@ -63,7 +65,7 @@ export function fmtTok(n) {
 export const SLASH_COMMANDS = [
   'help', 'new', 'clear', 'screen', 'compact', 'context', 'map', 'model', 'gateways', 'cost', 'stats', 'effort', 'events', 'stream',
   'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'diff', 'hooks', 'docs', 'rename', 'branch', 'fork', 'share', 'verbosity', 'theme', 'output-style', 'statusline', 'why', 'compare', 'memory', 'experience', 'learn', 'review',
-  'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit', 'add-dir', 'report',
+  'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit', 'add-dir', 'report', 'copy', 'terminal-setup', 'vim',
 ];
 
 // Descriptions shown in the slash-command palette (Claude Code style menu).
@@ -105,6 +107,9 @@ export const SLASH_DESCRIPTIONS = {
   plan: 'Toggle plan mode — read-only research until the plan is approved',
   plans: 'List approved plans saved under .buddy/plans/',
   rewind: 'List checkpoints — /rewind 1 restores files to before the latest edit',
+  copy: 'Copy an observation to the clipboard — /copy alone lists the register · /copy reply',
+  'terminal-setup': 'Teach this terminal shift+enter = newline (prints the exact steps)',
+  vim: 'Toggle vim modal editing on the input line (normal/insert, hjkl, dd/yy/p)',
   diff: 'Show uncommitted changes (git status + stat + diff)',
   hooks: 'Show lifecycle hooks (.buddy/settings.json) — exit 2 blocks a tool/prompt',
   memory: 'Show project memory (edit it to teach Buddy)',
@@ -255,7 +260,7 @@ function defaultApproval(busy) {
 
 // ── Event rendering (shared by REPL and one-shot) ────────────────────────────
 
-function makeRenderer({ quiet = false, toolByName = new Map(), verbosity = 'summary', verbose = false } = {}) {
+function makeRenderer({ quiet = false, toolByName = new Map(), verbosity = 'summary', verbose = false, obsIndexOf = null } = {}) {
   // verbosity/verbose may be live ref objects ({level}/{on}) so /verbosity and
   // ctrl+o changes apply immediately, not on the next turn.
   const level = () => (typeof verbosity === 'object' && verbosity !== null ? verbosity.level : verbosity);
@@ -274,7 +279,11 @@ function makeRenderer({ quiet = false, toolByName = new Map(), verbosity = 'summ
         console.log(renderTodo(ev.args.items));
         return;
       }
-      console.log(renderToolEvent(ev, { preview: !quiet, verbose: expanded() }));
+      // v0.33.0: the observation's /copy register position rides on the card
+      // (newest = 1 at print time) so the collapse hint doubles as the
+      // clipboard key. One-shot/CI renders pass no register — no hint.
+      const obsIndex = obsIndexOf ? obsIndexOf(ev) : null;
+      console.log(renderToolEvent(ev, { preview: !quiet, verbose: expanded(), obsIndex }));
       // /verbosity verbose — observations follow their tool cards.
       if (level() === 'verbose' && ev.observation && !ev.denied) {
         console.log(c.gray(`  ↳ ${String(ev.observation).split('\n')[0].slice(0, 160)}${String(ev.observation).length > 160 ? '…' : ''}`));
@@ -487,6 +496,11 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   if (themeSetting) setTheme(themeSetting);
   const verbosityRef = { level: getChatSetting(root, 'verbosity', 'summary') };
   const verboseRef = { on: false };
+  // /copy register (v0.33.0): the last N tool observations, newest = 1 — the
+  // clipboard affordance for long outputs the cards collapse. `say` events
+  // land here too so `/copy reply` grabs Buddy's last answer.
+  const obsRegister = [];
+  let vimEnabled = false; // /vim toggle (the box owns the actual mode state)
   const statuslineRef = { template: getChatSetting(root, 'statusline', '') };
   // Observability & routing (v0.25.0):
   //   effort — persisted level (chat.effort setting) retunes the loop live
@@ -579,9 +593,20 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       // Structured event log (v0.25.0): the machine-readable twin of the
       // transcript — tool calls, denials, compactions, errors as JSONL.
       if (eventsLogOn) appendEvent(root, projectEvent(ev));
+      if (ev.type === 'say') {
+        // /copy reply (v0.33.0): Buddy's last answer joins the register.
+        obsRegister.unshift({ tool: 'say', text: String(ev.text ?? ''), denied: false, at: Date.now(), ev });
+        if (obsRegister.length > CARDS.REGISTER_MAX) obsRegister.length = CARDS.REGISTER_MAX;
+      }
       if (ev.type === 'tool') {
         toolCallsThisTurn += 1;
         if (ev.denied) turnDenied += 1;
+        // /copy register (v0.33.0): remember the full observation BEFORE the
+        // card renders so the collapse hint can name its register number.
+        if (ev.observation != null) {
+          obsRegister.unshift({ tool: ev.tool, text: String(ev.observation), denied: !!ev.denied, at: Date.now(), ev });
+          if (obsRegister.length > CARDS.REGISTER_MAX) obsRegister.length = CARDS.REGISTER_MAX;
+        }
         rl.setBusy(`working · ${toolCallsThisTurn} tool call${toolCallsThisTurn === 1 ? '' : 's'}${msgQueue.length ? ` · ${msgQueue.length} queued` : ''}`);
         rl.setToolCalls(toolCallsThisTurn); // Aurora strip telemetry
         lastGateway = ev.gateway || lastGateway;
@@ -627,7 +652,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     }
   }
 
-  const render = makeRenderer({ toolByName: new Map(tools.map((t) => [t.name, t])), verbosity: verbosityRef, verbose: verboseRef });
+  const render = makeRenderer({ toolByName: new Map(tools.map((t) => [t.name, t])), verbosity: verbosityRef, verbose: verboseRef, obsIndexOf: (ev) => { const i = obsRegister.findIndex((r) => r.ev === ev); return i >= 0 ? i + 1 : null; } });
 
   const ensureRecorder = (firstMsg) => {
     if (!recorder) {
@@ -697,6 +722,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
             c.bold('Buddy Code') + c.dim(` v${VERSION} — commands`),
             '',
             `  ${c.bold('type a task')}      give Buddy work ("add input validation to X")`,
+            `  ${c.bold('ctrl+j')}           newline inside the draft — multi-line tasks (alt+enter works too)`,
             `  ${c.bold('\\ at line end')}   continue on the next line (multi-line tasks)`,
             `  ${c.bold('!cmd')}            run a shell command yourself (trusted, no gate)`,
             `  ${c.bold('@path')}           attach a file to the task (e.g. explain @src/app.js)`,
@@ -725,6 +751,15 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
               ['/events', 'tail the structured event log (.buddy/events.jsonl)'],
               ['/model <name>', 'pin a gateway first (e.g. /model kilo) · /model auto restores'],
               ['/gateways', 'health-probe the keyless chain (feeds self-healing routing)'],
+            ].map(([k, d]) => `    ${c.bold(k.padEnd(20))} ${c.dim(d)}`),
+            `  ${c.bold(c.cyan('Editing'))}`,
+            ...[
+              ['/vim', 'toggle vim modal editing — hjkl · i/a/o insert · x delete · dd/yy/p lines · w/b words'],
+              ['/copy <n>', 'copy an observation to the clipboard — /copy lists the register · /copy reply'],
+              ['/terminal-setup', 'teach this terminal shift+enter = newline (prints the exact steps)'],
+              ['ctrl+o', 'expand/collapse the stream transcript (v0.30)'],
+              ['ctrl+r', 'open the session transcript viewer (v0.31)'],
+              ['double-esc', 'open the rewind menu (v0.32)'],
             ].map(([k, d]) => `    ${c.bold(k.padEnd(20))} ${c.dim(d)}`),
             `  ${c.bold(c.cyan('Harness (Harness²)'))}`,
             ...[
@@ -1425,6 +1460,61 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         }
         try { setChatSetting(root, 'theme', applied); } catch { /* best effort */ }
         say(`\n  ${c.green('✓ theme:')} ${c.bold(applied)} — every render from now on uses it\n`);
+        break;
+      }
+      case 'vim': {
+        vimEnabled = !vimEnabled;
+        rl.setVim(vimEnabled);
+        if (vimEnabled) {
+          say(
+            `\n  ${c.green('⌨ vim mode on')} — the status right shows ${c.bold('vim')} while it is live\n` +
+            c.dim('  normal:  h/j/k/l move · w/b/e words · 0/$ line ends · gg/G top/bottom · ↑↓ history at the edges\n') +
+            c.dim('           i/a/I/A insert · o/O open a line · x/X delete chars · dd/yy/p lines · D/C to line end · counts (3j, 2dd)\n') +
+            c.dim('  insert:  type as always · esc returns to normal · esc from normal clears the draft / interrupts\n') +
+            c.dim('  / from an empty draft opens the command palette · u (undo) and : commands are not supported — the input line is short')
+          );
+        } else {
+          say('\n  vim mode off — classic editing\n');
+        }
+        break;
+      }
+      case 'copy': {
+        const ref = args.trim();
+        if (!ref) {
+          const rows = formatCopyTable(obsRegister);
+          say(`\n  ${c.bold('Clipboard register')} ${c.dim('— newest = 1 · /copy <n> copies · /copy reply = Buddy\'s last answer')}`);
+          if (!rows.length) say(c.dim('  (empty — observations land here as turns run)'));
+          else say(renderTable(rows, { headers: ['#', 'tool', 'size', '', 'preview'] }));
+          say(c.gray('  delivery is OSC 52 — supported natively by iTerm2, kitty, WezTerm, alacritty, foot; tmux needs set-clipboard on'));
+          say('');
+          break;
+        }
+        const got = resolveCopyRef(obsRegister, ref);
+        if (got.error) {
+          say(`  ${c.red('/copy')}: ${got.error}`);
+          break;
+        }
+        const text = String(got.entry.text ?? '');
+        if (!copyFits(text)) {
+          say(`  ${c.red('/copy')}: ${fmtBytes(Buffer.byteLength(text, 'utf8'))} exceeds the 100 kB terminal clipboard cap — /copy a smaller observation`);
+          break;
+        }
+        // The escape itself prints as its own (invisible) line — print()'s
+        // pending buffer needs the trailing newline, and the emulator consumes
+        // the OSC off the wire before it can ever render.
+        say(osc52(text));
+        say(`  ${SEM.ok('✓ copied')} ${c.bold(`#${got.n} ${got.entry.tool}`)} ${c.dim(`(${fmtBytes(Buffer.byteLength(text, 'utf8'))}) → system clipboard (OSC 52)`)}`);
+        break;
+      }
+      case 'terminal-setup': {
+        const det = detectTerminal(process.env);
+        say('');
+        say(`  ${c.bold('shift+enter → newline')} ${c.dim(`— detected: ${det.name} (${det.matched})`)}`);
+        say('');
+        for (const step of setupSteps(det.id)) say(`  ${step}`);
+        say('');
+        for (const l of NO_SETUP) say(c.gray(l));
+        say('');
         break;
       }
       case 'output-style': {
