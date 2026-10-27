@@ -51,7 +51,7 @@ export { charWidth, strWidth, wrapContent };
 // rewind chord (v0.32.0). Returns { action, data } where action ∈ insert|submit|
 // newline|backspace|delete|left|right|home|end|kill-line|kill-word-before|history-prev|
 // history-next|complete|mode-cycle|palette-prev|palette-next|escape|rewind|
-// transcript|sigint|eof|null
+// transcript|detach|sigint|eof|null
 export function applyKey(key, ctx = {}) {
   const name = key.name ?? '';
   if (key.ctrl && name === 'c') return { action: 'sigint' };
@@ -81,7 +81,7 @@ export function applyKey(key, ctx = {}) {
   }
   if (name === 'backspace' || (key.ctrl && name === 'h')) return { action: 'backspace' };
   if (name === 'delete') return { action: 'delete' };
-  if (name === 'left' || (key.ctrl && name === 'b')) return { action: 'left' };
+  if (name === 'left') return { action: 'left' }; // v0.34.0: plain left only — ctrl+b moved to the dual-duty branch below
   if (name === 'right' || (key.ctrl && name === 'f')) return { action: 'right' };
   if (name === 'home' || (key.ctrl && name === 'a')) return { action: 'home' };
   if (name === 'end' || (key.ctrl && name === 'e')) return { action: 'end' };
@@ -90,6 +90,14 @@ export function applyKey(key, ctx = {}) {
   if (key.ctrl && name === 'w') return { action: 'kill-word-before' };
   if (key.ctrl && name === 'o') return { action: 'verbose-toggle' }; // v0.30.0: expand/collapse the stream transcript
   if (key.ctrl && name === 'r') return { action: 'transcript' }; // v0.31.0: open the ctrl+r transcript viewer
+  if (key.ctrl && name === 'b') {
+    // v0.34.0: ctrl+b is DUAL-DUTY at the busy boundary (esc already works
+    // this way: idle = clear draft, busy = interrupt). While a turn runs it
+    // detaches the turn to the background (prompt returns, output mutes);
+    // while idle it stays the emacs cursor-left binding.
+    if (ctx.busy) return { action: 'detach' };
+    return { action: 'left' };
+  }
   if (name === 'up') return ctx.paletteOpen ? { action: 'palette-prev' } : { action: 'history-prev' };
   if (name === 'down') return ctx.paletteOpen ? { action: 'palette-next' } : { action: 'history-next' };
   if (name === 'tab') return key.shift ? { action: 'mode-cycle' } : { action: 'complete' };
@@ -532,6 +540,14 @@ export function createInputBox({
       redraw();
       return;
     }
+    // ── ctrl+b detach (v0.34.0) ── checked BEFORE vim routing: while a turn
+    // runs, ctrl+b detaches regardless of vim mode (a modal editor has no
+    // business paging a draft mid-turn, and the detach must be reliable);
+    // while idle, vim's ctrl+b / emacs cursor-left behave as before.
+    if (key.ctrl && key.name === 'b' && busyLabel && mode === 'input' && !viewerOpen && !menuOpen) {
+      handlers.detach?.();
+      return;
+    }
     const items = paletteItems();
     const now = Date.now();
     const vr = routeVim(key, items);
@@ -545,6 +561,7 @@ export function createInputBox({
         questionMode: mode === 'question',
         lastEscapeAt,
         now,
+        busy: Boolean(busyLabel) && mode === 'input',
       }));
     }
     if (action !== 'escape' && action !== 'rewind') lastEscapeAt = 0; // chord needs CONSECUTIVE escapes
@@ -638,6 +655,9 @@ export function createInputBox({
         viewerOpen = true;
         viewerScroll = 0; // live tail first — the newest work is the news
         break;
+      case 'detach': // ctrl+b (v0.34.0): background the running turn — the repl
+        handlers.detach?.(); // owns the note + footer release; no repaint here
+        return;
       case 'mode-cycle': handlers.modecycle?.(); break; // shift+tab: normal → auto-accept → plan
       case 'submit': submitLine(); return; // submitLine handles its own repaint
       case 'escape':

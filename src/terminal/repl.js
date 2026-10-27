@@ -38,6 +38,7 @@ import { c, PALETTE, logoBanner, spinner, renderToolCall, renderToolEvent, rende
 import { osc52, resolveCopyRef, formatCopyTable, copyFits, fmtBytes, CARDS } from './toolcards.js';
 import { detectTerminal, setupSteps, NO_SETUP } from './termkeys.js';
 import { SEM, renderDoneRibbon } from './theme.js';
+import { BG, createBgTurn, bgFinish, bgBufferEvent, resolveBgId, parseBgArgs, renderBgList, renderBgView, renderBgNote } from './tasks.js';
 import { makeThoughtExtractor } from './streamthought.js';
 import { getChatSetting, setChatSetting } from '../settings.js';
 import { listOutputStyles, loadOutputStyle } from '../harness/outputstyles.js';
@@ -103,7 +104,7 @@ export const SLASH_DESCRIPTIONS = {
   statusline: 'Template for the post-turn status line (/statusline "{branch} · {gateway} · {ctx}%")',
   why: 'Show exactly how the last answer was produced: gateway, model, every tool step',
   compare: 'Ask two gateways the same question side by side (/compare kilo duckai "question")',
-  tasks: 'List background shells (bash_bg / bash_output / kill_shell)',
+  tasks: 'Background turns (ctrl+b) + shells — /tasks view t1 · /tasks stop t1 · /tasks attach t1',
   plan: 'Toggle plan mode — read-only research until the plan is approved',
   plans: 'List approved plans saved under .buddy/plans/',
   rewind: 'List checkpoints — /rewind 1 restores files to before the latest edit',
@@ -486,6 +487,19 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   let lastGateway = null;
   let toolCallsThisTurn = 0;
   const turnStart = { at: 0 };
+  // Background turns (v0.34.0): ctrl+b detaches the RUNNING turn — the prompt
+  // returns while the turn keeps working with its output muted into the
+  // record's buffer. Mutex stays intact: ONE turn runs at a time (runTask +
+  // msgQueue); detach only decouples the prompt from the turn.
+  //   bg      — the record for the CURRENTLY detached in-flight turn (null = attached)
+  //   bgList  — every detached turn this session (finished ones keep their stats)
+  //   turnBgRecord — this turn's record even after a re-attach (finalize at turn end)
+  //   turnTaskText — the running turn's prompt (the record's task column)
+  let bgSeq = 0;
+  let bg = null;
+  const bgList = [];
+  let turnBgRecord = null;
+  let turnTaskText = '';
   let lastDocs = null; // /docs result — attached to the next task (v0.17.0)
   let lastReport = null; // /report result — attached to the next task (v0.26.0)
   const branches = new Map(); // /branch save <name> → in-memory conversation snapshots (v0.21.0)
@@ -523,6 +537,9 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     const n = String(frag ?? '').length;
     stepStreamBytes += n;
     turnStreamBytes += n;
+    // Detached turn (v0.34.0): bytes still count for the task's stats, but
+    // the thought strip belongs to the foreground — nothing paints.
+    if (bg) { bg.bytes = turnStreamBytes; return; }
     const snap = thoughtExtractor.push(frag);
     if (!snap) return;
     const now = Date.now();
@@ -557,6 +574,13 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     },
     approval: async ({ tool, summary, preview }) => {
       if (yolo) return 'yes';
+      // Detached turn hit an approval gate (v0.34.0): the question MUST be
+      // answerable, so the task re-attaches itself — footer returns, output
+      // prints live again, and the y/n prompt takes the box as always.
+      if (bg) {
+        say(`  ${c.yellow('⚠')} task ${bg.id} needs approval — reattached`);
+        attachTurn(bg);
+      }
       return new Promise((resolve) => {
         const token = ++qToken;
         console.log(`\n  ${c.yellow('⚠ approve')} ${c.bold(summary)}`);
@@ -585,6 +609,36 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       thoughtExtractor.reset();
       stepStreamBytes = 0;
       lastThoughtPaint = 0;
+      // Detached turn (v0.34.0): the session keeps its FULL truth — events,
+      // counters, /copy register, recorder, event log — but nothing paints
+      // and the footer stays released. The record is the muted output.
+      if (bg) {
+        bgBufferEvent(bg, ev);
+        if (ev.type === 'tool') {
+          if (ev.denied) turnDenied += 1;
+          toolCallsThisTurn += 1;
+          if (ev.observation != null) {
+            obsRegister.unshift({ tool: ev.tool, text: String(ev.observation), denied: !!ev.denied, at: Date.now(), ev });
+            if (obsRegister.length > CARDS.REGISTER_MAX) obsRegister.length = CARDS.REGISTER_MAX;
+          }
+          lastGateway = ev.gateway || lastGateway;
+          bg.tools = toolCallsThisTurn;
+          bg.denied = turnDenied;
+          bg.errors = turnErrors;
+          try {
+            recorder?.append({ type: 'tool', tool: ev.tool, args: { _preview: truncate(JSON.stringify(ev.args), 160) }, observation: truncate(ev.observation, 160), denied: ev.denied });
+          } catch {
+            /* transcript is best-effort */
+          }
+        }
+        if (ev.type === 'say') {
+          obsRegister.unshift({ tool: 'say', text: String(ev.text ?? ''), denied: false, at: Date.now(), ev });
+          if (obsRegister.length > CARDS.REGISTER_MAX) obsRegister.length = CARDS.REGISTER_MAX;
+        }
+        bg.steps = Math.max(bg.steps, toolCallsThisTurn); // ≈ one step per tool call while muted
+        if (eventsLogOn) appendEvent(root, projectEvent(ev));
+        return; // muted: no render, no footer, no strip
+      }
       try {
         rl.setThought(null);
       } catch {
@@ -665,13 +719,14 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   const rl = createInputBox({
     title: 'Buddy',
     placeholder: 'type a task…   (/ for commands · ! shell · # remember)',
-    hint: '? shortcuts · ↑↓ history · esc stop · ctrl+o expand · ctrl+r transcript · ctrl+c quit',
+    hint: '? shortcuts · ↑↓ history · esc stop · ctrl+o expand · ctrl+r transcript · ctrl+b background · ctrl+c quit',
     record: recordPath,
     statusRight: () => {
       try {
         const ctxK = (chat.historyChars() / 1000).toFixed(1);
         const mode = modes.plan ? ' · plan' : yolo ? ' · auto-accept' : '';
-        return `v${VERSION} · ${lastGateway || router.order[0]} · ${ctxK}k ctx${mode}`;
+        const bgMark = bg ? ` · bg t${bg.id}▶` : '';
+        return `v${VERSION} · ${lastGateway || router.order[0]} · ${ctxK}k ctx${mode}${bgMark}`;
       } catch { return `v${VERSION} · ${lastGateway || router.order[0]}`; }
     },
     commands: [
@@ -728,6 +783,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
             `  ${c.bold('@path')}           attach a file to the task (e.g. explain @src/app.js)`,
             `  ${c.bold('#note')}           remember a note in project memory (${HARNESS_DIR}/MEMORY.md)`,
             `  ${c.bold('Ctrl+C')}          interrupt the running task (drops queued messages) · twice to quit`,
+            `  ${c.bold('Ctrl+B')}           background the running turn — prompt returns, /tasks re-attaches`,
             `  ${c.bold('while busy')}       keep typing — messages queue and run in order next`,
             '',
             `  ${c.bold(c.cyan('Session'))}`,
@@ -1215,19 +1271,49 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         say(todoState.latest ? `\n${renderTodo(todoState.latest)}\n` : '\n  (no plan yet — Buddy builds one with the todo tool when a task has steps)\n');
         break;
       case 'tasks': {
-        const list = shells.list();
-        if (!list.length) {
-          say(`\n  no background shells — Buddy can start one: ${c.bold('bash_bg')} {"command":"npm run dev"} · poll with ${c.bold('bash_output')} · stop with ${c.bold('kill_shell')}\n`);
+        // v0.34.0: two sections — detached turns (ctrl+b) + background shells.
+        // Subcommands: /tasks view t1 · /tasks stop t1 · /tasks attach t1 ·
+        // /tasks t1 (= view). Bare /tasks lists both.
+        const parg = parseBgArgs(args);
+        if (parg.sub !== 'list') {
+          const rec = parg.id ? resolveBgId(bgList, parg.id) : null;
+          if (!rec) {
+            say(`  usage: /tasks view|stop|attach t<n> — /tasks lists everything (${c.dim('ids: t1, t2… = turns · #1, #2… = shells')})`);
+            break;
+          }
+          if (parg.sub === 'view') {
+            const view = renderBgView(rec);
+            if (view) say(view);
+            break;
+          }
+          if (parg.sub === 'stop') {
+            if (rec.status !== 'running') {
+              say(`  task t${rec.id} already ${rec.status} — nothing to stop`);
+              break;
+            }
+            if (!bg || bg !== rec || !aborter) {
+              say(`  task t${rec.id} is not the running turn — cannot stop it`);
+              break;
+            }
+            say(`  ${c.yellow('⏸')} stopping task t${rec.id}…`);
+            aborter.abort(); // the loop unwinds → ⏸ completion note
+            break;
+          }
+          if (parg.sub === 'attach') {
+            if (rec.status !== 'running') {
+              say(`  task t${rec.id} already ${rec.status} — /tasks view ${rec.id} reads its output`);
+              break;
+            }
+            if (bg !== rec) {
+              say(`  task t${rec.id} is not detached right now`);
+              break;
+            }
+            attachTurn(rec);
+            break;
+          }
           break;
         }
-        const rows = list.map((s) => [
-          s.status === 'running' ? c.green('●') : c.dim('○'),
-          `#${s.id}`,
-          s.status === 'running' ? c.green(`running ${(s.durationMs / 1000).toFixed(1)}s`) : `${s.status}${s.exitCode != null ? ` (${s.exitCode})` : ''}`,
-          truncate(s.command, 44),
-          `${s.bytes}b`,
-        ]);
-        say(`\n${renderTable(rows, { headers: ['', 'shell', 'status', 'command', 'output'] })}\n${c.dim('  read output: bash_output {"id":N} · stop: kill_shell {"id":N}\n')}`);
+        say(renderBgList({ turns: bgList, shells: shells.list() }));
         break;
       }
       case 'plan':
@@ -1762,6 +1848,12 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       }
       case 'quit':
       case 'exit':
+        if (bg) {
+          // Honest exit guard (v0.34.0): /exit while a task runs in the
+          // background would kill it mid-flight — name the way out instead.
+          say(`  task t${bg.id} is still running in the background — ${c.bold(`/tasks stop ${bg.id}`)} to end it, then /exit`);
+          return null;
+        }
         if (hookRunner?.size) hookRunner.fireAndForget('SessionEnd', { reason: 'quit' });
         rl.close();
         return 0;
@@ -1779,10 +1871,12 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       rl.prompt(true);
       return;
     }
-    if (busy && aborter) {
+    if (busy && aborter && !bg) {
       aborter.abort();
       return; // the interrupted event renders when the loop unwinds
     }
+    // Detached turn (v0.34.0): ctrl+c is the draft/quit key at a FREE prompt —
+    // it must never silently kill background work. /tasks stop t<n> does.
     if (pendingBuf !== null) {
       pendingBuf = null;
       console.log(c.dim('\n  (multi-line input cleared)'));
@@ -1800,7 +1894,12 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
 
   // ── Esc routing: interrupt a running turn (Claude Code style) ──────────────
   rl.on('escape', () => {
-    if (busy && aborter) aborter.abort();
+    if (busy && aborter && !bg) aborter.abort(); // detached turns: /tasks stop t<n>, never a stray esc
+  });
+
+  // ── Ctrl+B: detach the running turn (v0.34.0) ───────────────────────────
+  rl.on('detach', () => {
+    detachTurn();
   });
 
   // ── Double-esc rewind menu (v0.32.0) ─────────────────────────────────────
@@ -1872,6 +1971,12 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         rl.prompt();
         return;
       }
+      // Save/restore, not clear (v0.34.0 review catch): a `!` command can run
+      // while a turn is in flight (attached queue-wait, or detached — the
+      // whole point of ctrl+b). Blinding busy=false here would release the
+      // mutex and let a second chat.turn start mid-turn, interleaving
+      // conversation history. Restore whatever the flag was.
+      const wasBusy = busy;
       busy = true;
       const r = await runBash(cmd, { cwd: root, trusted: true, timeoutMs: 600000, maxOutputChars: 20000 });
       if (r.stdout?.trim()) console.log(r.stdout.trimEnd());
@@ -1879,7 +1984,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       if (r.interrupted) console.log(c.yellow('  ⏸ interrupted'));
       else if (!r.ok) console.log(c.gray(`  exit ${r.code}${r.blocked ? ` (${r.stderr || 'blocked'})` : ''}`));
       ensureRecorder(input).append({ type: 'shell', command: cmd, code: r.code });
-      busy = false;
+      busy = wasBusy;
       rl.prompt();
       return;
     }
@@ -1934,11 +2039,22 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           return;
         }
       }
-      if (busy) {
-        say('  (Buddy is still working — Ctrl+C to interrupt first)');
+      // Safe-while-busy allowlist (v0.34.0): read-only/box-local commands run
+      // even with a turn in flight — that's the whole point of a background
+      // task: the prompt keeps working. Everything else still refuses (state
+      // mutations mid-turn would race the running turn).
+      const BUSY_OK = new Set(['tasks', 'copy', 'help', 'context', 'cost', 'stats', 'status', 'todo', 'why', 'tools', 'agents', 'skills', 'mcp', 'memory', 'experience', 'events', 'stream', 'theme', 'verbosity', 'statusline', 'vim', 'terminal-setup', 'permissions']);
+      if (busy && !BUSY_OK.has(slash.name)) {
+        say(bg
+          ? `  (task t${bg.id} is running in the background — /tasks to check · /tasks stop ${bg.id} to end it)`
+          : '  (Buddy is still working — Ctrl+C to interrupt first)');
         rl.prompt();
         return;
       }
+      // Save/restore (v0.34.0 review catch — same mutex rule as the `!` path):
+      // safe slash commands may run while a turn is in flight; the flag must
+      // survive the command, not be cleared by it.
+      const wasBusy = busy;
       busy = true;
       try {
         const res = await handleSlash(slash);
@@ -1949,7 +2065,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       } catch (e) {
         say(`  ${c.red('command failed')}: ${truncate(e.message, 240)}`);
       }
-      busy = false;
+      busy = wasBusy;
       rl.prompt();
       return;
     }
@@ -1980,6 +2096,48 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     await runTask(taskText, taskOpts);
   }
 
+  // ── Background turns (v0.34.0) ────────────────────────────────────────────
+  // ctrl+b mid-turn: the record is born, the footer releases, the prompt is
+  // the user's again. The turn goes on mutating ONLY its own scope + the
+  // record; live rendering stays off until /tasks attach (or an approval
+  // pulls it back). Esc/ctrl+c never kill a detached turn — /tasks stop does.
+  function detachTurn() {
+    if (!aborter || bg) return; // no turn in flight, or already detached
+    if (turnBgRecord) {
+      // this turn was detached once and re-attached — resume the same record
+      bg = turnBgRecord;
+      bg.reattached = false;
+      bg.detachedAt = Date.now();
+    } else {
+      bgSeq += 1;
+      bg = createBgTurn({ id: bgSeq, task: turnTaskText, startedAt: turnStart.at, detachedAt: Date.now() });
+      bg.tools = toolCallsThisTurn;
+      bg.bytes = turnStreamBytes;
+      bg.denied = turnDenied;
+      bg.errors = turnErrors;
+      turnBgRecord = bg;
+      bgList.push(bg);
+      while (bgList.length > BG.HISTORY_CAP + 1) { // +1: the running record never drops
+        const oldest = bgList.find((r) => r.status !== 'running');
+        if (!oldest) break;
+        bgList.splice(bgList.indexOf(oldest), 1);
+      }
+    }
+    rl.setBusy(null); // the footer is the prompt's again; the turn keeps its label for re-attach
+    rl.setThought(null);
+    say(`  ${SEM.narrate('⌃')} detached — task ${c.bold(`t${bg.id}`)} runs in the background, output muted`);
+    say(`    ${c.gray(`/tasks to check · /tasks view ${bg.id} · /tasks attach ${bg.id} to follow live · keep typing, it queues`)}`);
+  }
+
+  /** Pull a running task back to the foreground (live rendering resumes). */
+  function attachTurn(rec) {
+    if (!rec || rec.status !== 'running') return;
+    rec.reattached = true;
+    if (bg === rec) bg = null;
+    rl.setBusy(busyLabel || 'Buddy working…'); // footer + strip return
+    say(`  ${SEM.narrate('⌄')} attached — task ${c.bold(`t${rec.id}`)} prints live again ${c.gray(`(buffered so far: /tasks view ${rec.id})`)}`);
+  }
+
   /** One Buddy turn (shared by plain tasks and /<skill-name> invocations).
    *  Typing while a turn runs QUEUES the message (Claude Code style): queued
    *  tasks run in order when the current turn ends; Ctrl+C interrupts the
@@ -2004,8 +2162,14 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     }
     if (busy) {
       msgQueue.push({ text: inputText });
-      say(`  ${c.cyan('⌁ queued')} ${c.dim(`— I'll run it when this turn ends (${msgQueue.length} waiting)`)}`);
-      rl.setBusy(`${busyLabel || 'Buddy working'} · ${msgQueue.length} queued`);
+      if (bg) {
+        // Detached turn (v0.34.0): the footer is the prompt's — never repaint
+        // a busy label over it; the queue note names the task it waits for.
+        say(`  ${c.cyan('⌁ queued')} ${c.dim(`— runs after task t${bg.id} finishes (${msgQueue.length} waiting)`)}`);
+      } else {
+        say(`  ${c.cyan('⌁ queued')} ${c.dim(`— I'll run it when this turn ends (${msgQueue.length} waiting)`)}`);
+        rl.setBusy(`${busyLabel || 'Buddy working'} · ${msgQueue.length} queued`);
+      }
       rl.prompt();
       return;
     }
@@ -2020,6 +2184,8 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         turnErrors = 0;
         lastTask = { task: current.text, events };
         turnStart.at = Date.now();
+        turnTaskText = current.text; // the bg record's task column (set before any detach)
+        turnBgRecord = null;         // a fresh turn has no background record yet
         aborter = new AbortController();
         const recorded = recordAs || current.text;
         ensureRecorder(recorded).append({ type: 'user', text: recorded });
@@ -2027,10 +2193,24 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         rl.setBusy(busyLabel);
         rl.setThought(null); // fresh turn — no stale thought from the last one
         let out = null;
+        let turnThrew = false;
         try {
           out = await chat.turn(current.text, { signal: aborter.signal, skill, anchor, images });
           recorder.append({ type: 'say', text: out.said ?? '' });
           lastTask.events = events;
+          if (bg) {
+            // Detached at completion (v0.34.0): one compact note instead of
+            // the ribbon + statusline — the foreground stays quiet; the full
+            // flow lives in the record (/tasks view) and the ctrl+r transcript.
+            bgFinish(bg, { at: Date.now(), steps: out.steps || 0, said: out.said, aborted: !!out.aborted });
+            bg.tools = toolCallsThisTurn;
+            bg.bytes = turnStreamBytes;
+            bg.denied = turnDenied;
+            bg.errors = turnErrors;
+            const note = renderBgNote(bg);
+            if (note) console.log(note);
+            bg = null;
+          } else {
           // Aurora done ribbon (v0.29.0): how the turn ended, at a glance —
           // green when clean, amber when something was denied, red on errors.
           // Absorbs the old plain ⏱ footer; ctx + gateway ride behind it.
@@ -2049,14 +2229,26 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
             cwd: path.basename(root),
           });
           if (statusLine) console.log(c.gray(`  ${statusLine}`));
+          }
           debugLog(`turn done: steps=${out.steps} said=${out.said ? 'yes' : 'no'}`);
         } catch (e) {
+          turnThrew = true;
           console.log(`  ${c.red('turn failed')}: ${truncate(e.message, 300)}`);
         } finally {
           rl.setBusy(null);
           rl.setThought(null);
           thoughtExtractor.reset();
           busyLabel = null;
+        }
+        // The turn's bg record always finishes — detached at the end OR
+        // re-attached midway (the ribbon printed, the record still closes).
+        // A detached turn that THREW lands here too (its finish branch was
+        // skipped) — bg must drop or the next turn's events would route
+        // into a dead record.
+        if (turnBgRecord && turnBgRecord.status === 'running') {
+          bgFinish(turnBgRecord, { at: Date.now(), steps: out?.steps || 0, said: out?.said ?? null, aborted: !!out?.aborted, failed: turnThrew });
+          if (bg === turnBgRecord) bg = null;
+          turnBgRecord = null;
         }
         // v0.25.0 post-turn, best-effort, never blocks the queue:
         //   routing memory — fold this turn's measured latencies into
