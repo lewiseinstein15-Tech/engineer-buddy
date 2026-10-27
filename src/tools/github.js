@@ -1,6 +1,8 @@
 // github.js — minimal GitHub REST client (zero dependencies).
 // Auth comes from GITHUB_TOKEN in Actions (no secrets to configure) or
-// BUDDY_GITHUB_TOKEN for local runs.
+// BUDDY_GITHUB_TOKEN for local runs. A credential embedded in the origin
+// remote URL (https://user:TOKEN@github.com/…) also works — v0.35.0 — and a
+// BAD embedded token falls back to anonymous reads on public repos.
 import { fetchWithTimeout, BuddyError, sleep } from '../util.js';
 
 export class GitHubClient {
@@ -18,6 +20,15 @@ export class GitHubClient {
     };
   }
 
+  _headers(unauth = false) {
+    return {
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'engineer-buddy',
+      ...(this.token && !unauth ? { Authorization: `Bearer ${this.token}` } : {}),
+    };
+  }
+
   async _req(path, { method = 'GET', body, raw = false, accept } = {}) {
     const url = path.startsWith('http') ? path : `${this.apiBase}${path}`;
     let lastErr = null;
@@ -28,7 +39,7 @@ export class GitHubClient {
           url,
           {
             method,
-            headers: { ...this.headers, ...(accept ? { Accept: accept } : {}) },
+            headers: { ...this._headers(), ...(accept ? { Accept: accept } : {}) },
             body: body ? JSON.stringify(body) : undefined,
           },
           this.httpMs
@@ -37,6 +48,16 @@ export class GitHubClient {
         lastErr = new BuddyError(`github: network error ${e.message}`, { code: 'NETWORK', cause: e });
         await sleep(1000 * attempt);
         continue;
+      }
+      // A bad/expired embedded credential (remote URL) must not break reads
+      // that would work anonymously on a public repo: one unauthenticated
+      // retry for GETs. Writes and private repos still surface the real 401.
+      if (res.status === 401 && this.token && method === 'GET') {
+        res = await fetchWithTimeout(
+          url,
+          { method, headers: { ...this._headers(true), ...(accept ? { Accept: accept } : {}) } },
+          this.httpMs
+        ).catch(() => res);
       }
       if (res.status === 403 || res.status === 429) {
         const remaining = res.headers.get('x-ratelimit-remaining');
@@ -205,5 +226,30 @@ export class GitHubClient {
   async findOpenIssueByTitlePrefix(prefix) {
     const issues = await this.listOpenIssues({ max: 100 });
     return issues.find((i) => (i.title || '').startsWith(prefix)) || null;
+  }
+
+  // ---------- agent-facing reads (v0.35.0 gh tool / /ci / /pr-comments) ----------
+
+  /** Workflow runs, newest first. `branch` uses the API's server-side filter. */
+  listActionRuns({ branch, perPage = 30 } = {}) {
+    const n = Math.min(Math.max(Number(perPage) || 30, 1), 100);
+    const q = branch ? `&branch=${encodeURIComponent(String(branch))}` : '';
+    return this._req(`/repos/${this.repo}/actions/runs?per_page=${n}${q}`);
+  }
+
+  /** Open PRs, newest-updated first. `head` filters ("owner:branch" or full ref). */
+  listOpenPulls({ head } = {}) {
+    const q = head ? `&head=${encodeURIComponent(head)}` : '';
+    return this._paginate(`/repos/${this.repo}/pulls?state=open&sort=updated&direction=desc${q}`);
+  }
+
+  /** Inline review comments of a PR (file/line-positioned). */
+  listReviewComments(number) {
+    return this._paginate(`/repos/${this.repo}/pulls/${number}/comments?sort=created&direction=asc`);
+  }
+
+  /** Review bodies of a PR (the "reviewed with these remarks" wrappers). */
+  listReviews(number) {
+    return this._paginate(`/repos/${this.repo}/pulls/${number}/reviews`);
   }
 }
