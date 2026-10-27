@@ -183,11 +183,16 @@ export function exportMarkdown(file, { workspace = '' } = {}) {
   let turn = 0;
   let pendingUser = null;
   const toolTally = new Map();
+  const toolWhys = [];
   const flushTools = () => {
     if (!toolTally.size) return;
     const tally = [...toolTally.entries()].map(([t, n]) => `${t}${n > 1 ? `×${n}` : ''}`).join(', ');
     lines.push(``, `*(${[...toolTally.values()].reduce((a, b) => a + b, 0)} tool call${[...toolTally.values()].reduce((a, b) => a + b, 0) === 1 ? '' : 's'}: ${tally})*`);
+    // Decision rationale (v0.37.0): steps the model explained get their why
+    // under the tally, in call order — the export answers "why that file?".
+    for (const { tool, why } of toolWhys) lines.push(`  · **${tool}** — *why: ${why}*`);
     toolTally.clear();
+    toolWhys.length = 0;
   };
   for (const e of events) {
     if (e.type === 'user') {
@@ -197,6 +202,7 @@ export function exportMarkdown(file, { workspace = '' } = {}) {
       lines.push(``, `## Turn ${turn}`, '', `**You:** ${pendingUser}`, '');
     } else if (e.type === 'tool') {
       toolTally.set(e.tool, (toolTally.get(e.tool) || 0) + 1);
+      if (e.why) toolWhys.push({ tool: e.tool, why: String(e.why).replace(/\s+/g, ' ').trim() });
     } else if (e.type === 'say') {
       lines.push(`**Buddy:** ${String(e.text ?? '').replace(/\n/g, '  \n')}`, '');
       pendingUser = null;
@@ -247,7 +253,7 @@ export function exportHtml(file, { title = '', workspace = '' } = {}) {
       const at = e.at ? new Date(e.at).toLocaleTimeString() : '';
       if (e.type === 'user') return `<div class="row user"><span class="who">you</span><div class="bubble">${esc(e.text)}</div><span class="at">${at}</span></div>`;
       if (e.type === 'say') return `<div class="row buddy"><span class="who">buddy</span><div class="bubble">${esc(e.text)}</div><span class="at">${at}</span></div>`;
-      if (e.type === 'tool') return `<div class="row tool"><span class="who">tool</span><div class="bubble"><code>${esc(e.tool)} ${esc(e.args?._preview || JSON.stringify(e.args || {}).slice(0, 160))}</code>${e.observation ? `<pre>${esc(String(e.observation).slice(0, 400))}</pre>` : ''}</div><span class="at">${at}</span></div>`;
+      if (e.type === 'tool') return `<div class="row tool"><span class="who">tool</span><div class="bubble"><code>${esc(e.tool)} ${esc(e.args?._preview || JSON.stringify(e.args || {}).slice(0, 160))}</code>${e.why ? `<div class="why">why: ${esc(e.why)}</div>` : ''}${e.observation ? `<pre>${esc(String(e.observation).slice(0, 400))}</pre>` : ''}</div><span class="at">${at}</span></div>`;
       if (e.type === 'shell') return `<div class="row tool"><span class="who">shell</span><div class="bubble"><code>! ${esc(e.command)}</code></div><span class="at">${at}</span></div>`;
       return '';
     })
@@ -266,6 +272,7 @@ export function exportHtml(file, { title = '', workspace = '' } = {}) {
   .buddy .who { color: #79b8ff; }
   .bubble { flex: 1; background: #1b201b; border: 1px solid #2a2f2a; border-radius: 8px; padding: 8px 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
   .tool .bubble { opacity: .85; font-size: 13px; }
+  .why { color: #8a8f8a; font-style: italic; font-size: 12px; margin-top: 4px; }
   .bubble pre { margin: 6px 0 0; font-size: 12px; color: #b8bdb8; max-height: 160px; overflow: hidden; }
   .bubble code { color: #d7ba7d; font-size: 12px; }
   .at { flex: 0 0 auto; font-size: 10px; color: #565b56; padding-top: 10px; }

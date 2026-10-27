@@ -633,7 +633,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           bg.denied = turnDenied;
           bg.errors = turnErrors;
           try {
-            recorder?.append({ type: 'tool', tool: ev.tool, args: { _preview: truncate(JSON.stringify(ev.args), 160) }, observation: truncate(ev.observation, 160), denied: ev.denied });
+            recorder?.append({ type: 'tool', tool: ev.tool, args: { _preview: truncate(JSON.stringify(ev.args), 160) }, observation: truncate(ev.observation, 160), denied: ev.denied, ...(ev.why ? { why: ev.why } : {}) });
           } catch {
             /* transcript is best-effort */
           }
@@ -672,7 +672,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         rl.setToolCalls(toolCallsThisTurn); // Aurora strip telemetry
         lastGateway = ev.gateway || lastGateway;
         try {
-          recorder?.append({ type: 'tool', tool: ev.tool, args: { _preview: truncate(JSON.stringify(ev.args), 160) }, observation: truncate(ev.observation, 160), denied: ev.denied });
+          recorder?.append({ type: 'tool', tool: ev.tool, args: { _preview: truncate(JSON.stringify(ev.args), 160) }, observation: truncate(ev.observation, 160), denied: ev.denied, ...(ev.why ? { why: ev.why } : {}) });
         } catch {
           /* transcript is best-effort */
         }
@@ -801,6 +801,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
               ['/sessions', 'list saved transcripts'],
               ['/resume <n|prefix>', 'resume a saved session'],
               ['/export', 'write the transcript to .buddy/exports/ as markdown'],
+              ['/replay', 'watch a saved session step-by-step — exit and run `buddy --replay [name]`'],
               ['/status', 'session stats'],
               ['/quit', 'leave'],
             ].map(([k, d]) => `    ${c.bold(k.padEnd(20))} ${c.dim(d)}`),
@@ -1008,6 +1009,15 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         }
         break;
       }
+      case 'replay': {
+        // Replayable narration (v0.37.0): the player is a standalone TTY mode
+        // (raw keys, paced paint) — it cannot share the box with the live
+        // input, so the command points at the door instead of pretending.
+        say(
+          `\n  ${c.bold('Replay')} plays a saved session back step-by-step, paced from its own timestamps\n  run it from your shell:  ${c.bold(`buddy --replay${args ? ` ${args.trim()}` : ''}`)}${args ? '' : c.gray('   (newest session; pass a name for an older one)')}\n`
+        );
+        break;
+      }
       case 'events': {
         const n = Math.min(Math.max(parseInt(args, 10) || 15, 1), 100);
         const evs = readEvents(root, n);
@@ -1016,7 +1026,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           break;
         }
         const detail = (e) => {
-          if (e.type === 'tool') return `${e.tool}${e.denied ? c.red(' DENIED') : ''}${e.gateway ? c.gray(` · ${e.gateway}`) : ''}`;
+          if (e.type === 'tool') return `${e.tool}${e.denied ? c.red(' DENIED') : ''}${e.gateway ? c.gray(` · ${e.gateway}`) : ''}${e.why ? c.gray(` — ${e.why}`) : ''}`;
           if (e.type === 'turn_end') return `${e.steps} steps · ${e.calls} calls · ~${fmtTok(e.tokIn)}/~${fmtTok(e.tokOut)} tok · ${(e.durationMs / 1000).toFixed(1)}s`;
           if (e.type === 'error') return truncate(e.text || '', 60);
           if (e.type === 'compaction') return `kept ${e.kept} · dropped ${e.dropped}${e.auto ? ' · auto' : ''}`;

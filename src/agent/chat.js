@@ -18,10 +18,23 @@ import { estimateTokens } from '../brain/usage.js';
 export const PROTOCOL_PREAMBLE = [
   'You are Engineer Buddy ("Buddy Code"), a software engineer working in the user\'s terminal inside this repository.',
   'Protocol: every reply must be EXACTLY ONE JSON object and nothing else:',
-  '  {"tool":"<tool-name>","args":{...}}   to use a tool, or',
+  '  {"tool":"<tool-name>","args":{...},"why":"..."}   to use a tool, or',
   '  {"tool":"say","message":"..."}        to speak to the user and end the turn.',
+  'The optional "why" field (tool calls only) is ONE short sentence — why this step, why this file — shown to the user next to the tool card and kept in the session log. Keep it under 20 words; skip it only when the reason is obvious from the tool name.',
   'Never output prose outside JSON. Never invent tool results. Never claim you ran a command you did not run.',
 ].join('\n');
+
+// Decision rationale (v0.37.0): the model may ship a `why` sentence with each
+// tool call — logged beside the card in the session JSONL, the event log and
+// the exports. Hard-capped with a clean ellipsis: a rationale is a sentence
+// for humans, not a preview that can afford `…[+N chars]` noise.
+export const WHY_MAX = 240;
+export function extractWhy(value) {
+  const w = value && typeof value === 'object' ? value.why : undefined;
+  const s = typeof w === 'string' ? w.trim() : '';
+  if (!s) return undefined;
+  return s.length <= WHY_MAX ? s : `${s.slice(0, WHY_MAX - 1)}…`;
+}
 
 // Research-repeat guard (v0.9.3 live test: kilo ran fs_search "todo" six
 // identical times, burned its own 6/6 cap, and wasted ~8 of 14 steps).
@@ -582,7 +595,8 @@ export function createChat({
       }
 
       debugLog(`chat step ${step}: ${tool}${denied ? ' (denied)' : ''} → ${truncate(observation, 120)}`);
-      onEvent({ type: 'tool', tool, args, observation, denied, salvaged, preview, argText: impl?.render ? String(impl.render(args) || '').slice(0, 200) : '', durationMs, model: res.model, gateway: res.gateway });
+      const why = extractWhy(parsed.value);
+      onEvent({ type: 'tool', tool, args, observation, denied, salvaged, preview, ...(why ? { why } : {}), argText: impl?.render ? String(impl.render(args) || '').slice(0, 200) : '', durationMs, model: res.model, gateway: res.gateway });
       messages.push({ role: 'assistant', content: JSON.stringify({ tool, args }) });
       messages.push({ role: 'user', content: `TOOL OBSERVATION:\n${observation}\n\nContinue with the next JSON step.` });
     }

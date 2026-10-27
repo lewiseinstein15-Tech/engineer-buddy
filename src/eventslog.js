@@ -89,6 +89,10 @@ export function projectEvent(ev) {
         gateway: ev.gateway || null,
         model: ev.model || null,
         obsChars: String(ev.observation || '').length,
+        // Decision rationale (v0.37.0): the model's why-this-step sentence,
+        // when it shipped one — the event log is the "why did it edit that
+        // file" answer machine.
+        ...(ev.why ? { why: String(ev.why) } : {}),
       };
     case 'compaction':
       return { ...base, kept: ev.kept, dropped: ev.dropped, auto: Boolean(ev.auto) };

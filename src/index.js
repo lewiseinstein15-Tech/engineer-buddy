@@ -56,6 +56,9 @@ Local coding agent (Buddy Code — like Claude Code, in your terminal):
   engineer-buddy -p "task" -o json      machine-readable output (text | json | stream-json)
   engineer-buddy -c                     continue the newest session in this directory
   engineer-buddy -r <name>              resume a named session (see /rename)
+  engineer-buddy --replay [name]        replay a saved session step-by-step, paced from its
+                                        own timestamps (space pause · n next · [ ] speed · q quit;
+                                        newest session when no name is given)
   engineer-buddy init                   scaffold .buddy/harness/ (systemprompt, guardrails,
                                         MEMORY.md, tool guidance, skills)
   engineer-buddy update [--check]       self-update from the latest git tag
@@ -265,6 +268,7 @@ async function cmdChat(argv, { oneShot = false } = {}) {
       config: { type: 'string' },
       dir: { type: 'string' },
       worktree: { type: 'boolean', default: false },
+      replay: { type: 'boolean', default: false },
       c: { type: 'boolean', default: false },
       continue: { type: 'boolean', default: false },
       r: { type: 'string' },
@@ -277,6 +281,22 @@ async function cmdChat(argv, { oneShot = false } = {}) {
   const cfg = loadConfig({ file: values.config });
   const router = buildRouter(cfg);
   let root = values.dir ? path.resolve(values.dir) : process.cwd();
+
+  // --replay (v0.37.0): watch a saved session step-by-step. Read-only — the
+  // JSONL is never touched — so it runs BEFORE worktree isolation (a replay
+  // wants the sessions of the directory you are IN, not a fresh checkout).
+  if (values.replay) {
+    const needle = positionals[0] || null;
+    const file = needle ? findSession(root, needle) : latestSession(root);
+    if (!file) {
+      console.error(`buddy: nothing to replay — ${needle ? `no session matches "${needle}"` : 'no saved sessions'} in ${root}`);
+      return 2;
+    }
+    const { playReplay } = await import('./terminal/replay.js');
+    const out = await playReplay({ file });
+    if (!out.ok) console.error(`buddy: replay failed — ${out.error}`);
+    return out.ok ? 0 : 2;
+  }
 
   // --worktree (v0.36.0): isolate this run in its own git worktree — a fresh
   // checkout of HEAD on a buddy/<slug> branch under .buddy/worktrees/. The

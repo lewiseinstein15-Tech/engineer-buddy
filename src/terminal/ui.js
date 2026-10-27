@@ -287,10 +287,14 @@ export function renderTable(rows, { headers = null, indent = '  ' } = {}) {
  *  verbose (ctrl+o transcript, v0.30.0): the observation keeps up to 24
  *  lines / 1200 chars instead of the collapsed 5 / 400 caps.
  *  obsIndex (v0.33.0): the observation's /copy register number — printed
- *  in the collapse hint so a long card tells you how to grab ALL of it. */
-export function renderToolEvent(ev, { preview = true, cols = null, verbose = false, obsIndex = null } = {}) {
+ *  in the collapse hint so a long card tells you how to grab ALL of it.
+ *  why (v0.37.0): the model's decision rationale — a dim line between the
+ *  head and the observation; absent → the card is byte-identical to v0.36. */
+export function renderToolEvent(ev, { preview = true, cols = null, verbose = false, obsIndex = null, why = true } = {}) {
   const parts = [];
   parts.push(renderToolCall({ tool: ev.tool, args: ev.args, denied: ev.denied, argText: ev.argText, durationMs: ev.durationMs ?? null, cols }));
+  const w = why === false ? '' : String(ev.why ?? '').trim();
+  if (w) parts.push(`${c.gray('  ⎿')} ${c.gray(c.italic(`why: ${w}`))}`);
   if (preview && ev.preview) parts.push(String(ev.preview));
   parts.push(renderObservation(ev.observation, verbose
     ? { maxLines: 24, maxChars: 1200, denied: !!ev.denied, obsIndex, headOnlyMax: CARDS.VERBOSE_SHOW, head: CARDS.VERBOSE_HEAD, tail: CARDS.VERBOSE_TAIL }
