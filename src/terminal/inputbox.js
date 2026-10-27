@@ -139,6 +139,8 @@ function withCursor(line, ci) {
 //   text, cursor, placeholder, hint,
 //   question: string|null          — question-mode prompt text (as placeholder)
 //   busy: null | { label, secs, glyph }
+//   bgNote: string|null — while a detached task runs, the footer's left side
+//           names it (the idle hint yields: the news is the background task)
 //   statusRight: string
 //   palette: null | { items: [{name, desc}], sel }
 //   viewer: null | { open, rows, scroll }   — ctrl+r transcript viewer (v0.31.0)
@@ -263,6 +265,10 @@ export function buildFrame(state, cols) {
   let left; const right = state.statusRight ? c.dim(state.statusRight) : '';
   if (state.busy) {
     left = `${c.cyan(state.busy.glyph)} ${c.bold(state.busy.label)}${c.dim(` · esc to interrupt · ${state.busy.secs}s`)}`;
+  } else if (state.bgNote) {
+    // Detached task (v0.34.0): while one runs, the footer names it — that is
+    // the news. The static hint yields; /tasks is one keystroke away.
+    left = c.dim(String(state.bgNote));
   } else {
     left = c.dim(String(state.hint ?? ''));
   }
@@ -325,6 +331,7 @@ export function createInputBox({
   let lastEscapeAt = 0; // arms the double-esc chord; any other key disarms
   let vimOn = false; // /vim (v0.33.0): modal editing on the draft
   let vim = createVimState();
+  let bgNote = null; // v0.34.0: set while a detached task runs (the footer's left side)
   let busyStart = 0;
   let spinIdx = 0;
   let spinTimer = null;
@@ -361,6 +368,7 @@ export function createInputBox({
       tick: spinIdx,
       toolCalls: toolCallsCount,
       verbose,
+      bgNote: bgNote && !busyLabel ? bgNote : null, // the busy footer owns the left side while busy
       viewer: viewerOpen
         ? { open: true, rows: viewerBodyRows(process.stdout?.rows, process.stdout?.columns), scroll: viewerScroll }
         : null,
@@ -730,8 +738,13 @@ export function createInputBox({
     cancelQuestion() { if (mode === 'question') { mode = 'input'; questionText = ''; questionCb = null; text = ''; cursor = 0; redraw(); } },
     close,
     on(ev, fn) { handlers[ev] = fn; return rl; },
-    // test / harness seam: drive the box's key reducer directly
-    _handleKeypress(key) { onKeypress(key || {}); },
+    // v0.34.0: the background-task note (footer left while idle) — set by the
+    // repl at detach, cleared at attach/completion
+    setBgNote(t) {
+      bgNote = t || null;
+      redraw();
+    },
+    _handleKeypress(key) { onKeypress(key || {}); }, // test / harness seam
     // /vim (v0.33.0): toggle modal editing; a fresh state every time so a
     // half-finished pending op or count can never leak across sessions
     // (question mode bypasses the reducer by design — routeVim checks mode)
@@ -744,7 +757,7 @@ export function createInputBox({
     // onPrint wiring receives from renderer.print in production)
     _capture: pushTranscript,
     // test / introspection hooks
-    _state: () => ({ text, cursor, mode, history: [...history], busy: busyLabel, thought: busyThought, toolCalls: toolCallsCount, verbose, viewer: viewerOpen ? { scroll: viewerScroll } : null, menu: menuOpen ? { sel: menuSel, count: menuEntries.length } : null, vim: vimOn ? { mode: vim.mode, pending: vim.pending, count: vim.count } : null, transcriptLines: transcript.length, palette: paletteItems().map((i) => i.name) }),
+    _state: () => ({ text, cursor, mode, history: [...history], busy: busyLabel, thought: busyThought, toolCalls: toolCallsCount, verbose, bgNote, viewer: viewerOpen ? { scroll: viewerScroll } : null, menu: menuOpen ? { sel: menuSel, count: menuEntries.length } : null, vim: vimOn ? { mode: vim.mode, pending: vim.pending, count: vim.count } : null, transcriptLines: transcript.length, palette: paletteItems().map((i) => i.name) }),
   };
 
   rl.install = function install() {

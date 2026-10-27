@@ -228,6 +228,23 @@ test('buildFrame: bg marker in statusRight stays inside W at 34..100 cols', () =
   }
 });
 
+test('buildFrame: bgNote replaces the idle hint while a task is detached; busy still wins', () => {
+  const state = {
+    text: '', cursor: 0, placeholder: '', hint: '? shortcuts · esc stop', question: null,
+    busy: null, bgNote: '⌃ t1 runs in the background — output muted · /tasks to check',
+    statusRight: 'bg t1▶ · kilo', palette: null, viewer: null, menu: null, tick: 0,
+  };
+  const idle = strip(buildFrame(state, 100).join('\n'));
+  assert.match(idle, /t1 runs in the background/);
+  assert.ok(!idle.includes('? shortcuts'), 'the hint yields to the bg note');
+  assert.match(idle, /bg t1▶ · kilo/, 'the short bg-first statusRight renders beside the note');
+
+  const busyState = { ...state, busy: { label: 'Buddy working…', secs: 3, glyph: '⠋' } };
+  const busy = strip(buildFrame(busyState, 100).join('\n'));
+  assert.match(busy, /Buddy working/);
+  assert.ok(!busy.includes('t1 runs in the background'), 'the busy footer owns the left side');
+});
+
 // ── repl wiring tripwire (source checks — the REPL needs a TTY) ─────────────
 
 test('repl wiring: mute branch, guards, queue note, completion note, exit guard all present', () => {

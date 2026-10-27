@@ -719,14 +719,16 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   const rl = createInputBox({
     title: 'Buddy',
     placeholder: 'type a task…   (/ for commands · ! shell · # remember)',
-    hint: '? shortcuts · ↑↓ history · esc stop · ctrl+o expand · ctrl+r transcript · ctrl+b background · ctrl+c quit',
+    hint: '? shortcuts · esc stop · ctrl+o expand · ctrl+r transcript · ctrl+b background',
     record: recordPath,
     statusRight: () => {
       try {
         const ctxK = (chat.historyChars() / 1000).toFixed(1);
         const mode = modes.plan ? ' · plan' : yolo ? ' · auto-accept' : '';
-        const bgMark = bg ? ` · bg t${bg.id}▶` : '';
-        return `v${VERSION} · ${lastGateway || router.order[0]} · ${ctxK}k ctx${mode}${bgMark}`;
+        // Detached (v0.34.0): the bg marker LEADS and the version drops — the
+        // marker must survive the footer's width guard at real terminals.
+        if (bg) return `bg t${bg.id}▶ · ${lastGateway || router.order[0]}`;
+        return `v${VERSION} · ${lastGateway || router.order[0]} · ${ctxK}k ctx${mode}`;
       } catch { return `v${VERSION} · ${lastGateway || router.order[0]}`; }
     },
     commands: [
@@ -2125,6 +2127,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     }
     rl.setBusy(null); // the footer is the prompt's again; the turn keeps its label for re-attach
     rl.setThought(null);
+    rl.setBgNote(`⌃ t${bg.id} runs in the background — output muted · /tasks to check`);
     say(`  ${SEM.narrate('⌃')} detached — task ${c.bold(`t${bg.id}`)} runs in the background, output muted`);
     say(`    ${c.gray(`/tasks to check · /tasks view ${bg.id} · /tasks attach ${bg.id} to follow live · keep typing, it queues`)}`);
   }
@@ -2134,6 +2137,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     if (!rec || rec.status !== 'running') return;
     rec.reattached = true;
     if (bg === rec) bg = null;
+    rl.setBgNote(null); // the classic hint returns
     rl.setBusy(busyLabel || 'Buddy working…'); // footer + strip return
     say(`  ${SEM.narrate('⌄')} attached — task ${c.bold(`t${rec.id}`)} prints live again ${c.gray(`(buffered so far: /tasks view ${rec.id})`)}`);
   }
@@ -2210,6 +2214,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
             const note = renderBgNote(bg);
             if (note) console.log(note);
             bg = null;
+            rl.setBgNote(null); // the task is done — the hint returns
           } else {
           // Aurora done ribbon (v0.29.0): how the turn ended, at a glance —
           // green when clean, amber when something was denied, red on errors.
@@ -2248,6 +2253,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         if (turnBgRecord && turnBgRecord.status === 'running') {
           bgFinish(turnBgRecord, { at: Date.now(), steps: out?.steps || 0, said: out?.said ?? null, aborted: !!out?.aborted, failed: turnThrew });
           if (bg === turnBgRecord) bg = null;
+          rl.setBgNote(null); // every teardown path clears the footer note
           turnBgRecord = null;
         }
         // v0.25.0 post-turn, best-effort, never blocks the queue:
