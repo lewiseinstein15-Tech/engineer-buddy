@@ -20,10 +20,14 @@
 //                     edit the files (gated fs tools), stage, and commit.
 //                     Or `abort` to walk away clean.
 //
-// Ops (14): stage, unstage, commit, branch, checkout, merge, rebase,
-//           rebase_continue, abort, stash, unstash, restore, tag, conflicts
-// Not here ON PURPOSE: push/pull/fetch (credentials + remote state belong to
-// the user's terminal or the bot path in git.js), clean/reset --hard (use
+// Ops (16): stage, unstage, commit (generate:true drafts from the diff +
+//           Co-Authored-By), branch, checkout, merge, rebase, rebase_continue,
+//           abort, stash, unstash, restore, tag, conflicts, push (gated,
+//           never force by default), pr (branch → commit → push → the gh
+//           pr_create handoff — the PR creation flow).
+// Not here ON PURPOSE: pull/fetch (they rewrite the LOCAL state from the
+// network — rebase/merge/abort already cover the local half; fetching is a
+// read the user's terminal or the bot path owns), clean/reset --hard (use
 // restore with a pathspec so the preview shows exactly what dies).
 //
 // All git invocations are non-interactive by construction: GIT_EDITOR=true,
@@ -34,6 +38,8 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { truncate } from '../util.js';
+import { draftCommitMessage, withTrailer } from './commitmsg.js';
+import { resolveGh } from './ghapi.js';
 
 const GIT_ENV = {
   GIT_EDITOR: 'true', // exits 0 immediately — rebase --continue never hangs
@@ -47,6 +53,7 @@ const GIT_ENV = {
 export const GIT_WRITE_OPS = [
   'stage', 'unstage', 'commit', 'branch', 'checkout', 'merge', 'rebase',
   'rebase_continue', 'abort', 'stash', 'unstash', 'restore', 'tag', 'conflicts',
+  'push', 'pr',
 ];
 
 /** Ops that are pure reads — they skip the approval gate entirely. */
@@ -232,12 +239,31 @@ function previewFor(root, op, a = {}) {
       return statOr(root, ['diff', '--stat'], '(no tracked unstaged changes — untracked files are staged as-is)');
     case 'unstage':
       return statOr(root, ['diff', '--cached', '--stat'], '(nothing staged)');
-    case 'commit':
+    case 'commit': {
+      // v0.36.0 drill fix: the all:true branch used to RETURN early, so the
+      // gate never previewed the drafted message when the model (sensibly)
+      // sent {generate:true, all:true} together. Now every commit preview
+      // names the draft — from the staged diff when one exists, or honestly
+      // "after staging" when all:true will build it.
+      const parts = [];
       if (a.all) {
         const n = runGit(root, ['status', '--porcelain']).out.split('\n').filter(Boolean).length;
-        return n ? `${n} changed file(s) will be staged first (all:true)` : '(nothing to commit — working tree clean)';
+        parts.push(n ? `${n} changed file(s) will be staged first (all:true)` : '(nothing to commit — working tree clean)');
+      } else {
+        parts.push(statOr(root, ['diff', '--cached', '--stat'], '(nothing staged yet — the commit will be refused)'));
       }
-      return statOr(root, ['diff', '--cached', '--stat'], '(nothing staged yet — the commit will be refused)');
+      const gen = a.generate || !a.message;
+      const trailer = withTrailer('', process.env);
+      if (gen) {
+        const draft = a.all ? null : draftMsg(root);
+        if (draft) {
+          parts.push(`will draft the message from the staged diff:\n  ${draft.title}${trailer ? `\n  (+ ${trailer})` : ''}${a.message ? '\n  (an explicit message was also given — it wins)' : ''}`);
+        } else {
+          parts.push(`will draft the message after staging${trailer ? ` (+ ${trailer})` : ''}${a.message ? ' (an explicit message was also given — it wins)' : ''}`);
+        }
+      }
+      return parts.join('\n');
+    }
     case 'branch':
       return `new branch from ${a.from ? String(a.from) : 'current HEAD'}${a.checkout === false ? ' (stays on current branch)' : ' (checks it out)'}`;
     case 'checkout': {
@@ -281,6 +307,33 @@ function previewFor(root, op, a = {}) {
     }
     case 'tag':
       return `tag ${String(a.name || '')} at ${a.ref ? String(a.ref) : 'HEAD'}${a.message ? ' (annotated)' : ' (lightweight)'}`;
+    case 'push': {
+      const remote = String(a.remote || 'origin');
+      const cur = runGit(root, ['rev-parse', '--abbrev-ref', 'HEAD']).out.trim();
+      const branch = String(a.branch || cur || '').trim();
+      const remotes = runGit(root, ['remote']).out.split('\n').map((s) => s.trim()).filter(Boolean);
+      if (!remotes.includes(remote)) return `no remote "${remote}" — the push will be refused (${remotes.length ? `found: ${remotes.join(', ')}` : 'no remotes configured'})`;
+      const ahead = runGit(root, ['rev-list', '--count', `${remote}/${branch}..${branch}`]).out.trim();
+      if (a.force_with_lease) return `push --force-with-lease ${branch} → ${remote} (REWRITES the remote branch — lease-guarded)`;
+      if (ahead === '0') return `nothing to push — ${branch} is up to date with ${remote}/${branch}`;
+      return `push ${ahead || '?'} commit(s) → ${remote}/${branch} (sets upstream; never force)`;
+    }
+    case 'pr': {
+      const cur = runGit(root, ['rev-parse', '--abbrev-ref', 'HEAD']).out.trim();
+      const branch = String(a.branch || '').trim() || cur;
+      const base = String(a.base || '').trim() || 'main';
+      if (branch === base) return `head and base are both "${branch}" — the flow will refuse; pass {"branch": "..."}`;
+      const dirty = runGit(root, ['status', '--porcelain']).out.split('\n').filter(Boolean).length;
+      const draft = draftMsg(root);
+      return [
+        'PR flow — every step runs in order, stop at the first failure:',
+        `  1. branch ${cur} → ${branch}${branch !== cur ? ` (from ${base})` : ' (already on it)'}`,
+        `  2. stage ${dirty || 0} changed file(s) (.buddy/ excluded)`,
+        `  3. commit: ${draft ? draft.title : String(a.message || '(drafted from the staged diff)')}${withTrailer('', process.env) ? `\n     (+ ${withTrailer('', process.env)})` : ''}`,
+        `  4. push -u origin ${branch} (plain push, never force)`,
+        `  5. handoff: gh op:pr_create {"branch":"${branch}","base":"${base}"}`,
+      ].join('\n');
+    }
     default:
       return null; // conflicts is read-only — no gate, no preview
   }
@@ -306,6 +359,57 @@ function pathsArg(a, what) {
 function shortstat(root) {
   const r = runGit(root, ['show', '--shortstat', '--format=', 'HEAD']).out.trim();
   return r || '';
+}
+
+/**
+ * Draft a commit message from the STAGED state (v0.36.0). Returns null when
+ * nothing is staged. Feeds draftCommitMessage() with the per-file shape
+ * (new/deleted flags + add/del counts) and the full staged diff so the hunk
+ * headers can name the enclosing functions.
+ */
+function draftMsg(root) {
+  const names = runGit(root, ['diff', '--cached', '--name-only']).out.split('\n').map((s) => s.trim()).filter(Boolean);
+  if (!names.length) return null;
+  const numstat = runGit(root, ['diff', '--cached', '--numstat']).out;
+  const status = runGit(root, ['diff', '--cached', '--name-status']).out;
+  const added = {}, deleted = {};
+  for (const line of numstat.split('\n')) {
+    const m = line.match(/^(\d+|-)\t(\d+|-)\t(.+)$/);
+    if (m) added[m[3]] = m[1] === '-' ? 0 : Number(m[1]);
+    if (m) deleted[m[3]] = m[2] === '-' ? 0 : Number(m[2]);
+  }
+  const isNew = new Set(), isGone = new Set();
+  for (const line of status.split('\n')) {
+    const m = line.match(/^([ADT])\t(.+)$/);
+    if (m?.[1] === 'A') isNew.add(m[2]);
+    if (m?.[1] === 'D') isGone.add(m[2]);
+  }
+  const files = names.map((p) => ({ path: p, add: added[p] || 0, del: deleted[p] || 0, isNew: isNew.has(p), isDeleted: isGone.has(p) }));
+  const diff = runGit(root, ['diff', '--cached'], 30000).out;
+  return draftCommitMessage({ diff, files });
+}
+
+/** One git invocation with a result-shaped return (used by the pr flow). */
+function step(root, argv, timeoutMs = 30000) {
+  const r = runGit(root, argv, timeoutMs);
+  return { ok: r.ok, out: r.out, err: r.err };
+}
+
+/**
+ * Stage everything except .buddy (v0.36.0 drill fix). The old form —
+ * `git add -A -- . ':(exclude).buddy'` — FAILS in any repo where .buddy is
+ * actually gitignored: a pathspec that names an ignored path trips git's
+ * ignored-paths advice and exits 1 ("The following paths are ignored …").
+ * Plain `git add -A` respects .gitignore on its own; the unstage step covers
+ * repos that DON'T ignore .buddy (their .buddy/ would otherwise be added —
+ * sessions, worktrees and all). --ignore-unmatch keeps the cleanup a no-op
+ * (exit 0) when .buddy was never staged.
+ */
+function stageAll(root) {
+  const add = runGit(root, ['add', '-A']);
+  if (!add.ok) return add;
+  const rm = runGit(root, ['rm', '-r', '-q', '--cached', '--ignore-unmatch', '.buddy']);
+  return rm.ok ? add : rm;
 }
 
 const conflictNext = (kind, extra) =>
@@ -350,19 +454,29 @@ export function gitWriteOp(root, op, a = {}) {
       // (audit, events, checkpoints, harness) never rides into the user's
       // history by accident. Committing it deliberately is still possible:
       // stage .buddy/... explicitly and commit without all.
-      if (a.all) runGit(root, ['add', '-A', '--', '.', ':(exclude).buddy']);
+      if (a.all) stageAll(root);
       const files = runGit(root, ['diff', '--cached', '--name-only']).out.split('\n').filter(Boolean);
       if (!files.length) return 'ERROR: nothing to commit — stage changes first (op:"stage") or pass all:true. The working tree being dirty is not enough; git commits the INDEX.';
-      const msg = String(a.message ?? '').trim();
-      if (!msg) return 'ERROR: commit needs a message (one line — say what and why, not just "update")';
+      // v0.36.0: the message may be drafted from the staged diff. An explicit
+      // message ALWAYS wins; generate:true (or a missing message) drafts one.
+      let msg = String(a.message ?? '').trim();
+      let body = String(a.body ?? '').trim();
+      let drafted = null;
+      if (!msg) {
+        drafted = draftMsg(root);
+        if (!drafted) return 'ERROR: nothing to draft from — the staged diff is empty; pass a message or stage changes first';
+        msg = drafted.title;
+        body = drafted.body;
+      }
       if (msg.length > 200) return 'ERROR: commit message over 200 chars — keep the summary line short, put detail in body';
+      body = withTrailer(body, process.env); // Co-Authored-By (env-configurable)
       const argv = ['commit', '-m', msg];
-      if (a.body) argv.push('-m', String(a.body).slice(0, 2000));
+      if (body) argv.push('-m', body);
       const r = runGit(root, argv);
       if (!r.ok) return errHint(r, 'commit');
       const head = runGit(root, ['log', '-1', '--format=%h %s']).out.trim();
       const stat = shortstat(root);
-      return `OK commit ${head}${stat ? ` — ${stat}` : ''}\nfiles: ${files.slice(0, 12).join(', ')}${files.length > 12 ? ` … +${files.length - 12} more` : ''}`;
+      return `OK commit ${head}${stat ? ` — ${stat}` : ''}${drafted ? '\ndrafted from the staged diff — edit with git commit --amend if you can say it better' : ''}${/Co-Authored-By:/i.test(body) ? `\ntrailer: ${body.split('\n').find((l) => /^Co-Authored-By:/i.test(l)).trim()}` : ''}\nfiles: ${files.slice(0, 12).join(', ')}${files.length > 12 ? ` … +${files.length - 12} more` : ''}`;
     }
 
     case 'branch': {
@@ -478,6 +592,111 @@ export function gitWriteOp(root, op, a = {}) {
       return `OK tag "${name}"${a.message ? ' (annotated)' : ''} at ${a.ref ? String(a.ref) : 'HEAD'}.`;
     }
 
+    case 'push': {
+      // v0.36.0 — the boundary moved when the gh tool put remote writes
+      // behind approval gates: push gets the same treatment. Preview shows
+      // remote/branch/ahead; force is refused unless force_with_lease is
+      // asked for EXPLICITLY (and it still goes through the same gate).
+      const remote = String(a.remote || 'origin');
+      const cur = runGit(root, ['rev-parse', '--abbrev-ref', 'HEAD']).out.trim();
+      const branch = String(a.branch || cur || '').trim();
+      if (!branch || branch === 'HEAD') return 'ERROR: push needs a branch (detached HEAD — pass {"branch": "..."})';
+      const remotes = runGit(root, ['remote']).out.split('\n').map((s) => s.trim()).filter(Boolean);
+      if (!remotes.includes(remote)) {
+        return `ERROR: no remote "${remote}" — git remote -v lists what exists (${remotes.length ? `found: ${remotes.join(', ')}` : 'no remotes configured'})`;
+      }
+      const r = runGit(root, a.force_with_lease ? ['push', '--force-with-lease', remote, branch, '--follow-tags'] : ['push', '-u', remote, branch, '--follow-tags']);
+      if (!r.ok) {
+        const hint = /rejected|fetch first|non-fast-forward/i.test(r.err + r.out)
+          ? ' — the remote moved ahead: pull/rebase first (your terminal: git pull --rebase), or pass force_with_lease:true to overwrite it deliberately (the gate will warn again)'
+          : '';
+        return `ERROR: push failed${hint}\n${truncate((r.err || r.out).trim(), 400)}`;
+      }
+      const url = runGit(root, ['remote', 'get-url', remote]).out.trim();
+      return `OK push — ${branch} → ${remote}${/up-to-date|Everything up-to-date/i.test(r.out) ? ' (was already up to date)' : ' (upstream set)'}\nremote: ${truncate(url, 100)}`;
+    }
+
+    case 'pr': {
+      // v0.36.0 — the PR creation flow: branch → stage → commit (drafted
+      // message + trailer) → push -u → the gh pr_create handoff. One gate
+      // previews the WHOLE plan before anything runs; every step's git
+      // output is captured and the flow stops at the first failure.
+      const log = [];
+      const cur = runGit(root, ['rev-parse', '--abbrev-ref', 'HEAD']).out.trim();
+      const branch = String(a.branch || '').trim() || cur;
+      const base = String(a.base || '').trim() || 'main';
+      if (branch === base) return `ERROR: head and base are both "${branch}" — a PR needs a differently named branch (pass {"branch": "..."})`;
+
+      // 1. branch (skip when already on it)
+      if (branch !== cur) {
+        const exists = runGit(root, ['rev-parse', '--verify', `refs/heads/${branch}`]).ok;
+        const r = exists ? step(root, ['checkout', branch]) : step(root, ['checkout', '-b', branch, ...(a.base && a.base !== cur ? [a.base] : [])]);
+        log.push(`branch: ${r.ok ? `${cur} → ${branch}${exists ? ' (existing)' : ' (new, from ' + (a.base || cur) + ')'}` : 'FAILED'}`);
+        if (!r.ok) return `ERROR: pr flow stopped at branch — ${truncate(r.err || r.out, 200)}\n${log.join('\n')}`;
+      } else {
+        log.push(`branch: already on ${branch}`);
+      }
+
+      // 2. stage (all:true semantics — same .buddy exclusion as commit)
+      const stagedBefore = runGit(root, ['diff', '--cached', '--name-only']).out.split('\n').filter(Boolean);
+      const dirty = runGit(root, ['status', '--porcelain']).out.split('\n').filter(Boolean);
+      if (a.all !== false && dirty.length) {
+        const r = stageAll(root);
+        log.push(`stage: ${r.ok ? `${dirty.length} changed file(s)` : 'FAILED'}`);
+        if (!r.ok) return `ERROR: pr flow stopped at stage — ${truncate(r.err || r.out, 200)}\n${log.join('\n')}`;
+      } else {
+        log.push(`stage: ${stagedBefore.length ? 'using what is staged' : 'nothing dirty, nothing staged'}`);
+      }
+
+      // 3. commit (generate unless an explicit message came in). v0.36.0
+      // drill fix: when nothing is left to stage, the branch state decides —
+      // commits already on the branch (ahead of base) skip the commit step
+      // (pushing IS the PR); a branch EVEN with base would open an empty PR,
+      // which is refused with that explanation, not a vague stage error.
+      const staged = runGit(root, ['diff', '--cached', '--name-only']).out.split('\n').filter(Boolean);
+      let msg = String(a.message ?? '').trim();
+      let body = String(a.body ?? '').trim();
+      let drafted = null;
+      if (!staged.length && !msg) {
+        const ahead = runGit(root, ['rev-list', '--count', `${base}..HEAD`]).out.trim();
+        if (ahead !== '0') {
+          log.push(`commit: skipped — the branch already has ${ahead} new commit(s) vs ${base} (pushing is the PR)`);
+        } else {
+          return `ERROR: pr flow stopped at commit — the branch is even with ${base} (no new commits, nothing to stage): opening this PR would be an empty diff. Do the work on ${branch} first — or leave it uncommitted and run the flow so it can stage + commit for you.\n${log.join('\n')}`;
+        }
+      } else {
+        if (!msg) {
+          drafted = draftMsg(root);
+          if (!drafted) return `ERROR: pr flow stopped at commit — nothing staged to commit or draft from\n${log.join('\n')}`;
+          msg = drafted.title;
+          body = drafted.body;
+        }
+        body = withTrailer(body, process.env);
+        const cr = step(root, ['commit', '-m', msg.slice(0, 200), ...(body ? ['-m', body.slice(0, 2000)] : [])]);
+        const head = cr.ok ? runGit(root, ['log', '-1', '--format=%h %s']).out.trim() : 'FAILED';
+        log.push(`commit: ${head}${drafted ? ' (drafted)' : ''}`);
+        if (!cr.ok) return `ERROR: pr flow stopped at commit — ${truncate(cr.err || cr.out, 200)}\n${log.join('\n')}`;
+      }
+
+      // 4. push -u
+      const pr = step(root, ['push', '-u', String(a.remote || 'origin'), branch], 60000);
+      log.push(`push: ${pr.ok ? `${branch} → ${a.remote || 'origin'}` : 'FAILED'}`);
+      const pushNote = pr.ok ? '' : `\npush failed: ${truncate((pr.err || pr.out).trim(), 300)}\n(the branch + commit exist locally — push from your terminal, then create the PR)`;
+
+      // 5. the gh handoff (best effort — the gh tool may not resolve here)
+      let handoff = '';
+      try {
+        const g = resolveGh({ root });
+        handoff = g.error
+          ? `gh: ${g.error}`
+          : `next: the gh tool → {"op":"pr_create","title":"${String(a.title || msg).replace(/"/g, "'").slice(0, 90)}","branch":"${branch}","base":"${base}"${a.body ? `,"body":"…"` : ''}}`;
+      } catch {
+        handoff = 'gh handoff unavailable';
+      }
+      log.push(handoff);
+      return `OK pr flow${pushNote}\n${log.join('\n')}`;
+    }
+
     default:
       return `ERROR: unhandled op "${op}"`;
   }
@@ -488,9 +707,9 @@ export function buildGitWriteTool({ root = process.cwd(), maxCalls = 8 } = {}) {
   return {
     name: 'git_write',
     description:
-      'GATED git writes: stage, unstage, commit, branch, checkout, merge, rebase (+continue), abort, stash, unstash, restore (discard!), tag, conflicts (read-only report). Every mutating op asks the user first with a preview of exactly what happens; merge/rebase conflicts come back as ours/base/theirs hunks — edit the files, stage, then commit (merge) or rebase_continue. No push/pull here: remotes and credentials are the user\u2019s business.',
+      'GATED git writes: stage, unstage, commit (generate:true drafts a conventional message from the staged diff + Co-Authored-By), branch, checkout, merge, rebase (+continue), abort, stash, unstash, restore (discard!), tag, conflicts (read-only report), push (plain, never force), pr (branch → stage → commit → push → the gh pr_create handoff). Every mutating op asks the user first with a preview of exactly what happens; merge/rebase conflicts come back as ours/base/theirs hunks — edit the files, stage, then commit (merge) or rebase_continue.',
     args:
-      '{"op":"commit","message":"fix: guard division by zero","all":true}  ·  {"op":"stage","paths":["src/app.js"]}  ·  {"op":"merge","branch":"feature/x"}  ·  {"op":"conflicts"}  ·  {"op":"abort","kind":"merge"}',
+      '{"op":"commit","generate":true,"all":true}  ·  {"op":"pr","branch":"fix/x","base":"main"}  ·  {"op":"push"}  ·  {"op":"stage","paths":["src/app.js"]}  ·  {"op":"conflicts"}',
     maxCalls,
     riskyWhen: (a) => !READ_OPS.has(String(a?.op || '')),
     render: (a) => `git_write ${a?.op || '?'}${firstTarget(a) ? ` ${firstTarget(a)}` : ''}`,

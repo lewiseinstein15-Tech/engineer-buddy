@@ -32,6 +32,7 @@ import { latestSession, findSession } from './session.js';
 import { importSession } from './session.js';
 import { startMcpServer } from './mcpserver.js';
 import { ensureHarness } from './harness/scaffold.js';
+import { createWorktree, worktreeSlug } from './tools/worktree.js';
 import { log, warn, setVerbose, truncate, BuddyError } from './util.js';
 import { parseArgs } from 'node:util';
 import path from 'node:path';
@@ -47,6 +48,10 @@ function usage() {
 Local coding agent (Buddy Code — like Claude Code, in your terminal):
   engineer-buddy                        interactive session in the current directory
   engineer-buddy -p "task"              one-shot autonomous task (add --safe to deny writes)
+  engineer-buddy --worktree             isolate the run in its own git worktree
+                                        (.buddy/worktrees/<slug>, branch buddy/<slug> —
+                                        your dirty tree stays untouched; the tree is kept
+                                        after exit, the note prints the removal command)
   echo "task" | engineer-buddy -p       pipe the task in on stdin
   engineer-buddy -p "task" -o json      machine-readable output (text | json | stream-json)
   engineer-buddy -c                     continue the newest session in this directory
@@ -259,6 +264,7 @@ async function cmdChat(argv, { oneShot = false } = {}) {
       quiet: { type: 'boolean', default: false },
       config: { type: 'string' },
       dir: { type: 'string' },
+      worktree: { type: 'boolean', default: false },
       c: { type: 'boolean', default: false },
       continue: { type: 'boolean', default: false },
       r: { type: 'string' },
@@ -270,7 +276,26 @@ async function cmdChat(argv, { oneShot = false } = {}) {
   });
   const cfg = loadConfig({ file: values.config });
   const router = buildRouter(cfg);
-  const root = values.dir ? path.resolve(values.dir) : process.cwd();
+  let root = values.dir ? path.resolve(values.dir) : process.cwd();
+
+  // --worktree (v0.36.0): isolate this run in its own git worktree — a fresh
+  // checkout of HEAD on a buddy/<slug> branch under .buddy/worktrees/. The
+  // user's dirty tree stays theirs; the run's edits, stages, and commits land
+  // in the worktree, and the diff between the two is plain git. The tree
+  // OUTLIVES the run on purpose (it may hold unmerged work) — the exit note
+  // prints the exact removal command.
+  let worktreeNote = null;
+  if (values.worktree) {
+    const wt = createWorktree(root, { slug: worktreeSlug(new Date()) });
+    if (wt.ok) {
+      console.error(`[buddy] --worktree: isolated in ${wt.path}`);
+      console.error(`[buddy]           branch ${wt.branch} (fresh checkout of HEAD — your dirty tree is untouched)`);
+      worktreeNote = wt;
+      root = wt.path;
+    } else {
+      console.error(`[buddy] --worktree failed, continuing in ${root}: ${wt.error}`);
+    }
+  }
 
   // Session continuity: -c continues the newest session here; -r <name>
   // resumes a named one (exact name → suffix → substring).
@@ -322,6 +347,10 @@ async function cmdChat(argv, { oneShot = false } = {}) {
       outputFormat: fmt,
       resumeFrom: resumeFile,
     });
+    // v0.36.0 review catch: the kept-note used to print only on the
+    // interactive path (via the onExit hook) — a --worktree one-shot run
+    // returned without ever naming the kept tree or its removal command.
+    if (worktreeNote) printWorktreeNote(worktreeNote);
     if (!out.said) {
       if (fmt !== 'json' && fmt !== 'stream-json') console.error('buddy: no final reply (see events above)');
       return 1;
@@ -333,7 +362,19 @@ async function cmdChat(argv, { oneShot = false } = {}) {
     console.error('       run `buddy` in your terminal, or use one-shot mode: buddy -p "task"');
     return 2;
   }
-  return (await startRepl({ router, root, config: cfg, yolo: Boolean(values.yolo), resumeFrom: resumeFile, record: values.record || null })) ?? 0;
+  // v0.36.0 drill catch: the REPL owns the process — every interactive exit
+  // funnels through its close handler's process.exit(0), so code AFTER
+  // startRepl is dead. The worktree kept-note rides the onExit hook instead
+  // (called by the close handler before the exit, still inside the terminal).
+  const exitNote = worktreeNote ? () => printWorktreeNote(worktreeNote) : null;
+  const exitCode = (await startRepl({ router, root, config: cfg, yolo: Boolean(values.yolo), resumeFrom: resumeFile, record: values.record || null, onExit: exitNote })) ?? 0;
+  return exitCode;
+}
+
+/** The --worktree kept-note: where the tree lives and exactly how to remove it. */
+function printWorktreeNote(wt) {
+  console.error(`\n[buddy] worktree kept: ${wt.path} (branch ${wt.branch})`);
+  console.error(`[buddy]   review: git -C "${wt.path}" diff HEAD   ·   remove: git worktree remove "${wt.path}"`);
 }
 
 async function cmdInit(argv) {

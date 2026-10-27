@@ -124,10 +124,14 @@ test('git_write: stage → commit → log; refuses empty index; commit all stage
   assert.match(done, /OK commit [0-9a-f]+ bump v to 2/);
   assert.match(done, /app\.js/);
 
-  // message discipline
+  // message discipline (v0.36.0): a missing message DRAFTS one from the
+  // staged diff (drafted marker + trailer); the old "refuse" contract is gone
   fs.writeFileSync(path.join(root, 'app.js'), 'export const v = 3;\n');
   gitWriteOp(root, 'stage', { paths: ['app.js'] });
-  assert.match(gitWriteOp(root, 'commit', {}), /ERROR: commit needs a message/);
+  const drafted = gitWriteOp(root, 'commit', {});
+  assert.match(drafted, /OK commit [0-9a-f]+ /);
+  assert.match(drafted, /drafted from the staged diff/);
+  assert.match(drafted, /trailer: Co-Authored-By:/);
 
   // all:true sweeps untracked but NEVER .buddy/ (Buddy's own runtime state)
   fs.writeFileSync(path.join(root, 'new.txt'), 'hi\n');

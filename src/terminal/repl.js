@@ -442,7 +442,7 @@ export function printMcpStatus(mcp) {
 
 // ── Interactive REPL ─────────────────────────────────────────────────────────
 
-export async function startRepl({ router, root = process.cwd(), config = {}, yolo: yoloFlag = false, resumeFrom = null, record = null } = {}) {
+export async function startRepl({ router, root = process.cwd(), config = {}, yolo: yoloFlag = false, resumeFrom = null, record = null, onExit = null } = {}) {
   if (!process.stdin.isTTY) {
     console.error('buddy: interactive mode needs a TTY. Use one-shot mode instead:  buddy -p "task"');
     return 2;
@@ -2058,6 +2058,13 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     await dispatch(input);
   }).on('close', () => {
     console.log(c.dim('\n  bye — sessions and experience are kept in .buddy/\n'));
+    // v0.36.0 drill catch: the REPL owns the process (every exit funnels
+    // here), so post-startRepl code in the caller is DEAD — the --worktree
+    // kept-note could never print. Callers hand us an onExit hook instead;
+    // it runs here, before the exit, still inside the terminal.
+    if (typeof onExit === 'function') {
+      try { onExit(); } catch { /* an exit note must never block the exit */ }
+    }
     process.exit(0);
   });
 
