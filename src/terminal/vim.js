@@ -123,11 +123,22 @@ export function applyVimKey(key, stIn, text, cursor) {
   // escape is modal: normal-mode esc = the box's classic escape semantics
   if (name === 'escape' || seq === '\x1b') return { op: 'action', action: 'escape', st };
 
-  // enter submits (draft may be multi-line — the box sends it as one task)
-  if (plain && (name === 'return' || name === 'enter')) return { op: 'action', action: 'submit', st };
+  // enter/return — WIRE TRUTH (caught live by the v0.33.1 drill): the real
+  // Enter arrives as \r (name 'return'); the LF byte (ctrl+j, or the
+  // shift+enter that /terminal-setup teaches) arrives as name 'enter' with
+  // ctrl FALSE — readline does not flag it. In normal mode that byte inserts
+  // a newline exactly like the classic path; mapping it to submit made
+  // multi-line drafts impossible under vim (the drill's LF submitted the
+  // draft mid-composition).
+  if (plain && (name === 'return' || name === 'enter')) {
+    if (name === 'enter' || key.sequence === '\n') {
+      return { op: 'edit', st, text: s.slice(0, cur) + '\n' + s.slice(cur), cursor: cur + 1 };
+    }
+    return { op: 'action', action: 'submit', st };
+  }
 
-  // literal newline (ctrl+j = LF, alt+enter) — inserts like any edit
-  if ((key.ctrl && name === 'j') || (key.meta && (name === 'return' || name === 'enter'))) {
+  // alt+enter chord (ESC-prefixed, coalesced by readline) — newline too
+  if (key.meta && (name === 'return' || name === 'enter')) {
     return { op: 'edit', st, text: s.slice(0, cur) + '\n' + s.slice(cur), cursor: cur + 1 };
   }
 

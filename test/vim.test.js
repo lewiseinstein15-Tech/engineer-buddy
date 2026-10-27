@@ -227,9 +227,10 @@ test('normal: passthrough actions — enter submits, esc escapes, ctrl chords su
   assert.equal(r.action, 'transcript'); // ctrl+r survives vim
 });
 
-test('normal: ctrl+j inserts a newline (multi-line editing works in normal mode)', () => {
+test('normal: alt+enter (the coalesced ESC-CR chord) inserts a newline', () => {
+  // real wire shape from the probe: {name:'return', meta:true, sequence:'\x1b\r'}
   let st = createVimState();
-  const r = edit({ name: 'j', ctrl: true, sequence: '\n' }, st, 'ab', 1);
+  const r = edit({ name: 'return', sequence: '\x1b\r', meta: true, ctrl: false }, st, 'ab', 1);
   assert.equal(r.text, 'a\nb');
   assert.equal(r.cursor, 2);
 });
@@ -248,6 +249,20 @@ test('normal: unknown keys are inert and cancel pending operators', () => {
   const r = applyVimKey(K('z'), st.st, 'abc', 0);
   assert.equal(r.op, 'inert');
   assert.equal(r.st.pending, null);
+});
+
+test('normal: the LF byte inserts a newline (REAL wire shape — regression)', () => {
+  // The wire probe: ctrl+j arrives as {name:'enter', sequence:'\n', ctrl:false}
+  // — NOT as a ctrl chord. Modeling it with ctrl:true was a test-only fantasy
+  // the v0.33.1 drill exposed (the LF submitted the draft mid-composition).
+  let st = createVimState();
+  const r = edit({ name: 'enter', sequence: '\n', ctrl: false, meta: false }, st, 'ab', 1);
+  assert.equal(r.text, 'a\nb');
+  assert.equal(r.cursor, 2);
+  // \r still submits
+  st = createVimState();
+  const s2 = applyVimKey({ name: 'return', sequence: '\r', ctrl: false, meta: false }, st, 'ab', 1);
+  assert.deepEqual({ op: s2.op, action: s2.action }, { op: 'action', action: 'submit' });
 });
 
 // ── Box integration ──────────────────────────────────────────────────────────
