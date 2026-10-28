@@ -127,8 +127,12 @@ const GIT_READ_RE = /^git (status|diff|log|branch|show|remote|tag)( .*)?$/;
 /** Run one allowlist-checked simple command. Never throws.
  * opts.signal — AbortSignal: kills the child and resolves with interrupted:true.
  * opts.trusted — skip the policy blocklist (ONLY for the user's own `!` shell
- * passthrough, where the human typed the command). */
-export function runBash(cmd, { cwd = process.cwd(), timeoutMs = 180000, maxOutputChars = 8000, env = {}, signal = null, trusted = false } = {}) {
+ * passthrough, where the human typed the command).
+ * opts.sandbox — v0.38.0 §9: { env, prefix } from the sandbox context. env
+ * swaps HOME to the empty sandbox dir; prefix (unshare -rn) turns the network
+ * off. When prefix is null (non-Linux or userns disabled) the run is still
+ * HOME-restricted and the result says so honestly. */
+export function runBash(cmd, { cwd = process.cwd(), timeoutMs = 180000, maxOutputChars = 8000, env = {}, signal = null, trusted = false, sandbox = null } = {}) {
   return new Promise((resolve) => {
     const blocked = trusted ? null : blockedBashReason(cmd);
     if (blocked) {
@@ -136,17 +140,20 @@ export function runBash(cmd, { cwd = process.cwd(), timeoutMs = 180000, maxOutpu
       return;
     }
     const command = String(cmd).trim().replace(/\s+/g, ' ');
+    // Sandbox wraps the SAME one-simple-command shape the blocklist already
+    // enforces (no pipes/chains/substitution), so prefixing is safe.
+    const spawnCommand = sandbox && sandbox.prefix ? `${sandbox.prefix} ${command}` : command;
     const t0 = Date.now();
     let timedOut = false;
     let child;
     try {
-      child = spawn(command, {
+      child = spawn(spawnCommand, {
         cwd,
         shell: true,
         timeout: timeoutMs,
         killSignal: 'SIGKILL',
         detached: process.platform !== 'win32', // own process group → we can kill sh AND its children
-        env: { PATH: process.env.PATH, HOME: process.env.HOME || '/tmp', LANG: 'C.UTF-8', NO_COLOR: '1', ...env },
+        env: { PATH: process.env.PATH, HOME: process.env.HOME || '/tmp', LANG: 'C.UTF-8', NO_COLOR: '1', ...env, ...(sandbox ? sandbox.env : {}) },
       });
     } catch (e) {
       resolve({ ok: false, code: -1, stdout: '', stderr: e.message, durationMs: 0, timedOut: false, command });
@@ -180,9 +187,9 @@ export function runBash(cmd, { cwd = process.cwd(), timeoutMs = 180000, maxOutpu
     const finish = (code) => {
       clearTimeout(killer);
       if (signal) signal.removeEventListener('abort', onAbort);
-      resolve({ ok: !timedOut && code === 0, code, stdout: truncate(out, maxOutputChars), stderr: truncate(err, maxOutputChars), durationMs: Date.now() - t0, timedOut, interrupted: Boolean(signal?.aborted), command });
+      resolve({ ok: !timedOut && code === 0, code, stdout: truncate(out, maxOutputChars), stderr: truncate(err, maxOutputChars), durationMs: Date.now() - t0, timedOut, interrupted: Boolean(signal?.aborted), command, ...(sandbox ? { sandboxed: true, netOff: Boolean(sandbox.prefix) } : {}) });
     };
-    child.on('error', (e) => { clearTimeout(killer); resolve({ ok: false, code: -1, stdout: truncate(out, maxOutputChars), stderr: e.message, durationMs: Date.now() - t0, timedOut, command }); });
+    child.on('error', (e) => { clearTimeout(killer); resolve({ ok: false, code: -1, stdout: truncate(out, maxOutputChars), stderr: e.message, durationMs: Date.now() - t0, timedOut, command, ...(sandbox ? { sandboxed: true, netOff: Boolean(sandbox.prefix) } : {}) }); });
     child.on('close', finish);
   });
 }
@@ -482,15 +489,18 @@ function fs_write(abs, content) { fs.writeFileSync(abs, String(content), 'utf8')
 // ── Tool definitions for the chat loop ───────────────────────────────────────
 
 function fmtResult(r) {
-  if (r.ok) return `exit 0 (${(r.durationMs / 1000).toFixed(1)}s)\n${r.stdout || '(no stdout)'}${r.stderr ? `\n[stderr]\n${r.stderr}` : ''}`;
-  return `exit ${r.code}${r.timedOut ? ' (TIMED OUT)' : ''} in ${(r.durationMs / 1000).toFixed(1)}s\n${r.stdout ? `[stdout]\n${r.stdout}\n` : ''}${r.stderr ? `[stderr]\n${r.stderr}` : ''}`;
+  // [sandbox] tag only when the sandbox actually bound — plain runs stay
+  // byte-identical to the pre-sandbox output.
+  const tag = r.sandboxed ? (r.netOff ? ' [sandbox: net off · home restricted]' : ' [sandbox: home only]') : '';
+  if (r.ok) return `exit 0 (${(r.durationMs / 1000).toFixed(1)}s)${tag}\n${r.stdout || '(no stdout)'}${r.stderr ? `\n[stderr]\n${r.stderr}` : ''}`;
+  return `exit ${r.code}${r.timedOut ? ' (TIMED OUT)' : ''} in ${(r.durationMs / 1000).toFixed(1)}s${tag}\n${r.stdout ? `[stdout]\n${r.stdout}\n` : ''}${r.stderr ? `[stderr]\n${r.stderr}` : ''}`;
 }
 
 /**
  * Build the local tool set.
  * @returns tools with {name, description, args, run, risky?, render?}
  */
-export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { latest: null }, symbolIndex = null, lspEnabled = true } = {}) {
+export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { latest: null }, symbolIndex = null, lspEnabled = true, sandbox = null } = {}) {
   const testTool = createTestTool({ root: scope.root });
   const gitTool = buildGitTool({ root: scope.root });
   const gitWriteTool = buildGitWriteTool({ root: scope.root });
@@ -827,12 +837,19 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     },
     {
       name: 'bash',
-      description:
-        'Run ONE simple command (no pipes/redirects/chains/sudo/network; git is read-only here — commit/merge/rebase via the git_write tool). Use for tests, builds, version checks, read-only git (status/diff/log/branch/show).',
+      get description() {
+        const base =
+          'Run ONE simple command (no pipes/redirects/chains/sudo/network; git is read-only here — commit/merge/rebase via the git_write tool). Use for tests, builds, version checks, read-only git (status/diff/log/branch/show).';
+        // Live getter: /sandbox toggles mid-session and the next system-prompt
+        // build already tells the model the boundary changed.
+        return sandbox && sandbox.enabled
+          ? `${base} SANDBOX IS ON: every run has NO network (DNS/sockets fail instantly) and HOME is an empty sandbox dir — do not attempt fetches or network diagnostics; local files, builds and tests still work.`
+          : base;
+      },
       args: '{"command":"npm test"}',
       risky: true,
       render: (a) => `bash ${a?.command}`,
-      run: async ({ command }, ctx = {}) => fmtResult(await runBash(command, { cwd: scope.root, timeoutMs: bashTimeoutMs, signal: ctx.signal })),
+      run: async ({ command }, ctx = {}) => fmtResult(await runBash(command, { cwd: scope.root, timeoutMs: bashTimeoutMs, signal: ctx.signal, sandbox: sandbox ? sandbox.spawnOverrides() : null })),
     },
   ];
 }

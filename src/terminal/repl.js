@@ -17,6 +17,7 @@ import { createRequire } from 'node:module';
 import { createChat } from '../agent/chat.js';
 import { loadAgents } from '../agent/subagents.js';
 import { LocalScope, buildLocalTools, runBash } from '../tools/local.js';
+import { makeSandboxContext, parseSandboxArgs, renderSandboxStatus, dockerProfile } from '../tools/sandbox.js';
 import { loadUserTools } from '../tools/usertools.js';
 import { buildWebTools } from '../tools/web.js';
 import { buildTaskTool } from '../tools/task.js';
@@ -67,7 +68,7 @@ export function fmtTok(n) {
 export const SLASH_COMMANDS = [
   'help', 'new', 'clear', 'screen', 'compact', 'context', 'map', 'model', 'gateways', 'cost', 'stats', 'effort', 'events', 'stream',
   'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'diff', 'hooks', 'docs', 'rename', 'branch', 'fork', 'share', 'verbosity', 'theme', 'output-style', 'statusline', 'why', 'compare', 'memory', 'experience', 'learn', 'review',
-  'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'quit', 'exit', 'add-dir', 'report', 'copy', 'terminal-setup', 'vim', 'ci', 'pr-comments',
+  'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'sandbox', 'quit', 'exit', 'add-dir', 'report', 'copy', 'terminal-setup', 'vim', 'ci', 'pr-comments',
 ];
 
 // Descriptions shown in the slash-command palette (Claude Code style menu).
@@ -126,6 +127,7 @@ export const SLASH_DESCRIPTIONS = {
   resume: 'Resume a saved session',
   status: 'Session stats',
   yolo: 'Toggle auto-approval (careful)',
+  sandbox: 'on | off | profile — bash with network off + restricted HOME (/sandbox on · /sandbox profile for the docker/podman strong option)',
   quit: 'Leave',
   exit: 'Leave',
 };
@@ -196,7 +198,12 @@ async function makeScopeAndTools({ root, router = null, onEvent = () => {}, appr
   const shells = new BackgroundShells({ cwd: root });
   // Named API reporters (.buddy/reporters/*.json) + the http client tool.
   const { reporters } = loadReporters(root);
-  const base = [...buildLocalTools({ scope, todoState }), ...buildWebTools(), buildHttpTool({ reporters }), ...buildBackgroundTools({ shells })];
+  // Sandbox mode (v0.38.0 §9): one context object — capability probed once,
+  // empty HOME dir ensured, enabled state read from settings. The bash tool
+  // reads it on every call; /sandbox flips the same object mid-session.
+  const sandbox = makeSandboxContext(root);
+  sandbox.enabled = getChatSetting(root, 'sandbox', false) === true;
+  const base = [...buildLocalTools({ scope, todoState, sandbox }), ...buildWebTools(), buildHttpTool({ reporters }), ...buildBackgroundTools({ shells })];
   // gh tool (v0.35.0): GitHub/GitLab over REST with the user's env token —
   // PR/MR ops + CI status; provider auto-detected from the origin remote.
   const ghTool = buildGhTool({ root });
@@ -220,7 +227,7 @@ async function makeScopeAndTools({ root, router = null, onEvent = () => {}, appr
     extraNames: new Set([...base, ghTool, taskTool, skillTool, ...mcpTools, ...(exitPlanTool ? [exitPlanTool] : [])].map((t) => t.name)),
   });
   const tools = [...base, ghTool, taskTool, skillTool, ...(exitPlanTool ? [exitPlanTool] : []), ...mcpTools, ...userTools];
-  return { scope, tools, todoState, mcp, shells, skills, userToolWarnings, extraRoots, reporters };
+  return { scope, tools, todoState, mcp, shells, skills, userToolWarnings, extraRoots, reporters, sandbox };
 }
 
 function makeHarness(root) {
@@ -243,7 +250,7 @@ function makeHarness(root) {
 
 /** Create a chat session bound to a workspace root. */
 export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {}, repoMap = null, effort = null, streaming = null, onStream = null } = {}) {
-  const { tools, todoState, mcp, shells, skills, userToolWarnings, scope, extraRoots, reporters } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved });
+  const { tools, todoState, mcp, shells, skills, userToolWarnings, scope, extraRoots, reporters, sandbox } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved });
   const harness = makeHarness(root);
   // Hooks: the deterministic guarantee layer (.buddy/settings.json). One
   // runner per session — the REPL reads it for /hooks, the loop obeys it.
@@ -256,7 +263,7 @@ export async function createBuddySession({ root = process.cwd(), router, yolo = 
   if (resumeFrom) {
     for (const m of resumeMessages(loadSession(resumeFrom))) session.messages.push(m);
   }
-  return { chat: session, tools, todoState, mcp, shells, skills, hooks, userToolWarnings, permissions: perms, permissionWarnings, scope, extraRoots, reporters };
+  return { chat: session, tools, todoState, mcp, shells, skills, hooks, userToolWarnings, permissions: perms, permissionWarnings, scope, extraRoots, reporters, sandbox };
 }
 
 function defaultApproval(busy) {
@@ -567,7 +574,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   const routingMemAtStart = loadRoutingMemory(root);
   if (selfHealingOn) healedNote = selfHeal(router, routingMemAtStart, { enabled: true });
 
-  const { chat, tools, todoState, mcp, shells, skills: skillCatalog, hooks: hookRunner, userToolWarnings, permissions: perms, permissionWarnings, scope, reporters: projectReporters } = await createBuddySession({
+  const { chat, tools, todoState, mcp, shells, skills: skillCatalog, hooks: hookRunner, userToolWarnings, permissions: perms, permissionWarnings, scope, reporters: projectReporters, sandbox: sandboxCtx } = await createBuddySession({
     root,
     router,
     modes,
@@ -854,6 +861,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
               ['/report <name>', 'run a named API reporter (.buddy/reporters/) — result attaches to the next task'],
               ['/review [staged]', 'Buddy reviews your uncommitted diff'],
               ['/yolo', 'toggle auto-approval (careful)'],
+              ['/sandbox', 'on | off — bash network-off + restricted HOME · /sandbox profile for docker/podman'],
             ].map(([k, d]) => `    ${c.bold(k.padEnd(20))} ${c.dim(d)}`),
             ...(renderCustomCommandHelp(loadCustomCommands(root, { builtins: SLASH_COMMANDS }).commands) || ['']),
             '',
@@ -1919,13 +1927,38 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         yolo = !yolo;
         say(yolo ? c.yellow('\n  YOLO on — edits and commands run without asking. Watch it.\n') : '\n  YOLO off — approvals restored.\n');
         break;
+      case 'sandbox': {
+        // v0.38.0 §9 — /sandbox · /sandbox on|off|profile. Same ref the bash
+        // tool reads: the flip is live, the next spawn obeys, settings persist.
+        const parsed = parseSandboxArgs(args);
+        if (parsed.error) {
+          say(`\n  ${c.red('usage')} — ${parsed.error}\n`);
+          break;
+        }
+        if (parsed.action === 'profile') {
+          say(`\n${c.bold('docker/podman profile')}${c.gray(' — the strong boundary (hard container isolation)')}\n\n${dockerProfile({ root })}\n`);
+          break;
+        }
+        if (parsed.action === 'on' || parsed.action === 'off') {
+          sandboxCtx.enabled = parsed.action === 'on';
+          setChatSetting(root, 'sandbox', sandboxCtx.enabled);
+        }
+        const head =
+          parsed.action === 'on'
+            ? `\n  ${c.green('✓ sandbox on')} — model bash runs network-off + HOME-restricted${c.gray(' (persisted; your own ! shells are never sandboxed)')}\n`
+            : parsed.action === 'off'
+              ? `\n  ${c.gray('⏹ sandbox off')} — bash back to blocklist + gates only${c.gray(' (persisted)')}\n`
+              : '\n';
+        say(`${head}${renderSandboxStatus(sandboxCtx, { colored: (s) => (sandboxCtx.enabled ? c.green(s) : s) })}\n`);
+        break;
+      }
       case 'status':
         say(
           [
             '',
             `  ${c.bold('Buddy Code')} ${c.dim(`v${VERSION}`)} · root: ${root}`,
             `  messages: ${chat.messages.length} · history: ${(chat.historyChars() / 1000).toFixed(1)}k chars · compactions: ${chat.compactCount}`,
-            `  approvals: ${chat.alwaysApproved.join(', ') || '—'} · yolo: ${yolo ? c.yellow('ON') : 'off'}`,
+            `  approvals: ${chat.alwaysApproved.join(', ') || '—'} · yolo: ${yolo ? c.yellow('ON') : 'off'}${sandboxCtx.enabled ? c.green(' · sandbox: ON') : ''}`,
             `  chain: ${router.order.join(' → ')}${lastGateway ? c.gray(` (last: ${lastGateway})`) : ''}`,
             (recorder && recorder.file) || sessionFile
               ? `  session: ${path.basename((recorder && recorder.file) || sessionFile)}`
