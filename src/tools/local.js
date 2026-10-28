@@ -26,6 +26,7 @@ import { createSecretTool } from './secret.js';
 import { createSchemaTool } from './schema.js';
 import { createBrowserTool } from './browser.js';
 import { createContainersTool } from './containers.js';
+import { createCloudTool } from './cloud.js';
 
 // ── Edit previews (shown before approval, Claude-Code style) ────────────────
 
@@ -571,6 +572,9 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     // call time, absent = honest refusal), read/act split with gates.
     createBrowserTool({ root: scope.root }),
     createContainersTool({ root: scope.root }),
+    // v0.43.0 (checklist §10): cloud resource management — the machine's own
+    // aws/gcloud/az, gate-free inspect, gated deploy, honest refusals.
+    createCloudTool({ root: scope.root }),
     {
       name: 'todo',
       description:
