@@ -21,6 +21,9 @@ import { snapshotPaths } from '../agent/checkpoints.js';
 import { getChatSetting } from '../settings.js';
 import { createPerfTool } from './perf.js';
 import { createTimetravelTools } from './timetravel.js';
+import { createDbTool } from './db.js';
+import { createSecretTool } from './secret.js';
+import { createSchemaTool } from './schema.js';
 
 // ── Edit previews (shown before approval, Claude-Code style) ────────────────
 
@@ -555,6 +558,12 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     gitWriteTool,
     createPerfTool({ root: scope.root }),
     ...createTimetravelTools({ root: scope.root }),
+    // v0.41.0 (checklist §10): the data plane — query/inspect the project db
+    // (read-only default), resolve vault secret REFS (values never surface),
+    // pull OpenAPI/GraphQL schemas into context + generate client stubs.
+    createDbTool({ root: scope.root }),
+    createSecretTool({}),
+    createSchemaTool({ root: scope.root }),
     {
       name: 'todo',
       description:

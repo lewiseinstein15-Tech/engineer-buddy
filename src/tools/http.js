@@ -1,15 +1,16 @@
-// http.js — the HTTP client tool (v0.26.0): APIs beyond plain web_fetch.
+// http.js — the HTTP client tool (v0.26.0; vault refs since v0.41.0): APIs beyond plain web_fetch.
 //
 // web_fetch reads PAGES (HTML → text, no method, no auth). Real integrations
 // need more: POST/PUT/PATCH/DELETE, custom headers, JSON bodies, retries,
 // and AUTH. The auth story is the part Buddy refuses to get wrong:
 //
-//   Secrets are passed as ENV-VAR REFERENCES, never literals:
-//     {"auth":{"type":"bearer","env":"GITHUB_TOKEN"}}
-//   The value is read from the environment at call time and lands ONLY in
-//   the outgoing request header — never in args (so never in the transcript,
-//   the audit trail, or the model's context). Passing {"token":"ghp_…"}
-//   literally is refused with a pointer to the env form.
+//   Secrets are passed as REFERENCES, never literals:
+//     {"auth":{"type":"bearer","env":"GITHUB_TOKEN"}}      ← env var
+//     {"auth":{"type":"bearer","ref":"pass:github/token"}}  ← vault (v0.41.0)
+//   The value is resolved at call time (env lookup / `pass show` / `op read`)
+//   and lands ONLY in the outgoing request header — never in args (so never
+//   in the transcript, the audit trail, or the model's context). Passing
+//   {"token":"ghp_…"} literally is refused with a pointer to the ref forms.
 //
 // Safety model (same discipline as web.js):
 //   scheme allowlist  — http(s) only
@@ -21,6 +22,7 @@
 //
 // `fetchImpl` is injectable so tests run fully offline.
 import { blockedHost } from './web.js';
+import { resolveSecretRef } from './secret.js';
 
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
 
@@ -31,33 +33,66 @@ const AUTH_TYPES = new Set(['bearer', 'basic', 'header']);
 /** Request headers that get echoed into the observation (response headers subset). */
 const SHOW_RESPONSE_HEADERS = ['content-type', 'x-request-id', 'retry-after', 'location', 'server', 'date'];
 
-/** Build auth headers from an env-ref spec. Returns { headers } or { error }.
- *  NEVER puts the secret value into the returned error text. */
-export function resolveAuthHeaders(auth, env = process.env) {
-  if (auth == null) return { headers: {} };
+/** Auth headers from an ALREADY-RESOLVED secret value. Returns {headers} or
+ *  {error}. NEVER puts the secret value into the returned error text. */
+function authHeadersFor(type, value, customName) {
+  if (type === 'bearer') return { headers: { authorization: `Bearer ${value}` } };
+  if (type === 'header') {
+    const name = String(customName || 'X-API-Key').trim();
+    if (!/^[A-Za-z0-9-]+$/.test(name)) return { error: `auth.header name "${name.slice(0, 24)}" is not a valid header name` };
+    return { headers: { [name.toLowerCase()]: value } };
+  }
+  // basic — value holds "user:password"
+  const sep = value.indexOf(':');
+  if (sep < 0) return { error: 'basic auth expects the value to contain "user:password"' };
+  const encoded = Buffer.from(value, 'utf8').toString('base64');
+  return { headers: { authorization: `Basic ${encoded}` } };
+}
+
+/** Validate the auth SHAPE (type + no literals). Returns {type, customName} or {error}. */
+function validateAuthShape(auth) {
   const a = typeof auth === 'object' ? auth : {};
   const type = String(a.type || '').toLowerCase();
   if (!AUTH_TYPES.has(type)) {
     return { error: `auth.type must be one of bearer | basic | header (got "${String(a.type || '').slice(0, 24)}")` };
   }
   if (a.token != null || a.password != null || a.apiKey != null) {
-    return { error: 'secrets are never passed in args — use {"type":"bearer","env":"MY_TOKEN"} so the value stays out of the transcript' };
+    return { error: 'secrets are never passed in args — use {"type":"bearer","env":"MY_TOKEN"} or {"type":"bearer","ref":"pass:…"} so the value stays out of the transcript' };
   }
-  const envName = String(a.env || '').trim();
+  return { type, customName: a.name, hasEnv: a.env != null, hasRef: a.ref != null };
+}
+
+/** Build auth headers from an env-ref spec. Returns { headers } or { error }.
+ *  NEVER puts the secret value into the returned error text. */
+export function resolveAuthHeaders(auth, env = process.env) {
+  if (auth == null) return { headers: {} };
+  const shape = validateAuthShape(auth);
+  if (shape.error) return { error: shape.error };
+  if (shape.hasRef) {
+    return { error: 'vault refs resolve asynchronously — this resolver handles env auth only; runHttpRequest resolves refs automatically' };
+  }
+  const envName = String(auth?.env || '').trim();
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(envName)) return { error: 'auth.env must name an environment variable (e.g. "GITHUB_TOKEN")' };
   const value = env?.[envName];
   if (typeof value !== 'string' || !value) return { error: `environment variable ${envName} is not set — export it, then retry (the secret itself never appears in this conversation)` };
-  if (type === 'bearer') return { headers: { authorization: `Bearer ${value}` } };
-  if (type === 'header') {
-    const name = String(a.name || 'X-API-Key').trim();
-    if (!/^[A-Za-z0-9-]+$/.test(name)) return { error: `auth.header name "${name.slice(0, 24)}" is not a valid header name` };
-    return { headers: { [name.toLowerCase()]: value } };
+  return authHeadersFor(shape.type, value, shape.customName);
+}
+
+/** Env OR vault ref. The ref (env:/pass:/op://) is resolved at call time;
+ *  the value lives only inside the built header. */
+export async function resolveAuthHeadersAsync(auth, env = process.env, resolveRef = resolveSecretRef) {
+  if (auth == null) return { headers: {} };
+  const shape = validateAuthShape(auth);
+  if (shape.error) return { error: shape.error };
+  if (shape.hasEnv && shape.hasRef) {
+    return { error: 'use ONE of auth.env or auth.ref — not both' };
   }
-  // basic — env var holds "user:password"
-  const sep = value.indexOf(':');
-  if (sep < 0) return { error: `basic auth expects ${envName} to contain "user:password"` };
-  const encoded = Buffer.from(value, 'utf8').toString('base64');
-  return { headers: { authorization: `Basic ${encoded}` } };
+  if (shape.hasRef) {
+    const r = await resolveRef(String(auth.ref));
+    if (r.error) return { error: r.error };
+    return authHeadersFor(shape.type, r.value, shape.customName);
+  }
+  return resolveAuthHeaders(auth, env);
 }
 
 /** One HTTP attempt with timeout + outer-abort wiring. */
@@ -84,7 +119,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * @param {object} args  {method,url,headers,query,body,auth,retries,max_chars}
  * @param {object} opts  {fetchImpl,timeoutMs,env,signal}
  */
-export async function runHttpRequest(args = {}, { fetchImpl = globalThis.fetch, timeoutMs = 15000, env = process.env, signal } = {}) {
+export async function runHttpRequest(args = {}, { fetchImpl = globalThis.fetch, timeoutMs = 15000, env = process.env, signal, resolveRef } = {}) {
   const method = String(args?.method || 'GET').toUpperCase();
   if (!HTTP_METHODS.has(method)) {
     return `ERROR: method "${method.slice(0, 12)}" not allowed — use one of ${[...HTTP_METHODS].join('/')}`;
@@ -111,7 +146,7 @@ export async function runHttpRequest(args = {}, { fetchImpl = globalThis.fetch, 
       if (/^[A-Za-z0-9-]+$/.test(String(k))) headers[String(k).toLowerCase()] = String(v).slice(0, 1024);
     }
   }
-  const auth = resolveAuthHeaders(args?.auth, env);
+  const auth = await resolveAuthHeadersAsync(args?.auth, env, resolveRef);
   if (auth.error) return `ERROR: ${auth.error}`;
   Object.assign(headers, auth.headers);
 
@@ -198,9 +233,9 @@ export function buildHttpTool({ fetchImpl = globalThis.fetch, timeoutMs = 15000,
       const rep = reporterNames.length
         ? ` Named API reporters configured for this project: ${reporterNames.join(', ')} (the user can run them with /report <name>; you can also send the same request yourself).`
         : '';
-      return `HTTP client for APIs: any method, custom headers, JSON bodies, auth via env-var references (bearer/basic/header — the secret never appears in args or transcripts), retries on 5xx/429. Mutating methods (POST/PUT/PATCH/DELETE) require user approval.${rep}`;
+      return `HTTP client for APIs: any method, custom headers, JSON bodies, auth via references (bearer/basic/header with env:"MY_TOKEN" or ref:"pass:…"/"op://…" — the secret never appears in args or transcripts), retries on 5xx/429. Mutating methods (POST/PUT/PATCH/DELETE) require user approval.${rep}`;
     },
-    args: '{"method":"GET","url":"https://api.github.com/repos/owner/repo/issues?per_page=5","headers":{"Accept":"application/vnd.github+json"},"auth":{"type":"bearer","env":"GITHUB_TOKEN"},"body":null,"retries":2,"max_chars":6000}',
+    args: '{"method":"GET","url":"https://api.github.com/repos/owner/repo/issues?per_page=5","headers":{"Accept":"application/vnd.github+json"},"auth":{"type":"bearer","env":"GITHUB_TOKEN"},"body":null,"retries":2,"max_chars":6000} — vault refs: {"auth":{"type":"bearer","ref":"pass:github/token"}}',
     riskyWhen: (a) => !SAFE_METHODS.has(String(a?.method || 'GET').toUpperCase()),
     render: (a) => `http ${String(a?.method || 'GET').toUpperCase()} ${a?.url || ''}`,
     run: async (args, ctx = {}) => runHttpRequest(args, { fetchImpl, timeoutMs, env, signal: ctx.signal }),
