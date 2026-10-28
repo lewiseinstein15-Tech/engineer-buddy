@@ -1,13 +1,18 @@
 // v0.43.0 — the §10 cloud plane: cloud resource management.
 //
 // Units pinned on injectable probes/runners so everything runs offline;
-// the LIVE leg runs status against the REAL machine (no cloud CLIs here —
-// the honest refusal is the live proof) — REAL > SIMULATED.
+// the LIVE leg runs status against the REAL machine and asserts the CONTRACT,
+// not the machine shape: every CLI gets a line matching reality (present →
+// version + explicit auth outcome; absent → not on PATH), and credential
+// VALUES never surface. CI runners ship aws/gcloud/az — the v0.43.0 test
+// assumed a bare machine and broke there while the TOOL stayed honest.
+// REAL > SIMULATED, on any machine.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import {
   tsvTable, probeCloud, findDeployDir, runCloud, createCloudTool,
   BUCKET_RE, CONTAINER_RE, REGION_RE, PROJECT_RE,
@@ -260,9 +265,39 @@ test('cloud: riskyWhen + registration — inspect gate-free, deploy gated, tool 
   assert.ok(names.includes('cloud'), 'cloud tool registered');
 });
 
-test('cloud: LIVE status against the real machine (no CLIs here — honesty is the proof)', () => {
+test('cloud: LIVE status against the real machine — the honesty contract on ANY machine', () => {
   const out = runCloud({ action: 'status' }, { root: tmp() }); // NO probe injection — real PATH probe
   assert.match(out, /cloud status/);
-  assert.match(out, /not on PATH/);
-  assert.match(out, /nothing fake is reported/);
+  // credential ENV hints: the NAMES always surface, marked names-only — and the
+  // leak guard is LIVE: a set credential var's VALUE bytes never appear.
+  assert.match(out, /credential env: AWS_ACCESS_KEY_ID/);
+  assert.match(out, /names only — values are never printed/);
+  for (const k of ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN']) {
+    const v = String(process.env[k] ?? '').trim();
+    if (v) assert.ok(!out.includes(v), `credential value of ${k} leaked into the status output`);
+  }
+  // Per-CLI honesty: present → a version line (never a refusal) + an explicit
+  // auth outcome; absent → "not on PATH" + "nothing fake is reported" on that
+  // same line. GitHub runners SHIP aws/gcloud/az preinstalled — the machine
+  // shape belongs to the environment; every line matching reality is OURS.
+  const lines = out.split('\n');
+  const realVersion = (bin) => {
+    try {
+      const r = spawnSync(bin, ['--version'], { encoding: 'utf8', timeout: 8000 });
+      const first = String(r.stdout || '').trim().split('\n')[0];
+      return r.status === 0 && first ? first : null;
+    } catch { return null; }
+  };
+  for (const bin of ['aws', 'gcloud', 'az']) {
+    const line = lines.find((l) => l.startsWith(`${bin}: `));
+    assert.ok(line, `${bin} always gets a status line — present or refused, never silently skipped`);
+    if (realVersion(bin)) {
+      assert.ok(!line.includes('not on PATH'), `${bin} IS on PATH — reported as present, not refused`);
+      const auth = lines.find((l) => l !== line && (l.startsWith(`${bin}: `) || l.includes(`${bin} identity:`)));
+      assert.ok(auth, `${bin} present → an explicit auth outcome (identity or honest failure)`);
+    } else {
+      assert.match(line, /not on PATH/, `${bin} absent → honest refusal`);
+      assert.match(line, /nothing fake is reported/, `${bin} absence is honest, not guessed`);
+    }
+  }
 });
