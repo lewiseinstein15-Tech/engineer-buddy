@@ -24,6 +24,8 @@ import { createTimetravelTools } from './timetravel.js';
 import { createDbTool } from './db.js';
 import { createSecretTool } from './secret.js';
 import { createSchemaTool } from './schema.js';
+import { createBrowserTool } from './browser.js';
+import { createContainersTool } from './containers.js';
 
 // ── Edit previews (shown before approval, Claude-Code style) ────────────────
 
@@ -564,6 +566,11 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     createDbTool({ root: scope.root }),
     createSecretTool({}),
     createSchemaTool({ root: scope.root }),
+    // v0.42.0 (checklist §10): browser automation + container orchestration —
+    // both ride the machine's/repo's own drivers (never bundled; probed at
+    // call time, absent = honest refusal), read/act split with gates.
+    createBrowserTool({ root: scope.root }),
+    createContainersTool({ root: scope.root }),
     {
       name: 'todo',
       description:

@@ -58,9 +58,12 @@ export function htmlToText(html) {
   return s;
 }
 
-/** True when a hostname must not be fetched (SSRF guard). Exported for tests. */
+/** True when a hostname must not be fetched (SSRF guard). Exported for tests.
+ *  v0.42.0 fix (red team): WHATWG URL keeps BRACKETS in hostname for IPv6
+ *  ("[fd00::1]") — strip them first or every private/link-local v6 range
+ *  (fc00::/7, fe80::/10) slips through the prefix regexes below. */
 export function blockedHost(hostname) {
-  const h = String(hostname || '').toLowerCase().replace(/\.$/, '');
+  const h = String(hostname || '').toLowerCase().replace(/^\[+/, '').replace(/\]+$/, '').replace(/\.$/, '');
   if (!h) return true;
   if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal')) return true;
   if (h === '::1' || h === '[::1]' || h === '0.0.0.0') return true;
