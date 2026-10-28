@@ -215,12 +215,21 @@ async function makeScopeAndTools({ root, router = null, onEvent = () => {}, appr
   // gh tool (v0.35.0): GitHub/GitLab over REST with the user's env token —
   // PR/MR ops + CI status; provider auto-detected from the origin remote.
   const ghTool = buildGhTool({ root });
-  // Sub-agents (task tool) — loadAgents never throws; invalid files degrade
-  // to warnings. Sub-agents see every base tool except task itself.
-  const { agents } = loadAgents(root);
-  const taskTool = buildTaskTool({ router, tools: [...base, ghTool], agents, approval, onSubEvent: onEvent });
   // MCP servers — optional, timeout-capped, never blocks startup on failure.
-  const mcp = await connectMcpServers(root).catch(() => ({ connected: [], failed: [] }));
+  // v0.44.0 (unified protocol end-state): connected BEFORE the task tool so
+  // bridged tools ride into the sub-agent world too — one tool surface at
+  // every level. Server→client notifications stream out as {type:'mcp'}
+  // events (narration + events.jsonl), flood-capped inside the client.
+  const mcp = await connectMcpServers(root, {
+    onNotification: (ev) => {
+      try {
+        onEvent({ type: 'mcp', ...ev });
+      } catch {
+        /* narration never breaks the run */
+      }
+    },
+  }).catch(() => ({ connected: [], failed: [] }));
+  const mcpTools = buildMcpTools(mcp.connected);
   // Skills v2 — bundled + personal + project catalog; the skill tool is the
   // model's only door to SKILL.md bodies (harness firewall hides the files).
   const { skills } = loadSkills({ root });
@@ -228,7 +237,11 @@ async function makeScopeAndTools({ root, router = null, onEvent = () => {}, appr
   // Plan mode (interactive only): exit_plan is registered so the model has a
   // door out — but it is hidden from the prompt unless plan mode is ON.
   const exitPlanTool = modes ? buildExitPlanTool({ modes, root, onApproved: onPlanApproved }) : null;
-  const mcpTools = buildMcpTools(mcp.connected);
+  // Sub-agents (task tool) — loadAgents never throws; invalid files degrade
+  // to warnings. Sub-agents see every base tool plus the bridged MCP tools
+  // (agent frontmatter allowlists support `mcp__<server>__*`), never `task`.
+  const { agents } = loadAgents(root);
+  const taskTool = buildTaskTool({ router, tools: [...base, ghTool, ...mcpTools], agents, approval, onSubEvent: onEvent });
   // User-defined tools (.buddy/tools/<name>/) — sandboxed child-process tools
   // (v0.14.0). They can never shadow built-ins, task, skills or MCP tools.
   const { tools: userTools, warnings: userToolWarnings } = loadUserTools(root, {
@@ -326,6 +339,15 @@ function makeRenderer({ quiet = false, toolByName = new Map(), verbosity = 'summ
       if (ev.phase === 'step') console.log(c.gray(`  ↳ ${SEM.warn('⧉')} ${ev.agent} · ${ev.tool}`));
       else if (ev.phase === 'done') console.log(c.gray(`  ↳ ${SEM.warn('⧉')} ${ev.agent} finished`));
       else console.log(c.gray(`  ↳ ${SEM.warn('⧉')} ${ev.agent} hit a problem (report returned to Buddy)`));
+    } else if (ev.type === 'mcp') {
+      // v0.44.0 — the unified protocol streams BOTH ways: the MCP server's
+      // own voice (progress / log notifications) narrates beside native tools.
+      if (ev.phase === 'progress') {
+        const n = ev.total ? ` (${ev.progress}/${ev.total})` : ev.progress != null ? ` (${ev.progress})` : '';
+        console.log(c.gray(`  ↳ ${SEM.narrate('⇄')} ${ev.server} · ${ev.message || 'progress'}${n}`));
+      } else {
+        console.log(c.gray(`  ↳ ${SEM.narrate('⇄')} ${ev.server} · ${ev.level || 'info'}${ev.logger ? ` [${ev.logger}]` : ''} · ${ev.data || ''}`));
+      }
     }
   };
 }
@@ -400,6 +422,9 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
           ...(ev.type === 'tool' ? { observation: truncate(ev.observation || '', 400) } : {}),
           ...(ev.type === 'say' ? { text: ev.text } : {}),
           ...(ev.type === 'error' ? { text: ev.text || ev.message || 'error' } : {}),
+          // v0.44.0 — sub-agent + MCP narration rides the stream too.
+          ...(ev.type === 'subagent' ? { agent: ev.agent, phase: ev.phase } : {}),
+          ...(ev.type === 'mcp' ? { server: ev.server, phase: ev.phase, data: ev.data || ev.message || undefined } : {}),
         };
         process.stdout.write(`${JSON.stringify(slim)}\n`);
       }
@@ -1064,6 +1089,8 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           if (e.type === 'error') return truncate(e.text || '', 60);
           if (e.type === 'compaction') return `kept ${e.kept} · dropped ${e.dropped}${e.auto ? ' · auto' : ''}`;
           if (e.type === 'user' || e.type === 'say') return `${e.chars} chars`;
+          if (e.type === 'subagent') return `${e.agent || '?'}${e.tool ? ` · ${e.tool}` : ''} · ${e.phase || ''}`;
+          if (e.type === 'mcp') return e.phase === 'progress' ? `${e.server} · progress ${e.progress ?? '?'}${e.total ? `/${e.total}` : ''}` : `${e.server} · ${e.level || 'info'} · ${e.chars} chars`;
           return '';
         };
         const rows = evs.map((e) => [String(e.ts || '').slice(11, 19), e.type, detail(e)]);

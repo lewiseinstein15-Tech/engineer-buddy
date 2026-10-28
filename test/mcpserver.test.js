@@ -105,12 +105,21 @@ test('protocol: initialize → tools/list → tools/call round-trip', async () =
   assert.equal(lines[0].id, 1);
   assert.equal(lines[0].result.serverInfo.name, 'engineer-buddy');
   assert.equal(lines[0].result.protocolVersion, '2024-11-05');
-  assert.equal(lines.length, 3, 'notifications get no response');
-  const listed = lines[1].result.tools;
+  // v0.44.0: tools/call NARRATES — start/done ride out as notifications/message.
+  // Replies and notifications are distinct channel shapes; the handshake ack
+  // (notifications/initialized) still gets no response of its own.
+  const replies = lines.filter((m) => m.id !== undefined);
+  const notes = lines.filter((m) => m.method === 'notifications/message');
+  assert.equal(lines.length, 5, '3 replies + 2 tool-call notifications');
+  assert.equal(replies.length, 3, 'notifications ride beside replies, never replace them');
+  assert.equal(lines.some((m) => m.method === 'notifications/initialized'), false, 'handshake ack stays silent');
+  assert.match(notes[0]?.params?.data, /buddy_fs_read start/);
+  assert.match(notes[1]?.params?.data, /buddy_fs_read done in \d+ms/);
+  const listed = replies[1].result.tools;
   assert.ok(listed.length >= 8, 'read trio + map + tests + todo + 2 writers');
   assert.ok(listed.every((t) => t.name && t.description && t.inputSchema), 'schema on every tool');
   assert.ok(!('run' in listed[0]), 'run functions never leak into the listing');
-  const call = lines[2];
+  const call = replies.find((m) => m.id === 3);
   assert.equal(call.id, 3);
   assert.match(call.result.content[0].text, /content/);
   assert.notEqual(call.result.isError, true);

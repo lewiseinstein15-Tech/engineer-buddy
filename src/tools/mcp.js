@@ -30,11 +30,65 @@ import { enabledPlugins } from '../plugins.js';
 
 export const MCP_CONFIG_PATH = '.buddy/mcp.json';
 export const MCP_PROTOCOL_VERSION = '2024-11-05';
+// A flooding server gets its first MAX_NOTIFICATIONS through per request
+// window; the rest are dropped (counted, never buffered) — narration must
+// never become an OOM vector.
+export const MAX_NOTIFICATIONS = 200;
+// Bridged tool names must survive the `mcp__<server>__<tool>` join without
+// corrupting cards or registries: a hostile server name/tool is skipped
+// honestly (lands in the invalid list), never bridged.
+export const TOOL_NAME_OK = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 
 let nextId = 1;
 
+/**
+ * Parse one server notification (v0.44.0: the unified protocol streams in
+ * BOTH directions) into a narration event. Returns null for anything that is
+ * not a recognized notification — unknown methods are forward-compatible
+ * noise and stay ignored. Pure; exported for tests.
+ */
+export function parseNotification(msg, serverName = '?') {
+  const method = typeof msg?.method === 'string' ? msg.method : '';
+  if (!method.startsWith('notifications/')) return null;
+  const p = msg?.params && typeof msg.params === 'object' ? msg.params : {};
+  if (method === 'notifications/progress') {
+    return {
+      kind: 'progress',
+      ev: {
+        server: serverName,
+        phase: 'progress',
+        progress: Number.isFinite(Number(p.progress)) ? Number(p.progress) : null,
+        total: Number.isFinite(Number(p.total)) && Number(p.total) > 0 ? Number(p.total) : null,
+        message: truncate(String(p.message ?? ''), 120),
+      },
+    };
+  }
+  if (method === 'notifications/message') {
+    const LEVELS = new Set(['debug', 'info', 'notice', 'warning', 'error', 'critical', 'alert', 'emergency']);
+    return {
+      kind: 'log',
+      ev: {
+        server: serverName,
+        phase: 'log',
+        level: LEVELS.has(String(p.level)) ? String(p.level) : 'info',
+        logger: truncate(String(p.logger ?? ''), 40),
+        data: truncate(typeof p.data === 'string' ? p.data : JSON.stringify(p.data ?? ''), 200),
+      },
+    };
+  }
+  return null;
+}
+
+// Reserved JS-mechanics names: a config or plugin server with one of these
+// names would set `out[name] = …` straight into the object's prototype
+// machinery (the red team proved `__proto__` silently vanishes — it sets
+// [[Prototype]] instead of an own key). They are renamed, deterministically,
+// before they can ever become a key.
+const RESERVED_NAMES = new Set(['__proto__', 'constructor', 'prototype']);
+
 function sanitizeName(s) {
-  return String(s || 'server').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'server';
+  const clean = String(s || 'server').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'server';
+  return RESERVED_NAMES.has(clean) ? `${clean}-reserved` : clean;
 }
 
 function toolArgsHint(inputSchema) {
@@ -65,20 +119,38 @@ export class McpClient {
    * @param {object} [p.env]       extra environment variables
    * @param {number} [p.initTimeoutMs]  initialize handshake budget (default 15000)
    * @param {number} [p.timeoutMs]     per-request budget (default 30000)
+   * @param {function} [p.onNotification] narration tap for server→client
+   *   notifications ({server, phase:'progress'|'log', ...}) — flood-capped,
+   *   a hostile or broken server can never crash the transport through it.
    */
-  constructor({ name, command, args = [], env = {}, initTimeoutMs = 15000, timeoutMs = 30000 } = {}) {
+  constructor({ name, command, args = [], env = {}, initTimeoutMs = 15000, timeoutMs = 30000, onNotification = null } = {}) {
     this.name = sanitizeName(name);
     this.command = String(command || '');
     this.args = Array.isArray(args) ? args.map(String) : [];
     this.env = env && typeof env === 'object' ? env : {};
     this.initTimeoutMs = initTimeoutMs;
     this.timeoutMs = timeoutMs;
+    this.onNotification = typeof onNotification === 'function' ? onNotification : null;
     this.child = null;
     this.info = null; // serverInfo from initialize
     this.tools = []; // tool descriptions from tools/list
     this.pending = new Map(); // id -> {resolve, reject, timer}
     this.closed = false;
     this.buffer = '';
+    this.notifCount = 0; // flood cap window (reset per request)
+  }
+
+  /** Route one notification to the narration tap — capped, never throws. */
+  _note(msg) {
+    if (!this.onNotification) return;
+    try {
+      const parsed = parseNotification(msg, this.name);
+      if (!parsed) return; // unknown notification — forward-compatible silence
+      this.notifCount += 1;
+      if (this.notifCount <= MAX_NOTIFICATIONS) this.onNotification(parsed.ev);
+    } catch {
+      /* a bad notification must never break the transport */
+    }
   }
 
   _send(obj) {
@@ -95,7 +167,14 @@ export class McpClient {
     } catch {
       return; // non-JSON stdout noise — servers sometimes print banners
     }
-    if (msg?.id === undefined || msg?.id === null) return; // notification from server — ignored for now
+    // Notifications are routed by METHOD, never by id — a notification that
+    // carries a pending request's id is still a notification and must never
+    // resolve or reject that request (red-team pinned).
+    if (typeof msg?.method === 'string' && msg.method.startsWith('notifications/')) {
+      this._note(msg);
+      return;
+    }
+    if (msg?.id === undefined || msg?.id === null) return; // id-less non-notification noise
     const p = this.pending.get(msg.id);
     if (!p) return;
     this.pending.delete(msg.id);
@@ -115,6 +194,7 @@ export class McpClient {
         return;
       }
       const id = nextId++;
+      this.notifCount = 0; // fresh flood-cap window per request
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`request "${method}" to "${this.name}" timed out after ${timeoutMs}ms`));
@@ -282,7 +362,7 @@ export function loadMcpConfig(root = process.cwd()) {
  * blocks startup. Never throws — failures land in `failed` so one bad server
  * never blocks startup. Returns { connected: [{name, client, tools}], failed: [{name, error}] }.
  */
-export async function connectMcpServers(root = process.cwd(), { initTimeoutMs = 15000, home = os.homedir() } = {}) {
+export async function connectMcpServers(root = process.cwd(), { initTimeoutMs = 15000, home = os.homedir(), onNotification = null } = {}) {
   let cfg;
   try {
     cfg = loadMcpConfig(root);
@@ -333,7 +413,7 @@ export async function connectMcpServers(root = process.cwd(), { initTimeoutMs = 
 
   const results = await Promise.all(
     Object.values(servers).map(async (spec) => {
-      const client = new McpClient({ ...spec, initTimeoutMs });
+      const client = new McpClient({ ...spec, initTimeoutMs, onNotification });
       try {
         await client.start();
         return { ok: true, entry: { name: client.name, client, tools: client.tools } };
@@ -356,13 +436,19 @@ export async function connectMcpServers(root = process.cwd(), { initTimeoutMs = 
  * Bridge connected MCP servers into the tool registry. Every exposed tool
  * becomes `mcp__<server>__<tool>`, marked risky (first use hits the approval
  * gate — Claude Code's per-tool consent, remembered as "always").
+ * v0.44.0: tool names are validated (a hostile server cannot bridge a name
+ * that corrupts registries/cards) and invalid ones are reported, not bridged.
  */
 export function buildMcpTools(connections = []) {
   const tools = [];
+  const invalid = [];
   for (const conn of connections) {
     for (const t of conn.tools || []) {
       const toolName = typeof t?.name === 'string' ? t.name : '';
-      if (!toolName) continue;
+      if (!toolName || !TOOL_NAME_OK.test(toolName)) {
+        if (toolName) invalid.push(`${conn.name}/${toolName}`);
+        continue;
+      }
       const fullName = `mcp__${conn.name}__${toolName}`;
       const description = String(t?.description || toolName).slice(0, 300);
       tools.push({
@@ -389,6 +475,7 @@ export function buildMcpTools(connections = []) {
       });
     }
   }
+  tools.invalid = invalid; // honestly surfaced, never silently dropped
   return tools;
 }
 

@@ -98,6 +98,26 @@ export function projectEvent(ev) {
       return { ...base, kept: ev.kept, dropped: ev.dropped, auto: Boolean(ev.auto) };
     case 'interrupted':
       return { ...base, at: ev.at };
+    case 'subagent':
+      // v0.44.0 — sub-agent narration keeps its facts in the log (the type
+      // alone used to fall through `default` and tell nobody anything).
+      return {
+        ...base,
+        agent: String(ev.agent || ''),
+        tool: ev.tool || null,
+        phase: String(ev.phase || ''),
+        obsChars: ev.observation ? String(ev.observation).length : 0,
+      };
+    case 'mcp':
+      // v0.44.0 — the unified protocol: server→client notifications
+      // (progress / log) land here, facts only, values truncated by the parser.
+      return {
+        ...base,
+        server: String(ev.server || ''),
+        phase: String(ev.phase || ''),
+        ...(ev.phase === 'progress' ? { progress: ev.progress, total: ev.total ?? null } : { level: ev.level || 'info' }),
+        chars: String(ev.data || ev.message || '').length,
+      };
     case 'error':
       return { ...base, text: String(ev.text || '').slice(0, 300) };
     case 'turn_end':

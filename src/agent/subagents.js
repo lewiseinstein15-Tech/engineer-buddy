@@ -79,6 +79,42 @@ export function normalizeTools(tools) {
   return list.length ? new Set(list) : null;
 }
 
+/**
+ * Compile a tools spec into an allowlist matcher (v0.44.0 — the unified
+ * protocol: sub-agents ride the SAME tool surface, including bridged MCP
+ * tools). One wildcard form exists: `mcp__<server>__*` — every bridged tool
+ * from ONE server (exact names are unknowable when a persona is written;
+ * a server may expose different tools per project). A bare `*` matches
+ * nothing by design — MCP access is always per-server, never global, and
+ * native tools can never be wildcarded away from scrutiny.
+ * Returns null (= inherit everything) or { exact: Set, prefixes: string[] }.
+ * Exported for tests.
+ */
+export function compileAllowlist(tools) {
+  if (!tools) return null;
+  const list = Array.isArray(tools)
+    ? tools
+    : String(tools)
+        .split(/[,\s]+/)
+        .filter(Boolean);
+  if (!list.length) return null;
+  const exact = new Set();
+  const prefixes = [];
+  for (const t of list) {
+    const name = String(t);
+    if (name.length > 1 && name.endsWith('*') && name.startsWith('mcp__')) prefixes.push(name.slice(0, -1));
+    else exact.add(name);
+  }
+  return { exact, prefixes };
+}
+
+/** Does one tool name pass the allowlist? null allow = everything passes. */
+export function allowMatches(allow, name) {
+  if (!allow) return true;
+  if (allow.exact.has(name)) return true;
+  return allow.prefixes.some((p) => String(name).startsWith(p));
+}
+
 const BUILTIN_PRESETS = [
   {
     name: 'explore',
@@ -227,11 +263,26 @@ export async function runSubagent({ router, agent, parentTools, task, maxTokens 
     if (!agent || typeof task !== 'string' || !task.trim()) return 'ERROR: agent and task are required';
 
     // Tool allowlist — and the structural depth limit: `task` is never passed
-    // down, so sub-agents cannot spawn sub-agents.
-    const allow = normalizeTools(agent.tools);
-    const tools = (parentTools || []).filter((t) => t && t.name !== 'task' && (!allow || allow.has(t.name)));
-    const unknown = allow ? [...allow].filter((n) => n !== 'task' && !tools.some((t) => t.name === n)) : [];
-    if (!tools.length) return `ERROR: agent "${agent.name}" has no usable tools (allowed: ${[...(allow || [])].join(', ') || 'none'})`;
+    // down, so sub-agents cannot spawn sub-agents (a wildcard can never
+    // rescue it — `task` is dropped by name BEFORE any matching).
+    const allow = compileAllowlist(agent.tools);
+    const tools = (parentTools || []).filter((t) => t && t.name !== 'task' && (!allow || allowMatches(allow, t.name)));
+    // Honest unknown report (v0.44.0 — was computed and dropped): exact
+    // entries that matched nothing, and wildcards whose server surfaced no
+    // tools (down server, typo'd name). Reported when nothing is usable;
+    // tolerated otherwise — one down server must not kill the run.
+    const unknown = allow ? [...allow.exact].filter((n) => n !== 'task' && !tools.some((t) => t.name === n)) : [];
+    const deadWildcards = allow ? allow.prefixes.filter((p) => !tools.some((t) => t.name.startsWith(p))) : [];
+    if (!tools.length) {
+      const asked = agent.tools ? (Array.isArray(agent.tools) ? agent.tools.join(', ') : String(agent.tools)) : 'none';
+      const why = [
+        unknown.length ? `unknown: ${unknown.join(', ')}` : '',
+        deadWildcards.length ? `no tools matched: ${deadWildcards.map((p) => `${p}*`).join(', ')}` : '',
+      ]
+        .filter(Boolean)
+        .join(' · ');
+      return `ERROR: agent "${agent.name}" has no usable tools (allowed: ${asked}${why ? ` — ${why}` : ''})`;
+    }
 
     // Approval gate for risky tools, mirroring the main loop's gate ("always"
     // is remembered per session, shared across sub-agent runs).

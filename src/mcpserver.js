@@ -183,11 +183,32 @@ export function startMcpServer(root, { writes = false, version = '0.15.0', stdin
           reply(undefined, { code: -32602, message: `unknown tool: ${name}` });
           return;
         }
+        // v0.44.0 — narration streams FROM the server too: every tool call
+        // announces start/done as notifications/message (MCP logging spec).
+        // Notifications expect no response; clients that ignore them (any
+        // third-party host) are unaffected — stdout stays protocol-only.
+        const t0 = Date.now();
+        send({
+          jsonrpc: '2.0',
+          method: 'notifications/message',
+          params: { level: 'info', logger: 'tools', data: `${name} start` },
+        });
         try {
           const out = await tool.run(msg.params?.arguments || {});
-          if (typeof out === 'string' && out.startsWith('ERROR')) reply(textResult(truncate(out, 8000), true));
+          const errored = typeof out === 'string' && out.startsWith('ERROR');
+          send({
+            jsonrpc: '2.0',
+            method: 'notifications/message',
+            params: { level: errored ? 'warning' : 'info', logger: 'tools', data: `${name} done in ${Date.now() - t0}ms${errored ? ' (tool error)' : ''}` },
+          });
+          if (errored) reply(textResult(truncate(out, 8000), true));
           else reply(textResult(truncate(String(out ?? '(empty result)'), 16000)));
         } catch (e) {
+          send({
+            jsonrpc: '2.0',
+            method: 'notifications/message',
+            params: { level: 'error', logger: 'tools', data: `${name} threw in ${Date.now() - t0}ms` },
+          });
           reply(textResult(truncate(`ERROR: ${e?.message || e}`, 8000), true));
         }
         return;
