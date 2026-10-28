@@ -23,8 +23,10 @@
 //     observations and never crashes the main loop
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { truncate, debugLog } from '../util.js';
+import { enabledPlugins } from '../plugins.js';
 
 export const MCP_CONFIG_PATH = '.buddy/mcp.json';
 export const MCP_PROTOCOL_VERSION = '2024-11-05';
@@ -275,20 +277,62 @@ export function loadMcpConfig(root = process.cwd()) {
 
 /**
  * Connect to every configured server (in parallel, capped by init timeout).
- * Never throws — failures land in `failed` so one bad server never blocks
- * startup. Returns { connected: [{name, client, tools}], failed: [{name, error}] }.
+ * Plugin mcp.json fragments (v0.39.0 §3) merge in after the project config —
+ * a name collision or a broken fragment lands in `failed` honestly and never
+ * blocks startup. Never throws — failures land in `failed` so one bad server
+ * never blocks startup. Returns { connected: [{name, client, tools}], failed: [{name, error}] }.
  */
-export async function connectMcpServers(root = process.cwd(), { initTimeoutMs = 15000 } = {}) {
+export async function connectMcpServers(root = process.cwd(), { initTimeoutMs = 15000, home = os.homedir() } = {}) {
   let cfg;
   try {
     cfg = loadMcpConfig(root);
   } catch (e) {
     return { connected: [], failed: [{ name: MCP_CONFIG_PATH, error: e.message }] };
   }
-  if (!cfg || !Object.keys(cfg.mcpServers).length) return { connected: [], failed: [] };
+  const servers = { ...(cfg?.mcpServers || {}) };
+  const failed = [];
+  // Plugin fragments: each enabled plugin may carry its own mcp.json.
+  // Project config wins on a server-name collision (plugin copy skipped).
+  const { plugins, warnings: pluginWarnings } = enabledPlugins({ root, home });
+  for (const w of pluginWarnings) failed.push({ name: 'plugins', error: truncate(w, 160) });
+  for (const p of plugins) {
+    const fragPath = path.join(p.dir, 'mcp.json');
+    let raw;
+    try {
+      raw = fs.readFileSync(fragPath, 'utf8');
+    } catch {
+      continue; // no fragment — normal
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      failed.push({ name: `plugin:${p.name}`, error: `mcp.json is not valid JSON: ${truncate(String(e.message), 120)}` });
+      continue;
+    }
+    const frag = parsed?.mcpServers && typeof parsed.mcpServers === 'object' ? parsed.mcpServers : {};
+    for (const [name, spec] of Object.entries(frag)) {
+      if (!spec || typeof spec !== 'object' || !spec.command) {
+        failed.push({ name: `plugin:${p.name}`, error: `mcp server "${name}" needs a "command"` });
+        continue;
+      }
+      const clean = sanitizeName(name);
+      if (servers[clean]) {
+        failed.push({ name: `plugin:${p.name}`, error: `mcp server "${clean}" already defined — project config wins` });
+        continue;
+      }
+      servers[clean] = {
+        name: clean,
+        command: String(spec.command),
+        args: Array.isArray(spec.args) ? spec.args.map(String) : [],
+        env: spec.env && typeof spec.env === 'object' ? Object.fromEntries(Object.entries(spec.env).map(([k, v]) => [String(k), String(v)])) : {},
+      };
+    }
+  }
+  if (!Object.keys(servers).length) return { connected: [], failed };
 
   const results = await Promise.all(
-    Object.values(cfg.mcpServers).map(async (spec) => {
+    Object.values(servers).map(async (spec) => {
       const client = new McpClient({ ...spec, initTimeoutMs });
       try {
         await client.start();
@@ -300,9 +344,11 @@ export async function connectMcpServers(root = process.cwd(), { initTimeoutMs = 
     })
   );
 
+  // Merge-phase failures (plugin collisions, junk fragments) AND spawn-phase
+  // failures both land in `failed` — one must never erase the other.
   return {
     connected: results.filter((r) => r.ok).map((r) => r.entry),
-    failed: results.filter((r) => !r.ok).map((r) => r.entry),
+    failed: [...failed, ...results.filter((r) => !r.ok).map((r) => r.entry)],
   };
 }
 

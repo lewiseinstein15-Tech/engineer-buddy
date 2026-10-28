@@ -52,6 +52,7 @@ import { buildHttpTool } from '../tools/http.js';
 import { buildGhTool, resolveGh, ghCiRows, ghPrComments, formatCommentsPlain, providerName, ago as ghAgo } from '../tools/ghapi.js';
 import { buildExtraRoots, listConfiguredDirs, addProjectDir, removeProjectDir, aliasFor, pickAlias, MAX_EXTRA_ROOTS } from '../tools/roots.js';
 import { loadReporters, findReporter, runReporter } from '../tools/reporters.js';
+import { discoverPlugins, installPlugin, removePlugin, setPluginEnabled, marketplaceEntries, summarizeBundles, pluginKindDirs } from '../plugins.js';
 import { truncate, debugLog } from '../util.js';
 
 // Version always comes from package.json so the banner can never drift from the release.
@@ -68,7 +69,7 @@ export function fmtTok(n) {
 export const SLASH_COMMANDS = [
   'help', 'new', 'clear', 'screen', 'compact', 'context', 'map', 'model', 'gateways', 'cost', 'stats', 'effort', 'events', 'stream',
   'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'diff', 'hooks', 'docs', 'rename', 'branch', 'fork', 'share', 'verbosity', 'theme', 'output-style', 'statusline', 'why', 'compare', 'memory', 'experience', 'learn', 'review',
-  'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'sandbox', 'quit', 'exit', 'add-dir', 'report', 'copy', 'terminal-setup', 'vim', 'ci', 'pr-comments',
+  'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'sandbox', 'plugin', 'quit', 'exit', 'add-dir', 'report', 'copy', 'terminal-setup', 'vim', 'ci', 'pr-comments',
 ];
 
 // Descriptions shown in the slash-command palette (Claude Code style menu).
@@ -95,6 +96,7 @@ export const SLASH_DESCRIPTIONS = {
   agents: 'List sub-agents (task tool) — and how to add your own',
   skills: 'List skills (SKILL.md playbooks) — /<skill-name> runs one',
   mcp: 'Show MCP servers + their tools (.buddy/mcp.json)',
+  plugin: 'One-folder plugins — /plugin list · add <owner>/<repo> | <path> | <pack> · browse · enable/disable/remove',
   docs: 'Fetch official docs (/docs react hooks) — attaches to your next task',
   rename: 'Name the current session (/rename fix-auth) — resume later with buddy -r fix-auth',
   branch: 'Save/restore conversation snapshots in memory (/branch save try-x · /branch try-x · /branch)',
@@ -196,8 +198,13 @@ async function makeScopeAndTools({ root, router = null, onEvent = () => {}, appr
   const scope = new LocalScope(root, extraRoots);
   const todoState = { latest: null };
   const shells = new BackgroundShells({ cwd: root });
-  // Named API reporters (.buddy/reporters/*.json) + the http client tool.
-  const { reporters } = loadReporters(root);
+  // Plugins (v0.39.0 §3): one-folder bundles discovered from .buddy/plugins/
+  // (project) and ~/.buddy/plugins/ (personal). Reporters merge here;
+  // skills/agents/commands scan plugin dirs inside their own loaders;
+  // tools/mcp pick up their plugin layers in this same session build.
+  const { plugins: installedPlugins, warnings: pluginWarnings } = discoverPlugins({ root });
+  // Named API reporters (.buddy/reporters/*.json + plugin reporters) + the http client tool.
+  const { reporters } = loadReporters(root, { extraDirs: pluginKindDirs(installedPlugins.filter((p) => p.enabled), 'reporters') });
   // Sandbox mode (v0.38.0 §9): one context object — capability probed once,
   // empty HOME dir ensured, enabled state read from settings. The bash tool
   // reads it on every call; /sandbox flips the same object mid-session.
@@ -227,7 +234,7 @@ async function makeScopeAndTools({ root, router = null, onEvent = () => {}, appr
     extraNames: new Set([...base, ghTool, taskTool, skillTool, ...mcpTools, ...(exitPlanTool ? [exitPlanTool] : [])].map((t) => t.name)),
   });
   const tools = [...base, ghTool, taskTool, skillTool, ...(exitPlanTool ? [exitPlanTool] : []), ...mcpTools, ...userTools];
-  return { scope, tools, todoState, mcp, shells, skills, userToolWarnings, extraRoots, reporters, sandbox };
+  return { scope, tools, todoState, mcp, shells, skills, userToolWarnings, extraRoots, reporters, sandbox, plugins: installedPlugins, pluginWarnings };
 }
 
 function makeHarness(root) {
@@ -250,7 +257,7 @@ function makeHarness(root) {
 
 /** Create a chat session bound to a workspace root. */
 export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {}, repoMap = null, effort = null, streaming = null, onStream = null } = {}) {
-  const { tools, todoState, mcp, shells, skills, userToolWarnings, scope, extraRoots, reporters, sandbox } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved });
+  const { tools, todoState, mcp, shells, skills, userToolWarnings, scope, extraRoots, reporters, sandbox, plugins: installedPlugins, pluginWarnings } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved });
   const harness = makeHarness(root);
   // Hooks: the deterministic guarantee layer (.buddy/settings.json). One
   // runner per session — the REPL reads it for /hooks, the loop obeys it.
@@ -263,7 +270,7 @@ export async function createBuddySession({ root = process.cwd(), router, yolo = 
   if (resumeFrom) {
     for (const m of resumeMessages(loadSession(resumeFrom))) session.messages.push(m);
   }
-  return { chat: session, tools, todoState, mcp, shells, skills, hooks, userToolWarnings, permissions: perms, permissionWarnings, scope, extraRoots, reporters, sandbox };
+  return { chat: session, tools, todoState, mcp, shells, skills, hooks, userToolWarnings, permissions: perms, permissionWarnings, scope, extraRoots, reporters, sandbox, plugins: installedPlugins, pluginWarnings };
 }
 
 function defaultApproval(busy) {
@@ -447,6 +454,21 @@ export function printMcpStatus(mcp) {
   }
 }
 
+/** Plugin status line under the banner (v0.39.0 §3). Never throws. */
+export function printPluginStatus(plugins, warnings = []) {
+  try {
+    const on = (plugins ?? []).filter((p) => p.enabled);
+    if (on.length) {
+      console.log(c.gray(`  plugins: ${on.map((p) => p.name).join(', ')} — /plugin for details`));
+    }
+    if (warnings.length) {
+      console.log(c.yellow(`  plugin warnings: ${warnings.join(' · ')}`));
+    }
+  } catch {
+    /* status line is best effort — never blocks the session */
+  }
+}
+
 // ── Interactive REPL ─────────────────────────────────────────────────────────
 
 export async function startRepl({ router, root = process.cwd(), config = {}, yolo: yoloFlag = false, resumeFrom = null, record = null, onExit = null } = {}) {
@@ -574,7 +596,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   const routingMemAtStart = loadRoutingMemory(root);
   if (selfHealingOn) healedNote = selfHeal(router, routingMemAtStart, { enabled: true });
 
-  const { chat, tools, todoState, mcp, shells, skills: skillCatalog, hooks: hookRunner, userToolWarnings, permissions: perms, permissionWarnings, scope, reporters: projectReporters, sandbox: sandboxCtx } = await createBuddySession({
+  const { chat, tools, todoState, mcp, shells, skills: skillCatalog, hooks: hookRunner, userToolWarnings, permissions: perms, permissionWarnings, scope, reporters: projectReporters, sandbox: sandboxCtx, plugins: installedPlugins, pluginWarnings } = await createBuddySession({
     root,
     router,
     modes,
@@ -693,6 +715,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   // it returns. (v0.8.1 fix — this block used to sit before the destructure,
   // a temporal-dead-zone ReferenceError on every interactive startup.)
   printMcpStatus(mcp);
+  printPluginStatus(installedPlugins, pluginWarnings);
 
   // Multi-root workspace (v0.26.0): make configured roots visible up front —
   // silent scoping changes are how trust dies.
@@ -848,6 +871,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
               ['/tools', "list Buddy's tools"],
               ['/agents', 'list sub-agents (task tool) — add your own in .buddy/agents/'],
               ['/mcp', 'MCP servers + tools (from .buddy/mcp.json)'],
+              ['/plugin', 'one-folder plugins — /plugin browse · add <owner>/<repo> · enable/disable'],
               ['/plan', 'toggle plan mode — read-only research, plan approved at the gate'],
               ['/plans', 'list approved plans in .buddy/plans/'],
               ['/rewind [n]', 'list checkpoints · /rewind 1 restores files to before the latest edit'],
@@ -1103,6 +1127,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
             { headers: ['tool', 'gate', 'what it does'] }
           )}` +
             `\n${c.dim('  add your own: .buddy/tools/<name>/ with manifest.json (name, description, version, argsSchema, safe) + index.js exporting run(args, ctx) — each call runs sandboxed in a child process')}` +
+            `\n${c.dim('  or bring a bundle: /plugin add <owner>/<repo> installs tools + skills + hooks as one plugin')}` +
             (userToolWarnings?.length ? `\n${c.yellow(`  skipped: ${userToolWarnings.join(' · ')}`)}` : '') +
             '\n'
         );
@@ -1124,14 +1149,17 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         break;
       }
       case 'skills': {
-        if (!skillCatalog.length) {
+        // LIVE scan (v0.39.0): /skills reflects plugins installed mid-session —
+        // the model's own catalog refreshes at the next session start.
+        const { skills: liveSkills, warnings: skillWarnings } = loadSkills({ root });
+        if (!liveSkills.length) {
           say(
             `\n  no skills loaded — add ${c.bold('.buddy/harness/skills/<name>/SKILL.md')} (frontmatter: name, description, allowed-tools)` +
-              `\n  ${c.dim('bundled: shipped with Buddy · personal: ~/.buddy/skills/<name>/SKILL.md')}\n`
+              `\n  ${c.dim('bundled: shipped with Buddy · personal: ~/.buddy/skills/<name>/SKILL.md · or /plugin add a pack')}\n`
           );
           break;
         }
-        const rows = skillCatalog.map((s) => [
+        const rows = liveSkills.map((s) => [
           s.disableModelInvocation ? c.dim('user-only') : c.green('auto'),
           c.bold(`/${s.name}`),
           s.source,
@@ -1141,7 +1169,9 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         say(
           `\n${renderTable(rows, { headers: ['trigger', 'skill', 'source', 'allowed tools', 'description'] })}` +
             `\n${c.dim('  Buddy auto-loads a skill when your task matches its description — or run /<skill-name> args yourself')}\n` +
-            c.dim('  add one: .buddy/harness/skills/<name>/SKILL.md · yours everywhere: ~/.buddy/skills/<name>/SKILL.md\n')
+            c.dim('  add one: .buddy/harness/skills/<name>/SKILL.md · yours everywhere: ~/.buddy/skills/<name>/SKILL.md · or /plugin add a pack') +
+            (skillWarnings.length ? `\n${c.yellow(`  warnings: ${skillWarnings.join(' · ')}`)}` : '') +
+            '\n'
         );
         break;
       }
@@ -1162,6 +1192,102 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           `\n${renderTable(rows, { headers: ['alive', 'server', 'tools', 'info'] })}` +
             (toolRows.length ? `\n${renderTable(toolRows, { headers: ['tool', 'description'] })}\n` : '\n') +
             c.dim('  first use of each tool asks for approval — answer "a" to always allow it this session\n')
+        );
+        break;
+      }
+      case 'plugin': {
+        const sub = String(args || '').trim();
+        if (!sub || sub === 'list') {
+          const { plugins: list, warnings } = discoverPlugins({ root });
+          if (!list.length) {
+            say(
+              `\n  no plugins installed — a plugin is ONE folder bundling skills · agents · commands · tools · reporters · mcp:\n` +
+                c.dim('    /plugin add <owner>/<repo>    clone a git repo (github shorthand works)\n') +
+                c.dim('    /plugin add <local path>      clone (git repo) or copy a folder\n') +
+                c.dim('    /plugin browse                the marketplace — bundled packs ship in the box\n')
+            );
+            break;
+          }
+          const rows = list.map((p) => [
+            c.bold(p.name),
+            p.version,
+            p.source,
+            p.enabled ? c.green('on') : c.yellow('off'),
+            summarizeBundles(p.bundles),
+            truncate(p.description, 44),
+          ]);
+          say(
+            `\n${renderTable(rows, { headers: ['plugin', 'v', 'origin', 'state', 'bundles', 'what it does'] })}` +
+              `\n${c.dim('  /plugin disable <name> turns one off (stays on disk) · /plugin remove <name> deletes it')}` +
+              (warnings.length ? `\n${c.yellow(`  warnings: ${warnings.join(' · ')}`)}` : '') +
+            '\n'
+          );
+          break;
+        }
+        if (sub === 'browse') {
+          const { entries, source, warnings } = await marketplaceEntries({ root });
+          if (!entries.length) {
+            say(`\n  the marketplace is empty${source !== 'bundled' ? ` (${source})` : ''}\n`);
+            break;
+          }
+          const rows = entries.map((e) => [
+            c.bold(e.name),
+            e.bundled ? c.green('bundled') : 'community',
+            e.repo ? truncate(e.repo, 36) : c.dim('—'),
+            truncate(e.description, 52),
+          ]);
+          say(
+            `\n${renderTable(rows, { headers: ['plugin', 'kind', 'repo', 'what it does'] })}` +
+              `\n${c.dim(`  catalog: ${source}`)} · ${c.dim('/plugin add <name> for a bundled pack · /plugin add <owner>/<repo> for a community entry')}` +
+              (warnings.length ? `\n${c.yellow(`  warnings: ${warnings.join(' · ')}`)}` : '') +
+            '\n'
+          );
+          break;
+        }
+        const addMatch = sub.match(/^add\s+(.+)$/);
+        if (addMatch) {
+          const src = addMatch[1].trim();
+          say(`  installing ${c.bold(truncate(src, 60))} …`);
+          const r = installPlugin({ root, from: src });
+          if (!r.ok) {
+            say(`\n  ${c.red('install failed')}: ${r.error}\n`);
+            break;
+          }
+          const p = r.plugin;
+          say(
+            `\n  ${c.green('✓')} installed ${c.bold(p.name)} v${p.version} — ${summarizeBundles(p.bundles)}` +
+              `\n${c.dim(`  ${truncate(p.description, 100)}`)}` +
+              `\n${c.dim('  live now: skills (/skills) · agents (/agents) · commands · hooks · reporters · mcp')}` +
+              `\n${c.dim('  next session start: plugin tools join the registry (/tools) — the model\'s skill catalog refreshes too')}` +
+              `\n${c.dim(`  turn it off any time: /plugin disable ${p.name}`)}\n`
+          );
+          break;
+        }
+        const enableMatch = sub.match(/^(enable|disable)\s+(\S+)$/);
+        if (enableMatch) {
+          const [, action, name] = enableMatch;
+          const disabledList = setPluginEnabled(root, name, action === 'enable');
+          say(
+            `\n  ${c.bold(name)} ${action}d — disabled list: ${disabledList.length ? disabledList.join(', ') : '(empty)'}` +
+              `\n${c.dim('  skills/agents/commands/reporters react on their next scan; tools/mcp at the next session start')}\n`
+          );
+          break;
+        }
+        const rmMatch = sub.match(/^(remove|rm)\s+(\S+)$/);
+        if (rmMatch) {
+          const r = removePlugin({ root, name: rmMatch[2] });
+          if (!r.ok) {
+            say(`\n  ${c.red('remove failed')}: ${r.error}\n`);
+            break;
+          }
+          say(`\n  ${c.green('✓')} removed ${c.bold(r.removed)} — folder deleted; a leftover disabled-list entry is harmless\n`);
+          break;
+        }
+        say(
+          `\n  ${c.yellow('unknown /plugin subcommand')} — try:\n` +
+            c.dim('    /plugin · /plugin list · /plugin browse\n') +
+            c.dim('    /plugin add <owner>/<repo> | <local path> | <bundled pack>\n') +
+            c.dim('    /plugin enable <name> · /plugin disable <name> · /plugin remove <name>\n')
         );
         break;
       }

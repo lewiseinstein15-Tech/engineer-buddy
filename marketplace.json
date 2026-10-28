@@ -1,0 +1,22 @@
+{
+  "updated": "2026-10-28",
+  "note": "Buddy's bundled marketplace seed — ships with the package so /plugin browse works offline with zero setup. Community catalogs can replace it live via settings plugins.marketplaceUrl (one fetch, 5s cap, falls back to this seed honestly). Entries with \"bundled\": true install straight from this package's packs/ dir; everything else installs from its repo with /plugin add <owner>/<repo>.",
+  "plugins": [
+    {
+      "name": "pack-python",
+      "bundled": true,
+      "description": "Python language pack — layout + tooling conventions (pytest, ruff, black), a QA playbook and a /py-qa command"
+    },
+    {
+      "name": "pack-nextjs",
+      "bundled": true,
+      "description": "Next.js framework pack — App Router conventions (server/client components, data fetching, metadata), a QA playbook and a /nextjs-page scaffold command"
+    },
+    {
+      "name": "engineer-buddy",
+      "bundled": false,
+      "repo": "the engineer-buddy repo itself — mine its skills/ dir for more playbooks",
+      "description": "Bundled skills source: pr-reviewer, issue-triage, release-notes, dep-auditor, issue-fixer"
+    }
+  ]
+}

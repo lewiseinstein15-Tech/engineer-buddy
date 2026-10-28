@@ -23,9 +23,11 @@
 // Six built-in presets ship in code so `task` works out of the box:
 //   explore · plan · test-writer · refactorer · doc-generator · security-auditor
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { runAgent } from './agent.js';
 import { truncate } from '../util.js';
+import { enabledPlugins, pluginKindDirs } from '../plugins.js';
 
 export const AGENTS_DIR = '.buddy/agents';
 export const RESULT_CHAR_CAP = 8000; // sub-agent report budget back to the main loop
@@ -160,34 +162,47 @@ export function builtinAgents() {
 }
 
 /**
- * Load every agent available in a workspace: built-in presets merged with
- * .buddy/agents/*.md (user definitions win on name collisions).
- * Invalid files are skipped with a warning entry so one bad file never
- * breaks the tool set. Exported for tests.
+ * Load every agent available in a workspace: built-in presets, then every
+ * enabled plugin's agents/ dir (v0.39.0 §3), then .buddy/agents/*.md —
+ * user definitions win on name collisions. Invalid files are skipped with a
+ * warning entry so one bad file never breaks the tool set. Exported for tests.
  */
-export function loadAgents(root = process.cwd()) {
+export function loadAgents(root = process.cwd(), { home = os.homedir() } = {}) {
   const byName = new Map(builtinAgents().map((a) => [a.name, a]));
   const warnings = [];
-  const dir = path.join(root, AGENTS_DIR);
-  let entries = [];
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isFile() && e.name.endsWith('.md'));
-  } catch {
-    /* no agents dir — built-ins only */
-  }
-  for (const ent of entries) {
-    const fallbackName = ent.name.replace(/\.md$/, '');
+  // One dir of <name>.md personas; later dirs win on name collisions.
+  const scanDir = (dir, source) => {
+    let entries = [];
     try {
-      const parsed = parseAgentMd(fs.readFileSync(path.join(dir, ent.name), 'utf8'), { fallbackName });
-      if (!parsed.ok) {
-        warnings.push(`${ent.name}: ${parsed.error}`);
-        continue;
-      }
-      byName.set(parsed.agent.name, parsed.agent);
-    } catch (e) {
-      warnings.push(`${ent.name}: ${e.message}`);
+      entries = fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isFile() && e.name.endsWith('.md'));
+    } catch {
+      return; /* no such dir — normal */
     }
-  }
+    for (const ent of entries) {
+      const fallbackName = ent.name.replace(/\.md$/, '');
+      try {
+        const parsed = parseAgentMd(fs.readFileSync(path.join(dir, ent.name), 'utf8'), { fallbackName });
+        if (!parsed.ok) {
+          warnings.push(`${ent.name} (${source}): ${parsed.error}`);
+          continue;
+        }
+        // overriding a BUILT-IN is the documented merge rule (silent);
+        // shadowing another user/plugin definition deserves a warning
+        if (byName.has(parsed.agent.name) && byName.get(parsed.agent.name).source !== 'builtin') {
+          warnings.push(`agent "${parsed.agent.name}" (${source}) shadows the ${byName.get(parsed.agent.name).source} one`);
+        }
+        byName.set(parsed.agent.name, parsed.agent);
+      } catch (e) {
+        warnings.push(`${ent.name} (${source}): ${e.message}`);
+      }
+    }
+  };
+  // Plugin layer: enabled plugins contribute their agents/ dirs (project
+  // .buddy/agents is scanned after, so the user's own definitions win).
+  const { plugins, warnings: pluginWarnings } = enabledPlugins({ root, home });
+  warnings.push(...pluginWarnings);
+  for (const d of pluginKindDirs(plugins, 'agents')) scanDir(d.dir, `plugin:${d.plugin}`);
+  scanDir(path.join(root, AGENTS_DIR), 'project');
   return { agents: [...byName.values()], warnings };
 }
 

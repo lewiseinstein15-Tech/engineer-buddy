@@ -17,9 +17,11 @@
 // A 10s timeout kills runaway hooks. Aliases: pre_edit, post_edit,
 // pre_command, post_command, on_error.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { debugLog, truncate } from './util.js';
+import { enabledPlugins, pluginHookEntries } from './plugins.js';
 
 export const HOOK_EVENTS = [
   'SessionStart',
@@ -44,35 +46,24 @@ export const HOOK_ALIASES = {
 export const SETTINGS_FILE = '.buddy/settings.json';
 export const HOOK_TIMEOUT_MS = 10000;
 
-/** Load + validate hook config from .buddy/settings.json. Never throws. */
-export function loadHooks(root) {
-  const hooks = new Map(); // event -> [{matcher: RegExp|null, matcherSrc, command}]
-  const warnings = [];
-  const file = path.join(root, SETTINGS_FILE);
-  let cfg = null;
-  try {
-    cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch (e) {
-    if (e.code !== 'ENOENT') warnings.push(`settings unreadable: ${e.message}`);
-  }
-  const cfgHooks = cfg?.hooks;
-  if (cfgHooks === undefined) return { hooks, warnings, file };
+/** Validate + register one event→entries mapping into the hooks map. Shared by settings AND plugin manifests. */
+function registerHookEntries(cfgHooks, hooks, warnings, { label = '' } = {}) {
   if (typeof cfgHooks !== 'object' || Array.isArray(cfgHooks) || cfgHooks === null) {
-    warnings.push('hooks must be an object of event → command | [{matcher, command}]');
-    return { hooks, warnings, file };
+    warnings.push(`${label}hooks must be an object of event → command | [{matcher, command}]`);
+    return;
   }
   for (const [rawName, entries] of Object.entries(cfgHooks)) {
     const alias = HOOK_ALIASES[rawName];
     const name = alias ? alias.event : rawName;
     if (!HOOK_EVENTS.includes(name)) {
-      warnings.push(`unknown hook event "${rawName}" (events: ${HOOK_EVENTS.join(', ')}; aliases: ${Object.keys(HOOK_ALIASES).join(', ')})`);
+      warnings.push(`${label}unknown hook event "${rawName}" (events: ${HOOK_EVENTS.join(', ')}; aliases: ${Object.keys(HOOK_ALIASES).join(', ')})`);
       continue;
     }
     const list = Array.isArray(entries) ? entries : [entries];
     for (const entry of list) {
       const command = typeof entry === 'string' ? entry : entry?.command;
       if (!command || typeof command !== 'string') {
-        warnings.push(`hook "${rawName}" entry without a "command" — skipped`);
+        warnings.push(`${label}hook "${rawName}" entry without a "command" — skipped`);
         continue;
       }
       const matcherSrc =
@@ -84,13 +75,35 @@ export function loadHooks(root) {
         try {
           re = new RegExp(`^(?:${matcherSrc})$`);
         } catch {
-          warnings.push(`hook "${rawName}" matcher "${matcherSrc}" is not a valid regex — skipped`);
+          warnings.push(`${label}hook "${rawName}" matcher "${matcherSrc}" is not a valid regex — skipped`);
           continue;
         }
       }
       if (!hooks.has(name)) hooks.set(name, []);
       hooks.get(name).push({ matcher: re, matcherSrc, command });
     }
+  }
+}
+
+/** Load + validate hook config from .buddy/settings.json, then every enabled
+ *  plugin's manifest hooks (v0.39.0 §3). Never throws. */
+export function loadHooks(root, { home = os.homedir() } = {}) {
+  const hooks = new Map(); // event -> [{matcher: RegExp|null, matcherSrc, command}]
+  const warnings = [];
+  const file = path.join(root, SETTINGS_FILE);
+  let cfg = null;
+  try {
+    cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    if (e.code !== 'ENOENT') warnings.push(`settings unreadable: ${e.message}`);
+  }
+  if (cfg?.hooks !== undefined) registerHookEntries(cfg.hooks, hooks, warnings);
+  // Plugin manifest hooks — same shape, appended after the user's own
+  // settings hooks. A broken manifest hook degrades to a warning.
+  const { plugins, warnings: pluginWarnings } = enabledPlugins({ root, home });
+  warnings.push(...pluginWarnings);
+  for (const ph of pluginHookEntries(plugins)) {
+    registerHookEntries(ph.hooks, hooks, warnings, { label: `plugin ${ph.plugin}: ` });
   }
   return { hooks, warnings, file };
 }

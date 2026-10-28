@@ -1,0 +1,6 @@
+{
+  "name": "pack-python",
+  "version": "1.0.0",
+  "description": "Python language pack — layout + tooling conventions (pytest, ruff, black), a QA playbook and a /py-qa command",
+  "keywords": ["python", "language-pack", "pytest"]
+}

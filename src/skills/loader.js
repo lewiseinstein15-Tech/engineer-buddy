@@ -11,10 +11,11 @@
 //   ---
 //   (markdown body — the playbook Buddy follows)
 //
-// Three layers, later wins (same shadowing rule as Claude Code):
+// Four layers, later wins (same shadowing rule as Claude Code):
 //   1. bundled  — shipped with Buddy (skills/ in the package root)
-//   2. personal — ~/.buddy/skills/<name>/SKILL.md   (you, everywhere)
-//   3. project  — .buddy/harness/skills/<name>/SKILL.md (this repo only)
+//   2. plugin   — every enabled plugin's skills/ dir (v0.39.0 §3)
+//   3. personal — ~/.buddy/skills/<name>/SKILL.md   (you, everywhere)
+//   4. project  — .buddy/harness/skills/<name>/SKILL.md (this repo only)
 //
 // Only `name` + `description` are always in context (progressive disclosure);
 // the body loads on demand through the `skill` tool — the harness firewall
@@ -24,6 +25,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { enabledPlugins, pluginKindDirs } from '../plugins.js';
 
 export const SKILL_FILE = 'SKILL.md';
 export const SKILL_NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
@@ -140,8 +142,13 @@ function scanLayer(dir, source) {
 export function loadSkills({ root = process.cwd(), home = os.homedir() } = {}) {
   const warnings = [];
   const byName = new Map();
+  // Enabled plugins contribute their skills/ dirs between bundled and
+  // personal — a plugin can extend the catalog, the user's own always wins.
+  const { plugins: plugged, warnings: pluginWarnings } = enabledPlugins({ root, home });
+  warnings.push(...pluginWarnings);
   const layers = [
     [BUNDLED_SKILLS_DIR, 'bundled'],
+    ...pluginKindDirs(plugged, 'skills').map((d) => [d.dir, 'plugin']),
     [path.join(home, PERSONAL_SKILLS_DIR), 'personal'],
     [path.join(root, '.buddy/harness/skills'), 'project'],
   ];

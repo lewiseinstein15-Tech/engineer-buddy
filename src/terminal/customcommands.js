@@ -14,6 +14,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { truncate } from '../util.js';
+import { enabledPlugins, pluginKindDirs } from '../plugins.js';
 
 const NAME_RE = /^[a-z][a-z0-9-]*$/i;
 
@@ -32,7 +33,7 @@ export function parseFrontmatter(text) {
   return { meta, body: s.slice(end + 4).trim() };
 }
 
-function loadDir(dir) {
+function loadDir(dir, source = dir) {
   const out = new Map();
   let entries = [];
   try {
@@ -61,24 +62,28 @@ function loadDir(dir) {
       argumentHint: String(meta['argument-hint'] || meta.argumenthint || ''),
       allowedTools,
       body,
-      source: dir,
+      source,
     });
   }
   return out;
 }
 
 /**
- * Load custom commands from <root>/.buddy/commands + ~/.buddy/commands.
- * Project wins over user on a name clash; names colliding with built-in
- * slash commands are skipped with a reason (the built-in always wins).
- * Returns { commands: Map<name, cmd>, skipped: [{name, reason}] }.
+ * Load custom commands from <root>/.buddy/commands + ~/.buddy/commands plus
+ * every enabled plugin's commands/ dir (v0.39.0 §3). Project wins over
+ * plugins, plugins win over user on a name clash; names colliding with
+ * built-in slash commands are skipped with a reason (the built-in always
+ * wins). Returns { commands: Map<name, cmd>, skipped: [{name, reason}] }.
  */
 export function loadCustomCommands(root, { home = null, builtins = [] } = {}) {
   const skipped = [];
   const homeDir = home || os.homedir();
   const user = loadDir(path.join(homeDir, '.buddy', 'commands'));
+  // Plugin layer between user and project — the user's own always wins.
+  const { plugins } = enabledPlugins({ root, home: homeDir });
+  const pluginMaps = pluginKindDirs(plugins, 'commands').map((d) => loadDir(d.dir, d.plugin));
   const project = loadDir(path.join(root, '.buddy', 'commands'));
-  const merged = new Map([...user, ...project]); // project overrides user
+  const merged = new Map([...user, ...pluginMaps.flatMap((m) => [...m]), ...project]); // later wins
   const builtinSet = new Set(builtins);
   const commands = new Map();
   for (const [name, cmd] of merged) {

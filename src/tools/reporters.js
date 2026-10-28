@@ -71,27 +71,37 @@ export function validateReporter(raw, fallbackName) {
 }
 
 /**
- * Load every reporter in <root>/.buddy/reporters/*.json. Never throws.
+ * Load every reporter in <root>/.buddy/reporters/*.json, plus any extraDirs
+ * (plugin reporters, v0.39.0 §3). Never throws. First definition of a name
+ * wins (project dir is scanned first — plugins extend, never replace).
  * @returns {{ reporters: Array, warnings: string[] }}
  */
-export function loadReporters(root, { dir = null } = {}) {
+export function loadReporters(root, { dir = null, extraDirs = [] } = {}) {
   const warnings = [];
-  const base = dir || path.join(root, REPORTERS_DIR);
+  const bases = [...(dir ? [dir] : [path.join(root, REPORTERS_DIR)]), ...extraDirs.map((d) => (typeof d === 'string' ? d : d?.dir)).filter(Boolean)];
   let files = [];
-  try {
-    files = fs.readdirSync(base, { withFileTypes: true }).filter((e) => e.isFile() && e.name.endsWith('.json')).map((e) => e.name);
-  } catch {
-    return { reporters: [], warnings }; // no reporters dir — normal
+  for (const base of bases) {
+    let found = [];
+    try {
+      found = fs.readdirSync(base, { withFileTypes: true }).filter((e) => e.isFile() && e.name.endsWith('.json')).map((e) => e.name);
+    } catch {
+      continue; // no reporters dir — normal
+    }
+    // sort WITHIN each base — the bases themselves stay in priority order
+    // (project dir first, plugin dirs after), which the first-wins rule
+    // below depends on. A global path sort would let ".buddy/plugins/…"
+    // beat ".buddy/reporters/…" alphabetically.
+    files.push(...found.map((f) => path.join(base, f)).sort());
   }
   const reporters = [];
   const seen = new Set();
-  for (const f of files.sort()) {
+  for (const f of files) {
     if (reporters.length >= MAX_REPORTERS) {
       warnings.push(`reporter cap (${MAX_REPORTERS}) reached — remaining files ignored`);
       break;
     }
     try {
-      const raw = JSON.parse(fs.readFileSync(path.join(base, f), 'utf8'));
+      const raw = JSON.parse(fs.readFileSync(f, 'utf8'));
       const v = validateReporter(raw, path.basename(f, '.json'));
       if (!v.ok) {
         warnings.push(`${f}: ${v.error}`);

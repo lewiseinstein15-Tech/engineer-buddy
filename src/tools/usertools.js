@@ -24,6 +24,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { truncate } from '../util.js';
+import { enabledPlugins, pluginKindDirs } from '../plugins.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const USER_RUNTIME = path.join(__dirname, 'userruntime.js');
@@ -177,6 +178,11 @@ export function loadUserTools(root, { home = os.homedir(), extraNames = new Set(
     { source: 'project', dir: path.join(root, '.buddy', 'tools') },
     { source: 'personal', dir: path.join(home, '.buddy', 'tools') },
   ];
+  // Plugin layer (v0.39.0 §3): enabled plugins' tools/ dirs come AFTER the
+  // user's own — project > personal > plugin, and a plugin tool can never
+  // shadow a built-in (the extraNames filter below holds for plugins too).
+  const { plugins } = enabledPlugins({ root, home });
+  for (const d of pluginKindDirs(plugins, 'tools')) layers.push({ source: `plugin:${d.plugin}`, dir: d.dir });
   const tools = [];
   const warnings = [];
   const seen = new Map(); // name -> source that owns it (project first)

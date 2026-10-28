@@ -1,0 +1,6 @@
+{
+  "name": "pack-nextjs",
+  "version": "1.0.0",
+  "description": "Next.js framework pack — App Router conventions (server/client components, data fetching, metadata), a QA playbook and a /nextjs-page scaffold command",
+  "keywords": ["nextjs", "react", "framework-pack", "app-router"]
+}
