@@ -17,6 +17,7 @@ import { createRequire } from 'node:module';
 import { createChat } from '../agent/chat.js';
 import { loadAgents } from '../agent/subagents.js';
 import { LocalScope, buildLocalTools, runBash } from '../tools/local.js';
+import { retraceRecord } from '../tools/timetravel.js';
 import { makeSandboxContext, parseSandboxArgs, renderSandboxStatus, dockerProfile } from '../tools/sandbox.js';
 import { loadUserTools } from '../tools/usertools.js';
 import { buildWebTools } from '../tools/web.js';
@@ -662,7 +663,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           bg.denied = turnDenied;
           bg.errors = turnErrors;
           try {
-            recorder?.append({ type: 'tool', tool: ev.tool, args: { _preview: truncate(JSON.stringify(ev.args), 160) }, observation: truncate(ev.observation, 160), denied: ev.denied, ...(ev.why ? { why: ev.why } : {}) });
+            recorder?.append({ type: 'tool', tool: ev.tool, args: { _preview: truncate(JSON.stringify(ev.args), 160) }, ...(retraceRecord(ev.tool, ev.args) ? { retrace: retraceRecord(ev.tool, ev.args) } : {}), observation: truncate(ev.observation, 1200), denied: ev.denied, ...(ev.why ? { why: ev.why } : {}) });
           } catch {
             /* transcript is best-effort */
           }
@@ -701,7 +702,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         rl.setToolCalls(toolCallsThisTurn); // Aurora strip telemetry
         lastGateway = ev.gateway || lastGateway;
         try {
-          recorder?.append({ type: 'tool', tool: ev.tool, args: { _preview: truncate(JSON.stringify(ev.args), 160) }, observation: truncate(ev.observation, 160), denied: ev.denied, ...(ev.why ? { why: ev.why } : {}) });
+          recorder?.append({ type: 'tool', tool: ev.tool, args: { _preview: truncate(JSON.stringify(ev.args), 160) }, ...(retraceRecord(ev.tool, ev.args) ? { retrace: retraceRecord(ev.tool, ev.args) } : {}), observation: truncate(ev.observation, 1200), denied: ev.denied, ...(ev.why ? { why: ev.why } : {}) });
         } catch {
           /* transcript is best-effort */
         }

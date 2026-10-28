@@ -19,6 +19,8 @@ import { buildGitWriteTool } from './gitwrite.js';
 import { createLspHub, lspExtFor, formatDiagnostics } from '../agent/lsp.js';
 import { snapshotPaths } from '../agent/checkpoints.js';
 import { getChatSetting } from '../settings.js';
+import { createPerfTool } from './perf.js';
+import { createTimetravelTools } from './timetravel.js';
 
 // ── Edit previews (shown before approval, Claude-Code style) ────────────────
 
@@ -551,6 +553,8 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     testTool,
     gitTool,
     gitWriteTool,
+    createPerfTool({ root: scope.root }),
+    ...createTimetravelTools({ root: scope.root }),
     {
       name: 'todo',
       description:

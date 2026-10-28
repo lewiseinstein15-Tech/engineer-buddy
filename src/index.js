@@ -59,6 +59,10 @@ Local coding agent (Buddy Code — like Claude Code, in your terminal):
   engineer-buddy --replay [name]        replay a saved session step-by-step, paced from its
                                         own timestamps (space pause · n next · [ ] speed · q quit;
                                         newest session when no name is given)
+  engineer-buddy --retrace [name]       time-travel: rebuild a session's file timeline
+                                        deterministically (dry run) — --from N --until M
+                                        --swap K --set '<json>' swap ONE step's args,
+                                        --apply writes the what-if state (checkpoints first)
   engineer-buddy init                   scaffold .buddy/harness/ (systemprompt, guardrails,
                                         MEMORY.md, tool guidance, skills)
   engineer-buddy update [--check]       self-update from the latest git tag
@@ -269,6 +273,12 @@ async function cmdChat(argv, { oneShot = false } = {}) {
       dir: { type: 'string' },
       worktree: { type: 'boolean', default: false },
       replay: { type: 'boolean', default: false },
+      retrace: { type: 'boolean', default: false },
+      from: { type: 'string' },
+      until: { type: 'string' },
+      swap: { type: 'string' },
+      set: { type: 'string' },
+      apply: { type: 'boolean', default: false },
       c: { type: 'boolean', default: false },
       continue: { type: 'boolean', default: false },
       r: { type: 'string' },
@@ -295,6 +305,68 @@ async function cmdChat(argv, { oneShot = false } = {}) {
     const { playReplay } = await import('./terminal/replay.js');
     const out = await playReplay({ file });
     if (!out.ok) console.error(`buddy: replay failed — ${out.error}`);
+    return out.ok ? 0 : 2;
+  }
+
+  // --retrace (v0.40.0): time-travel debugging — rebuild a saved session's
+  // file timeline deterministically, optionally swapping ONE step's args.
+  // Dry run by default; --apply writes the what-if state (checkpoints first).
+  if (values.retrace) {
+    const needle = positionals[0] || null;
+    const file = needle ? findSession(root, needle) : latestSession(root);
+    if (!file) {
+      console.error(`buddy: nothing to retrace — ${needle ? `no session matches "${needle}"` : 'no saved sessions'} in ${root}`);
+      return 2;
+    }
+    const { runRetrace } = await import('./tools/timetravel.js');
+    let set = null;
+    if (values.set) {
+      try { set = JSON.parse(values.set); } catch {
+        console.error('buddy: --set must be a JSON object, e.g. --set \'{"find":"draft","replace":"what-if"}\'');
+        return 2;
+      }
+    }
+    const out = runRetrace({
+      root,
+      file,
+      from: Number(values.from) || 1,
+      until: values.until ? Number(values.until) : null,
+      swap: values.swap != null ? Number(values.swap) : null,
+      set,
+      apply: Boolean(values.apply),
+    });
+    console.log(out.report);
+    return out.ok ? 0 : 2;
+  }
+
+  // --retrace (v0.40.0): time-travel debugging — rebuild a saved session's
+  // file timeline deterministically, optionally swapping ONE step's args.
+  // Dry run by default; --apply writes the what-if state (checkpoints first).
+  if (values.retrace) {
+    const needle = positionals[0] || null;
+    const file = needle ? findSession(root, needle) : latestSession(root);
+    if (!file) {
+      console.error(`buddy: nothing to retrace — ${needle ? `no session matches "${needle}"` : 'no saved sessions'} in ${root}`);
+      return 2;
+    }
+    const { runRetrace } = await import('./tools/timetravel.js');
+    let set = null;
+    if (values.set) {
+      try { set = JSON.parse(values.set); } catch {
+        console.error('buddy: --set must be a JSON object, e.g. --set \'{"find":"draft","replace":"what-if"}\'');
+        return 2;
+      }
+    }
+    const out = runRetrace({
+      root,
+      file,
+      from: Number(values.from) || 1,
+      until: values.until ? Number(values.until) : null,
+      swap: values.swap != null ? Number(values.swap) : null,
+      set,
+      apply: Boolean(values.apply),
+    });
+    console.log(out.report);
     return out.ok ? 0 : 2;
   }
 
