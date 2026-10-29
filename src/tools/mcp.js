@@ -27,6 +27,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { truncate, debugLog } from '../util.js';
 import { enabledPlugins } from '../plugins.js';
+import { HttpMcpClient, RateLimiter, maskAuth } from '../mcphttp.js';
 
 export const MCP_CONFIG_PATH = '.buddy/mcp.json';
 export const MCP_PROTOCOL_VERSION = '2024-11-05';
@@ -123,7 +124,7 @@ export class McpClient {
    *   notifications ({server, phase:'progress'|'log', ...}) — flood-capped,
    *   a hostile or broken server can never crash the transport through it.
    */
-  constructor({ name, command, args = [], env = {}, initTimeoutMs = 15000, timeoutMs = 30000, onNotification = null } = {}) {
+  constructor({ name, command, args = [], env = {}, initTimeoutMs = 15000, timeoutMs = 30000, onNotification = null, rateLimit = null } = {}) {
     this.name = sanitizeName(name);
     this.command = String(command || '');
     this.args = Array.isArray(args) ? args.map(String) : [];
@@ -131,6 +132,10 @@ export class McpClient {
     this.initTimeoutMs = initTimeoutMs;
     this.timeoutMs = timeoutMs;
     this.onNotification = typeof onNotification === 'function' ? onNotification : null;
+    // v0.48.0 — optional per-server rate budget (sliding window). null = no
+    // limit, the long-standing stdio behavior; remote servers default to a
+    // budget set in connectMcpServers.
+    this.rateLimiter = rateLimit ? new RateLimiter(rateLimit) : null;
     this.child = null;
     this.info = null; // serverInfo from initialize
     this.tools = []; // tool descriptions from tools/list
@@ -311,7 +316,40 @@ export class McpClient {
   }
 }
 
-/** Read .buddy/mcp.json. Returns {mcpServers:{name:{command,args,env}}} or null. */
+/**
+ * One server entry from any config source. v0.48.0: an entry is EITHER a
+ * local stdio server (command) OR a remote one (url — validated later by
+ * HttpMcpClient, whose refusals land in connectMcpServers' failed list
+ * honestly). Everything is passed through as-is; the transports own their
+ * config contracts.
+ */
+function normalizeServerEntry(name, cfg) {
+  const clean = sanitizeName(name);
+  const base = { name: clean };
+  if (cfg.url) {
+    const entry = { ...base, url: String(cfg.url) };
+    if (cfg.headers !== undefined) entry.headers = cfg.headers;
+    if (cfg.auth !== undefined) entry.auth = cfg.auth;
+    if (cfg.tls !== undefined) entry.tls = cfg.tls;
+    return entry;
+  }
+  if (!cfg.command) return null;
+  return {
+    ...base,
+    command: String(cfg.command),
+    args: Array.isArray(cfg.args) ? cfg.args.map(String) : [],
+    env: cfg.env && typeof cfg.env === 'object' ? Object.fromEntries(Object.entries(cfg.env).map(([k, v]) => [String(k), String(v)])) : {},
+  };
+}
+
+function entryExtras(cfg) {
+  // Transport-shared optional config, passed through for both kinds.
+  const out = {};
+  if (cfg.rateLimit !== undefined) out.rateLimit = cfg.rateLimit;
+  return out;
+}
+
+/** Read .buddy/mcp.json (v0.48.0: command OR url entries). */
 export function loadMcpConfig(root = process.cwd()) {
   const file = path.join(root, MCP_CONFIG_PATH);
   let raw;
@@ -330,26 +368,16 @@ export function loadMcpConfig(root = process.cwd()) {
   const out = {};
   if (servers) {
     for (const [name, cfg] of Object.entries(servers)) {
-      if (cfg && typeof cfg === 'object' && cfg.command) {
-        out[sanitizeName(name)] = {
-          name: sanitizeName(name),
-          command: String(cfg.command),
-          args: Array.isArray(cfg.args) ? cfg.args.map(String) : [],
-          env: cfg.env && typeof cfg.env === 'object' ? Object.fromEntries(Object.entries(cfg.env).map(([k, v]) => [String(k), String(v)])) : {},
-        };
+      if (cfg && typeof cfg === 'object' && (cfg.command || cfg.url)) {
+        out[sanitizeName(name)] = { ...normalizeServerEntry(name, cfg), ...entryExtras(cfg) };
       }
     }
     return { mcpServers: out };
   }
-  // Tolerant fallback: a bare {name: {command,...}} map also works.
+  // Tolerant fallback: a bare {name: {command|url,...}} map also works.
   for (const [name, cfg] of Object.entries(parsed || {})) {
-    if (cfg && typeof cfg === 'object' && cfg.command) {
-      out[sanitizeName(name)] = {
-        name: sanitizeName(name),
-        command: String(cfg.command),
-        args: Array.isArray(cfg.args) ? cfg.args.map(String) : [],
-        env: cfg.env && typeof cfg.env === 'object' ? Object.fromEntries(Object.entries(cfg.env).map(([k, v]) => [String(k), String(v)])) : {},
-      };
+    if (cfg && typeof cfg === 'object' && (cfg.command || cfg.url)) {
+      out[sanitizeName(name)] = { ...normalizeServerEntry(name, cfg), ...entryExtras(cfg) };
     }
   }
   return { mcpServers: out };
@@ -392,8 +420,8 @@ export async function connectMcpServers(root = process.cwd(), { initTimeoutMs = 
     }
     const frag = parsed?.mcpServers && typeof parsed.mcpServers === 'object' ? parsed.mcpServers : {};
     for (const [name, spec] of Object.entries(frag)) {
-      if (!spec || typeof spec !== 'object' || !spec.command) {
-        failed.push({ name: `plugin:${p.name}`, error: `mcp server "${name}" needs a "command"` });
+      if (!spec || typeof spec !== 'object' || (!spec.command && !spec.url)) {
+        failed.push({ name: `plugin:${p.name}`, error: `mcp server "${name}" needs a "command" or a "url"` });
         continue;
       }
       const clean = sanitizeName(name);
@@ -401,19 +429,30 @@ export async function connectMcpServers(root = process.cwd(), { initTimeoutMs = 
         failed.push({ name: `plugin:${p.name}`, error: `mcp server "${clean}" already defined — project config wins` });
         continue;
       }
-      servers[clean] = {
-        name: clean,
-        command: String(spec.command),
-        args: Array.isArray(spec.args) ? spec.args.map(String) : [],
-        env: spec.env && typeof spec.env === 'object' ? Object.fromEntries(Object.entries(spec.env).map(([k, v]) => [String(k), String(v)])) : {},
-      };
+      servers[clean] = { ...normalizeServerEntry(name, spec), ...entryExtras(spec) };
     }
   }
   if (!Object.keys(servers).length) return { connected: [], failed };
 
   const results = await Promise.all(
     Object.values(servers).map(async (spec) => {
-      const client = new McpClient({ ...spec, initTimeoutMs, onNotification });
+      // v0.48.0 — remote servers ride the HTTP transport; a remote without an
+      // explicit budget gets the default one (a runaway loop against someone
+      // else's machine must cost neither them nor us more than the budget).
+      // Local stdio servers keep the long-standing unlimited default.
+      const rateLimit = spec.url
+        ? (spec.rateLimit ?? { max: 120, perMinutes: 1 })
+        : spec.rateLimit ?? null;
+      let client;
+      try {
+        client = spec.url
+          ? new HttpMcpClient({ ...spec, rateLimit, initTimeoutMs, onNotification })
+          : new McpClient({ ...spec, rateLimit, initTimeoutMs, onNotification });
+      } catch (e) {
+        // Config-validation refusals (literal secrets, tls.insecure, URL
+        // credentials…) land here — honest, named, never blocking the rest.
+        return { ok: false, entry: { name: sanitizeName(spec?.name || 'server'), error: truncate(String(e?.message || e), 200) } };
+      }
       try {
         await client.start();
         return { ok: true, entry: { name: client.name, client, tools: client.tools } };
@@ -451,6 +490,7 @@ export function buildMcpTools(connections = []) {
       }
       const fullName = `mcp__${conn.name}__${toolName}`;
       const description = String(t?.description || toolName).slice(0, 300);
+      const rl = conn.client?.rateLimiter || null;
       tools.push({
         name: fullName,
         description: `[mcp:${conn.name}] ${description}`,
@@ -458,6 +498,16 @@ export function buildMcpTools(connections = []) {
         risky: true,
         render: (a) => `${fullName} ${truncate(JSON.stringify(a ?? {}), 90)}`,
         run: async (args = {}) => {
+          // v0.48.0 — the per-server budget is checked BEFORE the wire. All
+          // of one server's tools share it. Exhaustion is an honest in-band
+          // observation; the model can back off; nothing auto-sleeps.
+          if (rl) {
+            const take = rl.tryTake();
+            if (!take.ok) {
+              const secs = Math.max(1, Math.ceil(take.retryAfterMs / 1000));
+              return `ERROR (mcp:${conn.name}): rate limited — the per-server budget (${rl.max} calls / ${rl.perMinutes} min) is exhausted; retry in ~${secs}s (sliding window). No call was made.`;
+            }
+          }
           try {
             const res = await conn.client.callTool(toolName, args);
             const content = Array.isArray(res?.content) ? res.content : [];
@@ -479,11 +529,19 @@ export function buildMcpTools(connections = []) {
   return tools;
 }
 
-/** Rows for the /mcp slash command table. */
+/** Rows for the /mcp slash command table. Remote rows show host + masked auth — never a credential value. */
 export function describeMcpServers(connections = [], failed = []) {
   const rows = [];
   for (const c of connections) {
-    rows.push(['✓', c.name, String((c.tools || []).length), truncate(c.client?.info?.name || c.client?.command || '-', 40)]);
+    let info;
+    if (c.client?.url) {
+      let host = '-';
+      try { host = new URL(c.client.url).host; } catch { /* junk urls cannot reach here — validated at start */ }
+      info = `${host} (${maskAuth(c.client.spec)})`;
+    } else {
+      info = c.client?.info?.name || c.client?.command || '-';
+    }
+    rows.push(['✓', c.name, String((c.tools || []).length), truncate(info, 40)]);
   }
   for (const f of failed) {
     rows.push(['✗', f.name, '-', truncate(f.error || 'failed', 40)]);
