@@ -110,6 +110,18 @@ GitHub skills (CI):
                                         cue-weighted, threshold 0.35; the same
                                         engine the live session auto-recalls with
                                         (--task "..." | positional words, --max N)
+  engineer-buddy telemetry [view|export|reset]
+                                        (alias: metrics) opt-in metrics export:
+                                        the all-time view over .buddy/events.jsonl
+                                        (turns, tokens, tool counts, durations);
+                                        'export' lands one DELTA window in
+                                        .buddy/telemetry/metrics.jsonl and — when
+                                        chat.telemetry.endpoint is set — POSTs a
+                                        zero-dep OTLP/HTTP-JSON payload to your
+                                        collector (token by env NAME via
+                                        headersEnv; --dry-run writes nothing);
+                                        auto-flush at turn boundaries rides
+                                        chat.telemetry.enabled (default FALSE)
   engineer-buddy mcp-serve [--allow-writes]   expose Buddy as an MCP stdio server
   engineer-buddy import <session.jsonl>       restore a shared session (then -r <name>)
 
@@ -599,6 +611,84 @@ async function cmdBenchmark(argv) {
   return 0;
 }
 
+/** `buddy telemetry` (v0.53.0) — opt-in metrics export (§11): the all-time
+ *  view, one cursor-based DELTA export (JSONL sink + optional OTLP/HTTP JSON
+ *  collector wire), and the explicit cursor reset. The engine is telemetry.js. */
+async function cmdTelemetry(argv) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: {
+      dir: { type: 'string' },
+      'dry-run': { type: 'boolean' },
+      yes: { type: 'boolean' },
+    },
+    allowPositionals: true,
+  });
+  const T = await import('./telemetry.js');
+  const root = values.dir ? path.resolve(values.dir) : process.cwd();
+  const sub = String(positionals[0] ?? 'view').toLowerCase();
+  try {
+    if (sub === 'view' || sub === 'status') {
+      console.error('\n' + T.telemetryViewText(root) + '\n');
+      return 0;
+    }
+    if (sub === 'export') {
+      // the engine never touches process.env (testable + the secret stays
+      // out of the engine) — the CLI resolves headersEnv here, the ONE place
+      const { config: tcfg, problems: tcfgProblems } = T.readTelemetryConfig(root);
+      // BROKEN CONFIG IS A REFUSAL, not a degradation (the goals/channels
+      // precedent: junk is HELD honestly — an export with a refused knob
+      // must not silently run as JSONL-only while the operator believes the
+      // wire is configured)
+      if (tcfgProblems.length) {
+        console.error('buddy: telemetry export refused — the chat.telemetry config has problems:');
+        for (const p of tcfgProblems) console.error(`  - ${p}`);
+        console.error('fix .buddy/settings.json (or ~/.buddy/settings.json) and re-run; nothing was exported.');
+        return 2;
+      }
+      const token = tcfg?.headersEnv ? process.env[tcfg.headersEnv] : undefined;
+      const r = await T.exportTelemetry(root, { dryRun: Boolean(values['dry-run']), token });
+      if (r.dryRun) {
+        console.error(`dry run — nothing was written (no sink line, no cursor move, no POST):`);
+        console.error(`  would export : ${r.events.read} event(s) (${r.events.torn} torn counted, ${r.events.giants} giant discarded) since byte ${r.cursor.before}`);
+        console.error(`  would count  : turns ${r.metrics.turns} · calls ${r.metrics.calls} · ~${r.metrics.tokIn} tok in · ~${r.metrics.tokOut} out · tools ${Object.keys(r.metrics.byTool).length} distinct · denied ${r.metrics.denied}`);
+        console.error(`  would sink   : ${r.sink === null ? '.buddy/telemetry/metrics.jsonl (one DELTA record)' : r.sink}`);
+        console.error(`  would post   : ${r.otlp.wouldPost ? r.problems.length ? 'endpoint configured — see problems' : 'endpoint configured' : 'nothing (no endpoint configured — JSONL sink only)'}`);
+        for (const p of r.problems) console.error(`  problem: ${p}`);
+        return 0;
+      }
+      if (!r.ok) {
+        console.error(`buddy: telemetry export failed honestly — ${(r.problems[r.problems.length - 1] || 'unknown reason')}`);
+        return 2;
+      }
+      if (r.note) { console.error(r.note); return 0; }
+      console.error(`exported one DELTA window (${r.window.bytes} bytes): turns ${r.metrics.turns} · calls ${r.metrics.calls} · ~${r.metrics.tokIn} in / ~${r.metrics.tokOut} out · tools ${Object.keys(r.metrics.byTool).length} distinct (denied ${r.metrics.denied})`);
+      console.error(`  sink  : ${r.sink}`);
+      console.error(`  cursor: ${r.cursor.before} → ${r.cursor.after}${r.reset ? ' (reset — the events log shrank below the old cursor)' : ''}`);
+      if (r.events.torn) console.error(`  torn  : ${r.events.torn} corpse line(s) counted, never guessed`);
+      if (r.otlp.attempted) console.error(`  otlp  : ${r.otlp.sent ? `sent — collector answered ${r.otlp.status}` : `NOT sent — ${r.otlp.reason}`}`);
+      else if (r.otlp.reason) console.error(`  otlp  : not attempted — ${r.otlp.reason}`);
+      for (const p of r.problems) console.error(`  problem: ${p}`);
+      return 0;
+    }
+    if (sub === 'reset') {
+      if (!values.yes) {
+        console.error('refusing to reset the export cursor without --yes — a reset SKIPS the log history (the events log itself is never touched).');
+        console.error('usage: buddy telemetry reset --yes   (cursor → end of log; future exports start from now)');
+        return 2;
+      }
+      const target = T.resetCursorToEnd(root);
+      console.error(`cursor reset to ${target} — the next export starts from now (history is skipped, not deleted)`);
+      return 0;
+    }
+    console.error(`buddy: unknown telemetry subcommand "${sub}" — known: view | export | reset`);
+    return 2;
+  } catch (e) {
+    console.error(`buddy: telemetry failed honestly — ${e?.message || e}`);
+    return 2;
+  }
+}
+
 /** `buddy lessons` (v0.52.0) — cross-session lessons: index stats, or ranked
  *  topic recall for a query. The same recall engine the live session rides. */
 async function cmdLessons(argv) {
@@ -887,6 +977,7 @@ async function main() {
     if (cmd === 'goals' || cmd === 'goal') process.exit(await cmdGoals(argv));
     if (cmd === 'channel' || cmd === 'channels') process.exit(await cmdChannel(argv));
     if (cmd === 'lesson' || cmd === 'lessons') process.exit(await cmdLessons(argv));
+    if (cmd === 'telemetry' || cmd === 'metrics') process.exit(await cmdTelemetry(argv));
     if (cmd === 'ask') process.exit(await cmdAsk(argv));
     if (cmd === 'mcp-serve') process.exit(await cmdMcpServe(argv));
     if (cmd === 'import') process.exit(await cmdImport(argv));

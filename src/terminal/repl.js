@@ -2665,6 +2665,14 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           const last = tl[tl.length - 1];
           if (last) appendEvent(root, projectEvent({ type: 'turn_end', ...last }));
         }
+        // v0.53.0 telemetry: the OPT-IN auto flush. chat.telemetry.enabled
+        // gates it — with the default (false) this is a config read and
+        // nothing else: no dir, no byte, no wire (the opt-in contract).
+        // Best-effort with a swallowed rejection: telemetry must never
+        // break a turn (the eventslog doctrine, inherited).
+        try {
+          import('../telemetry.js').then((T) => T.autoFlush(root)).catch(() => {});
+        } catch { /* telemetry must never break a turn */ }
         // Interrupt = stop everything: the turn AND anything still queued.
         if (out?.aborted && msgQueue.length) {
           say(`  ${c.yellow('⏸')} queue cleared — ${msgQueue.length} queued message${msgQueue.length === 1 ? '' : 's'} dropped (interrupt stops everything)`);
