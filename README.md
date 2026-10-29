@@ -25,6 +25,7 @@ the version and the configuration it ran under).
 | one MCP protocol, every level (CAPABILITIES) | `buddy benchmark --dim capabilities` | Buddy drives Buddy: tools/list, a real read, a refused write, unknown tools are errors |
 | remote MCP with auth that cannot leak (v0.48) | `node scripts/v48-drill.mjs` | a hostile server echoes the credential back in its 401 body — the client's whole output still names only the status + config; the leak probe greps every captured byte: 0 occurrences |
 | nothing is faked, ever | `buddy benchmark --fast` | absent capabilities SKIP **honestly with a reason** — never a fabricated pass |
+| a goal wakes on a schedule and runs unattended | `buddy goal add "sweep" --cron "30 3 * * *" --prompt "..." && buddy goals run --dir .` | the tick computes what is due, locks (double-fire refused, exit 3), runs it behind the same gates, and lands an append-only history row — the clock stays external (OS cron / GH Actions cron) |
 | evidence ships with everything (EVIDENCE) | `.buddy/benchmark/<ts>/` | scorecard.json + summary.md + per-dimension artifacts |
 
 ```
