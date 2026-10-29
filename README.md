@@ -23,6 +23,7 @@ the version and the configuration it ran under).
 | it recovers from a kill (RECOVER) | `buddy benchmark --dim recover` | SIGKILLed mid-task → checkpoint manifests prove state → finished green |
 | its citations are fetchable (RESEARCH) | `buddy benchmark --dim research` | the harness fetches the cited URL ITSELF through the SSRF guard |
 | one MCP protocol, every level (CAPABILITIES) | `buddy benchmark --dim capabilities` | Buddy drives Buddy: tools/list, a real read, a refused write, unknown tools are errors |
+| remote MCP with auth that cannot leak (v0.48) | `node scripts/v48-drill.mjs` | a hostile server echoes the credential back in its 401 body — the client's whole output still names only the status + config; the leak probe greps every captured byte: 0 occurrences |
 | nothing is faked, ever | `buddy benchmark --fast` | absent capabilities SKIP **honestly with a reason** — never a fabricated pass |
 | evidence ships with everything (EVIDENCE) | `.buddy/benchmark/<ts>/` | scorecard.json + summary.md + per-dimension artifacts |
 
@@ -164,6 +165,40 @@ use the mcp__demo__echo tool to say "hello", then ask mcp__demo__now for the tim
 ```
 
 `echo`, `now` (IANA timezones) and `word_count` ride the full stack: spawn → initialize handshake → `tools/list` → approval gate → `tools/call`. See `examples/echo-mcp.js` — it is also a template for writing your own servers (~150 lines, stdio JSON-RPC only).
+
+### MCP over HTTP — remote servers with auth that cannot leak (v0.48)
+
+A `url` entry instead of a `command` connects a REMOTE server (Streamable-HTTP-style MCP: one JSON-RPC POST per message, session ids echoed, SSE responses parsed with the same flood discipline as stdio):
+
+```json
+{
+  "mcpServers": {
+    "remote-demo": {
+      "url": "https://mcp.example.com/mcp",
+      "auth": { "type": "bearer", "tokenEnv": "MCP_REMOTE_TOKEN" }
+    }
+  }
+}
+```
+
+The hardening rules, in order of importance:
+
+- **Credentials live in the environment, referenced by NAME.** `tokenEnv` for bearer, `clientSecretEnv` for oauth2 client-credentials (token cached, exactly one refresh on a 401, then an honest error — no loops), and `${VAR}` references inside custom header values. A config that embeds a literal secret is **refused**; a URL that embeds credentials is **refused**; `tls.insecure` is **refused** — certificate validation cannot be disabled through config. mTLS rides `tls: { ca, cert, key }` PEM file paths.
+- **A missing env var is an honest connect failure** — the placeholder is never sent, not even an unclosed one.
+- **The value never renders.** `/mcp` shows `host (bearer via env NAME)`; errors name the HTTP status and where to look; response bodies are never quoted into errors — a hostile server that echoes your token back in a 401 body leaks nothing. The drill proves it on camera: `node scripts/v48-drill.mjs` (frames + leak probe in `download/aurora-evidence/v48-readable/`).
+- **Per-server rate limits.** `rateLimit: { "max": 30, "perMinutes": 1 }` caps the whole server (all its tools share the budget); exhaustion is an honest in-band refusal — `rate limited … No call was made.` — never an auto-sleep. Remote servers get a default budget (120/min) so a runaway loop cannot bill anyone; local stdio servers keep the unlimited default.
+
+Try it in 60 seconds with the repo's own remote demo (zero installs):
+
+```bash
+export MCP_HTTP_TOKEN='dev-token-123'
+node examples/echo-mcp-http.js --port 8931          # add --evil-echo for the red-team mode
+mkdir -p .buddy && cat > .buddy/mcp.json <<'EOF'
+{ "mcpServers": { "remote-demo": { "url": "http://127.0.0.1:8931/mcp",
+  "auth": { "type": "bearer", "tokenEnv": "MCP_HTTP_TOKEN" } } } }
+EOF
+buddy                                                # /mcp shows: 127.0.0.1:8931 (bearer via env MCP_HTTP_TOKEN)
+```
 
 ### Background shells — long-running work without blocking the turn (v0.9)
 
