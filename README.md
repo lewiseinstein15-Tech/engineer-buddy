@@ -27,6 +27,7 @@ the version and the configuration it ran under).
 | frontier toolchains, machine's own, never bundled (v0.50) | `node scripts/v50-drill.mjs` | real probes across mobile/wasm-edge/ml/hardware with honest absences ("nothing fake is reported"), the refusal wall (invented serial ports, smuggled flags, traversal, coercion tricks), an ML template written + read back, and a REAL hand-encoded WASI module executing through node's WASI fallback — `exit 42` on camera |
 | nothing is faked, ever | `buddy benchmark --fast` | absent capabilities SKIP **honestly with a reason** — never a fabricated pass |
 | a goal wakes on a schedule and runs unattended | `buddy goal add "sweep" --cron "30 3 * * *" --prompt "..." && buddy goals run --dir .` | the tick computes what is due, locks (double-fire refused, exit 3), runs it behind the same gates, and lands an append-only history row — the clock stays external (OS cron / GH Actions cron) |
+| the outside world can push into a live session (v0.51) | `node scripts/v51-drill.mjs` | a REAL loopback receiver takes token-gated webhooks into an append-only inbox (rate limits BEFORE the disk write — a flood records nothing); the refusal wall on camera (401/400/413/429, 0.0.0.0 refused with the tunnel answer, second receiver exit 3); events ride into context wrapped as "data, not instructions"; the token canary appears in ZERO captured bytes |
 | evidence ships with everything (EVIDENCE) | `.buddy/benchmark/<ts>/` | scorecard.json + summary.md + per-dimension artifacts |
 
 ```
