@@ -52,15 +52,28 @@ export function tsvTable(tsv, headers, { maxRows = MAX_ROWS } = {}) {
   return out;
 }
 
-/** Probe the machine's own cloud CLIs. Injectable for tests. */
+/** Probe the machine's own cloud CLIs. Injectable for tests.
+ *  TRI-STATE per CLI — honesty demands the difference:
+ *    version string   → present and talking
+ *    PROBE_FAILED     → ON PATH but the --version probe failed/timed out
+ *                       (cold SDK starts are real; "not on PATH" would be a lie)
+ *    null             → genuinely absent (ENOENT) — the only case that may say
+ *                       "not on PATH" */
+export const PROBE_FAILED = 'probe-failed';
 export function probeCloud(root, probe = null) {
   if (probe) return probe(root);
   const check = (bin) => {
     try {
-      const r = spawnSync(bin, ['--version'], { cwd: root, encoding: 'utf8', timeout: 8000 });
-      const first = String(r.stdout || '').trim().split('\n')[0];
-      return r.status === 0 && first ? truncate(first, 60) : null;
-    } catch { return null; }
+      const r = spawnSync(bin, ['--version'], { cwd: root, encoding: 'utf8', timeout: 12000 });
+      if (r.status === 0) {
+        const first = String(r.stdout || '').trim().split('\n')[0];
+        if (first) return truncate(first, 60);
+      }
+      if (r.error?.code === 'ENOENT') return null; // absent — the honest "not on PATH"
+      return PROBE_FAILED; // present but the probe failed, hung, or timed out
+    } catch {
+      return null;
+    }
   };
   return { aws: check('aws'), gcloud: check('gcloud'), az: check('az') };
 }
@@ -160,8 +173,14 @@ export function runCloud(args = {}, { root = process.cwd(), probe = null, runner
   if (action === 'status') {
     const lines = ["cloud status — the machine's own CLIs (nothing bundled, nothing faked)"];
     const auth = [];
-    if (bins.aws) {
-      lines.push(`aws: ${bins.aws}`);
+    const probeLine = (bin, human) => {
+      const p = bins[bin];
+      if (p === PROBE_FAILED) lines.push(`${bin}: ON PATH but the --version probe failed or timed out (cold start?) — reported honestly, not guessed`);
+      else if (p) lines.push(`${bin}: ${p}`);
+      else lines.push(`${bin}: not on PATH — install ${human} and retry; nothing fake is reported`);
+      return Boolean(p); // present (version or probe-failed) → attempt the identity call
+    };
+    if (probeLine('aws', 'the AWS CLI')) {
       const id = runBin(['aws', 'sts', 'get-caller-identity', '--output', 'json'], { root, timeoutMs: READ_TIMEOUT_MS, runner });
       if (id.status === 0) {
         try {
@@ -174,8 +193,7 @@ export function runCloud(args = {}, { root = process.cwd(), probe = null, runner
     } else {
       lines.push('aws: not on PATH — install the AWS CLI and retry; nothing fake is reported');
     }
-    if (bins.gcloud) {
-      lines.push(`gcloud: ${bins.gcloud}`);
+    if (probeLine('gcloud', 'the Google Cloud SDK')) {
       const cfg = runBin(['gcloud', 'config', 'list', '--format=csv[no-heading](core.account,core.project)'], { root, timeoutMs: READ_TIMEOUT_MS, runner });
       if (cfg.status !== 0) {
         auth.push('gcloud: config list failed (not authenticated or SDK incomplete)');
@@ -188,8 +206,7 @@ export function runCloud(args = {}, { root = process.cwd(), probe = null, runner
     } else {
       lines.push('gcloud: not on PATH — install the Google Cloud SDK and retry; nothing fake is reported');
     }
-    if (bins.az) {
-      lines.push(`az: ${bins.az}`);
+    if (probeLine('az', 'the Azure CLI')) {
       const acc = runBin(['az', 'account', 'show', '--output', 'json', '--query', '{name:name,id:id,user:user.name}'], { root, timeoutMs: READ_TIMEOUT_MS, runner });
       if (acc.status === 0) {
         try {

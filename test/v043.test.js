@@ -276,28 +276,42 @@ test('cloud: LIVE status against the real machine — the honesty contract on AN
     const v = String(process.env[k] ?? '').trim();
     if (v) assert.ok(!out.includes(v), `credential value of ${k} leaked into the status output`);
   }
-  // Per-CLI honesty: present → a version line (never a refusal) + an explicit
-  // auth outcome; absent → "not on PATH" + "nothing fake is reported" on that
-  // same line. GitHub runners SHIP aws/gcloud/az preinstalled — the machine
-  // shape belongs to the environment; every line matching reality is OURS.
+  // Per-CLI honesty, TRI-STATE and race-free (CI runners SHIP aws/gcloud/az and
+  // gcloud's cold start can exceed the probe timeout — a TIMED-OUT probe must
+  // never be reported as "not on PATH", that would be a lie):
+  //   version line            → present + talking → an explicit auth outcome exists
+  //   "probe failed or timed" → ON PATH, slow/broken → still an explicit auth outcome
+  //   "not on PATH"           → ABSENT (ENOENT is deterministic) → "nothing fake";
+  //                             cross-checked: a binary that answers --version can
+  //                             never be honestly reported absent.
   const lines = out.split('\n');
   const realVersion = (bin) => {
     try {
-      const r = spawnSync(bin, ['--version'], { encoding: 'utf8', timeout: 8000 });
-      const first = String(r.stdout || '').trim().split('\n')[0];
-      return r.status === 0 && first ? first : null;
-    } catch { return null; }
+      const r = spawnSync(bin, ['--version'], { encoding: 'utf8', timeout: 12000 });
+      return r.status === 0 && String(r.stdout || '').trim() ? 'ok' : 'not-ok';
+    } catch { return 'not-ok'; }
   };
   for (const bin of ['aws', 'gcloud', 'az']) {
     const line = lines.find((l) => l.startsWith(`${bin}: `));
-    assert.ok(line, `${bin} always gets a status line — present or refused, never silently skipped`);
-    if (realVersion(bin)) {
-      assert.ok(!line.includes('not on PATH'), `${bin} IS on PATH — reported as present, not refused`);
-      const auth = lines.find((l) => l !== line && (l.startsWith(`${bin}: `) || l.includes(`${bin} identity:`)));
-      assert.ok(auth, `${bin} present → an explicit auth outcome (identity or honest failure)`);
-    } else {
-      assert.match(line, /not on PATH/, `${bin} absent → honest refusal`);
+    assert.ok(line, `${bin} always gets a status line — present, probe-failed, or absent; never silently skipped`);
+    if (line.includes('not on PATH')) {
       assert.match(line, /nothing fake is reported/, `${bin} absence is honest, not guessed`);
+      assert.equal(realVersion(bin), 'not-ok', `${bin} claimed ABSENT but --version succeeded — the probe lied`);
+    } else {
+      const auth = lines.find((l) => l !== line && (l.startsWith(`${bin}: `) || l.includes(`${bin} identity:`)));
+      assert.ok(auth, `${bin} present (or probe-failed) → an explicit auth outcome (identity or honest failure)`);
     }
   }
+});
+
+test('cloud: a timed-out probe is reported as PRESENT-but-slow, never as "not on PATH"', () => {
+  // the CI lesson (v0.45.0): gcloud cold start > 8s on GitHub runners — the old
+  // probe collapsed "slow" into "absent", which is exactly the lie this pins out
+  const out = runCloud({ action: 'status' }, { root: tmp(), probe: () => ({ aws: null, gcloud: 'probe-failed', az: null }) });
+  assert.match(out, /gcloud: ON PATH but the --version probe failed or timed out/);
+  assert.ok(!/gcloud: not on PATH/.test(out), 'a slow probe must never be reported as absent');
+  assert.match(out, /gcloud: (not authenticated|config list failed|identity:)/, 'the auth outcome is still attempted + reported honestly');
+  // and list/deploy still treat present-but-slow as present (gated as usual)
+  const lst = runCloud({ action: 'list', provider: 'gcp', service: 'storage' }, { root: tmp(), probe: () => ({ aws: null, gcloud: 'probe-failed', az: null }), runner: () => ({ status: 0, stdout: 'gs://bucket-x', stderr: '' }) });
+  assert.match(lst, /gcp storage:/);
 });
