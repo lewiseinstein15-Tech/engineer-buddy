@@ -28,6 +28,7 @@ import { createBrowserTool } from './browser.js';
 import { createContainersTool } from './containers.js';
 import { createCloudTool } from './cloud.js';
 import { createFrontierTool } from './frontier.js';
+import { createNotebookTools } from './notebook.js';
 
 // ── Edit previews (shown before approval, Claude-Code style) ────────────────
 
@@ -580,6 +581,10 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     // hardware-embedded; the machine's own tools, probed at call time, never
     // bundled; gate-free status, gated build/run/template/flash/monitor.
     createFrontierTool({ root: scope.root }),
+    // v0.54.0 (checklist §11): notebook support — nb_read + nb_edit ride the
+    // SAME scope protections as the fs_* family: policy guard, containment,
+    // the freshness guard (changed-since-read is refused), checkpoints.
+    ...createNotebookTools({ scope }),
     {
       name: 'todo',
       description:

@@ -122,6 +122,18 @@ GitHub skills (CI):
                                         headersEnv; --dry-run writes nothing);
                                         auto-flush at turn boundaries rides
                                         chat.telemetry.enabled (default FALSE)
+  engineer-buddy notebook [read|insert|replace|delete|move|clear]
+                                        (alias: nb) edit a Jupyter notebook
+                                        (.ipynb) by cell: 'read' lists the cell
+                                        map (indices, types, outputs); the
+                                        mutations take -f/--file, 0-based
+                                        --index/--after/--to, --type
+                                        code|markdown, --source/--source-file/
+                                        --stdin, --expect (stale-cell guard),
+                                        --clear-outputs, --all. Broken or
+                                        oversized notebooks are REFUSED, not
+                                        repaired by guesswork; writes are
+                                        atomic (tmp+rename)
   engineer-buddy mcp-serve [--allow-writes]   expose Buddy as an MCP stdio server
   engineer-buddy import <session.jsonl>       restore a shared session (then -r <name>)
 
@@ -689,6 +701,83 @@ async function cmdTelemetry(argv) {
   }
 }
 
+/** `buddy notebook` (v0.54.0) — Jupyter notebook (.ipynb) cell editing (§11):
+ *  read the cell map, then insert/replace/delete/move/clear_outputs. The
+ *  engine is notebook.js; indices are 0-based and canonical-or-refused;
+ *  broken notebooks are refused, never repaired by guesswork; writes are
+ *  atomic (tmp+rename). Refusals exit 2 with the reason on stderr. */
+async function cmdNotebook(argv) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: {
+      file: { type: 'string', short: 'f' },
+      index: { type: 'string' },
+      after: { type: 'string' },
+      to: { type: 'string' },
+      type: { type: 'string' },
+      source: { type: 'string' },
+      'source-file': { type: 'string' },
+      stdin: { type: 'boolean' },
+      expect: { type: 'string' },
+      'clear-outputs': { type: 'boolean' },
+      all: { type: 'boolean' },
+      dir: { type: 'string' },
+    },
+    allowPositionals: true,
+  });
+  const NB = await import('./notebook.js');
+  const sub = String(positionals[0] ?? '').toLowerCase();
+  try {
+    if (!['read', 'insert', 'replace', 'delete', 'move', 'clear'].includes(sub)) {
+      console.error(`buddy: unknown notebook subcommand "${sub || '(none)'}" — known: read | insert | replace | delete | move | clear`);
+      console.error('  every subcommand takes -f/--file <path.ipynb>; indices are 0-based.');
+      return 2;
+    }
+    const rel = values.file;
+    if (!rel || String(rel).includes('..')) {
+      console.error('buddy: notebook needs -f/--file <path.ipynb> (no ".." segments)');
+      return 2;
+    }
+    if (!NB.isNotebookPath(rel)) {
+      console.error(`buddy: "${rel}" is not a .ipynb — this command edits notebook cells only`);
+      return 2;
+    }
+    const abs = path.resolve(values.dir ? path.resolve(values.dir) : process.cwd(), rel);
+    if (sub === 'read') {
+      console.error('\n' + NB.notebookReadText(abs) + '\n');
+      return 0;
+    }
+    const op = sub === 'clear' ? 'clear_outputs' : sub;
+    const args = {};
+    if (values.index != null) args.index = values.index;
+    if (values.after != null) args.after = values.after;
+    if (values.to != null) args.to = values.to;
+    if (values.type != null) args.cellType = values.type;
+    if (values.expect != null) args.expect = values.expect;
+    if (values['clear-outputs']) args.clearOutputs = true;
+    if (values.all) args.all = true;
+    if (sub === 'insert' || sub === 'replace') {
+      if (values.source != null) args.source = values.source;
+      else if (values['source-file']) args.source = fs.readFileSync(path.resolve(values['source-file']), 'utf8');
+      else if (values.stdin) args.source = fs.readFileSync(0, 'utf8');
+      if (typeof args.source !== 'string' || args.source === '') {
+        console.error('buddy: insert/replace needs --source "text", --source-file <path>, or --stdin');
+        return 2;
+      }
+    }
+    const r = NB.nbEdit(abs, op, args);
+    const bits = [`OK ${r.op}`, r.index != null ? `cell [${r.index}]` : '', r.to != null ? `→ [${r.to}]` : '', r.cellType || '', `${r.cellsBefore}→${r.cellsAfter} cells`, `${r.bytesBefore}→${r.bytesAfter} bytes`].filter(Boolean);
+    console.error(bits.join(' '));
+    if (r.outputs) console.error(`  outputs: ${r.outputs}`);
+    if (r.moved === false) console.error('  (to === index — nothing moved, nothing written)');
+    for (const w of r.warnings || []) console.error(`  warning: ${w}`);
+    return 0;
+  } catch (e) {
+    console.error(`buddy: notebook ${sub} refused — ${e?.message || e}`);
+    return 2;
+  }
+}
+
 /** `buddy lessons` (v0.52.0) — cross-session lessons: index stats, or ranked
  *  topic recall for a query. The same recall engine the live session rides. */
 async function cmdLessons(argv) {
@@ -978,6 +1067,7 @@ async function main() {
     if (cmd === 'channel' || cmd === 'channels') process.exit(await cmdChannel(argv));
     if (cmd === 'lesson' || cmd === 'lessons') process.exit(await cmdLessons(argv));
     if (cmd === 'telemetry' || cmd === 'metrics') process.exit(await cmdTelemetry(argv));
+    if (cmd === 'notebook' || cmd === 'nb') process.exit(await cmdNotebook(argv));
     if (cmd === 'ask') process.exit(await cmdAsk(argv));
     if (cmd === 'mcp-serve') process.exit(await cmdMcpServe(argv));
     if (cmd === 'import') process.exit(await cmdImport(argv));
