@@ -35,7 +35,8 @@ import { connectMcpServers, buildMcpTools, describeMcpServers, MCP_CONFIG_PATH }
 import { ensureHarness, loadHarness, harnessContext } from '../harness/scaffold.js';
 import { HARNESS_DIR } from '../harness/defaults.js';
 import { SessionRecorder, listSessions, loadSession, sessionInfo, resumeMessages, writeExport, latestSession, findSession, renameSession, forkSession, writeHtmlExport, importSession } from '../session.js';
-import { reflect, recentLessons, experiencePath } from '../learn.js';
+import { reflect, recentLessons, experiencePath, recallBlock } from '../learn.js';
+import { recallLessons, recallBlockText, lessonsIndexText, lessonsRecallText } from '../lessons.js';
 import { c, PALETTE, logoBanner, spinner, renderToolCall, renderToolEvent, renderTodo, renderTable, formatMs, renderContextBar, setTheme, themeNames, currentTheme } from './ui.js';
 import { osc52, resolveCopyRef, formatCopyTable, copyFits, fmtBytes, CARDS } from './toolcards.js';
 import { detectTerminal, setupSteps, NO_SETUP } from './termkeys.js';
@@ -253,7 +254,7 @@ async function makeScopeAndTools({ root, router = null, onEvent = () => {}, appr
   return { scope, tools, todoState, mcp, shells, skills, userToolWarnings, extraRoots, reporters, sandbox, plugins: installedPlugins, pluginWarnings };
 }
 
-function makeHarness(root) {
+function makeHarness(root, recencyTexts = null) {
   ensureHarness(root);
   // root passed → MEMORY.md @path imports are expanded at assembly time.
   const hctx = harnessContext(loadHarness(root), root);
@@ -264,17 +265,22 @@ function makeHarness(root) {
     const style = loadOutputStyle(root, styleName);
     if (style) hctx.systemprompt = `${style.body}\n\n(Using output style "${style.name}" — /output-style default returns to the built-in prompt.)`;
   }
-  const lessons = recentLessons(root);
-  if (lessons.length) {
-    hctx.memory += `\n\n## Lessons from past tasks\n${lessons.map((l) => `- ${l}`).join('\n')}`;
+  // Cross-session lessons (v0.52.0): the session-level block stays the
+  // recency window (no task text exists yet); the texts are ALSO returned to
+  // the caller so the per-task topic recall can exclude them — a lesson must
+  // never ride into context twice.
+  const recency = Array.isArray(recencyTexts) ? recencyTexts : recentLessons(root);
+  if (recency.length) {
+    hctx.memory += `\n\n## Lessons from past tasks\n${recency.map((l) => `- ${l}`).join('\n')}`;
   }
-  return hctx;
+  return { hctx, recency };
 }
 
 /** Create a chat session bound to a workspace root. */
 export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {}, repoMap = null, effort = null, streaming = null, onStream = null } = {}) {
   const { tools, todoState, mcp, shells, skills, userToolWarnings, scope, extraRoots, reporters, sandbox, plugins: installedPlugins, pluginWarnings } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved });
-  const harness = makeHarness(root);
+  const recencyLessonTexts = recentLessons(root); // read ONCE — same list the harness block and the task-level recall exclude-set see
+  const harness = makeHarness(root, recencyLessonTexts).hctx;
   // Hooks: the deterministic guarantee layer (.buddy/settings.json). One
   // runner per session — the REPL reads it for /hooks, the loop obeys it.
   const hooks = new HookRunner({ root });
@@ -442,6 +448,18 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
     taskImages = ex.images || [];
   } catch {
     /* mentions are best effort — the raw task still runs */
+  }
+  // Cross-session recall (v0.52.0): headless runs get the same topic-matched
+  // lesson injection as the REPL — same firewall, same honest-empty rule.
+  // The fact lands in events.jsonl; the block rides in the task text itself.
+  try {
+    const rb = recallBlock(root, taskText);
+    if (rb) {
+      taskText = `${rb.text}\n\n${taskText}`;
+      appendEvent(root, { type: 'lessonRecall', count: rb.count, topScore: rb.topScore });
+    }
+  } catch {
+    /* recall must never break a turn */
   }
   const out = await chat.turn(taskText, { images: taskImages });
   if (fmt === 'json') {
@@ -891,6 +909,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
               ['/init', 'scaffold .buddy/harness/'],
               ['/memory', 'show project memory (edit it to teach Buddy)'],
               ['/experience', 'lessons from past tasks'],
+              ['/lessons [query]', 'index stats, or ranked topic recall'],
               ['/learn', 'reflect on the last task → harness refinement'],
               ['/skills', 'list skills — /<skill-name> runs one directly'],
               ['/todo', "show Buddy's current plan"],
@@ -2013,6 +2032,14 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           say('\n(no experience yet — run a task, then /learn)\n');
         }
         break;
+      case 'lessons': {
+        // v0.52.0 — cross-session lessons: no query = index stats; a query =
+        // ranked topic recall on camera (the same path runTask auto-rides).
+        const q = String(args || '').trim();
+        if (!q) say(`\n${lessonsIndexText(root)}\n`);
+        else say(`\n${lessonsRecallText(root, q)}\n`);
+        break;
+      }
       case 'init': {
         const created = ensureHarness(root);
         say(created.length ? `\n  ${c.green('harness scaffolded')}:\n${created.map((f) => `    + ${f}`).join('\n')}\n` : '\n  harness already present — nothing to do\n');
@@ -2475,6 +2502,21 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     // Attached only when the task actually STARTS (a busy-time queue push
     // must not consume the docs — they attach when the queue drains).
     let effective = inputText;
+    // Cross-session recall (v0.52.0): the task's topic pulls topic-matched
+    // lessons out of EXPERIENCE.md; they ride through the same injection
+    // firewall as /docs — data, not instructions. A miss injects nothing.
+    if (!busy) {
+      try {
+        const rb = recallBlock(root, inputText);
+        if (rb) {
+          effective = `${rb.text}\n\n${effective}`;
+          say(`  ${c.green('↳ experience recall')} ${c.dim(`attached (${rb.count} topic-matched, this task only)`)}`);
+          appendEvent(root, { type: 'lessonRecall', count: rb.count, topScore: rb.topScore });
+        }
+      } catch {
+        /* recall must never break a turn */
+      }
+    }
     if (!busy && lastReport) {
       const r = lastReport;
       lastReport = null;
@@ -2501,6 +2543,28 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       pendingChannelEvents = [];
       effective = `${Channels.channelMessageText(evs)}\n\n${inputText}`;
       say(`  ${c.green('↳ channel events')} ${c.dim(`attached (${evs.length} webhook event(s), this task only)`)}`);
+    }
+    if (!busy) {
+      // Cross-session lessons (v0.52.0): experience entries recalled by TOPIC
+      // similarity to THIS task (idf-damped, cue-weighted — not recency),
+      // wrapped in the same injection firewall: PAST EXPERIENCE IS DATA, not
+      // instructions (a lesson distilled from a poisoned transcript must never
+      // become a command in a future session). The session-level recency
+      // block is excluded so a lesson never rides into context twice. Recall
+      // is best-effort by contract — it can never break the task start.
+      try {
+        const rec = recallLessons(root, inputText, { exclude: recencyLessonTexts });
+        if (rec.matches.length) {
+          const block = recallBlockText(rec);
+          if (block) {
+            effective = `${block}\n\n${effective}`;
+            const n = rec.matches.length;
+            say(`  ${c.green('↳ experience recall')} ${c.dim(`attached (${n} lesson${n === 1 ? '' : 's'} matched this task's topic)`)}`);
+          }
+        }
+      } catch {
+        /* recall is additive — a failure here never blocks the turn */
+      }
     }
     if (busy) {
       msgQueue.push({ text: inputText });

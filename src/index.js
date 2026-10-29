@@ -102,6 +102,14 @@ GitHub skills (CI):
                                         per-channel rate limit; one receiver at
                                         a time (serve lock); 'channel drain'
                                         consumes the inbox headless
+  engineer-buddy lessons [query...]
+                                        (alias: lesson) cross-session lessons:
+                                        no query = index stats (entries, torn,
+                                        vocabulary); with a query = ranked TOPIC
+                                        recall from .buddy/experience — idf-damped,
+                                        cue-weighted, threshold 0.35; the same
+                                        engine the live session auto-recalls with
+                                        (--task "..." | positional words, --max N)
   engineer-buddy mcp-serve [--allow-writes]   expose Buddy as an MCP stdio server
   engineer-buddy import <session.jsonl>       restore a shared session (then -r <name>)
 
@@ -591,6 +599,29 @@ async function cmdBenchmark(argv) {
   return 0;
 }
 
+/** `buddy lessons` (v0.52.0) — cross-session lessons: index stats, or ranked
+ *  topic recall for a query. The same recall engine the live session rides. */
+async function cmdLessons(argv) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: {
+      dir: { type: 'string' },
+      task: { type: 'string' },
+      max: { type: 'string' },
+    },
+    allowPositionals: true,
+  });
+  const L = await import('./lessons.js');
+  const root = values.dir ? path.resolve(values.dir) : process.cwd();
+  const query = values.task ?? (positionals.length ? positionals.join(' ') : null);
+  // canonical-only knob (the v0.50/v0.51 lesson): pure digits or default —
+  // '5\n' or 'abc' never becomes 5-by-coincidence.
+  const max = /^\d+$/.test(String(values.max ?? '')) ? Math.max(1, Math.min(20, parseInt(values.max, 10))) : 5;
+  if (query) console.log('\n' + L.lessonsRecallText(root, query, { max }) + '\n');
+  else console.log('\n' + L.lessonsIndexText(root) + '\n');
+  return 0;
+}
+
 async function cmdChannel(argv) {
   const { values, positionals } = parseArgs({
     args: argv,
@@ -838,6 +869,7 @@ async function main() {
     if (cmd === 'benchmark') process.exit(await cmdBenchmark(argv));
     if (cmd === 'goals' || cmd === 'goal') process.exit(await cmdGoals(argv));
     if (cmd === 'channel' || cmd === 'channels') process.exit(await cmdChannel(argv));
+    if (cmd === 'lesson' || cmd === 'lessons') process.exit(await cmdLessons(argv));
     if (cmd === 'ask') process.exit(await cmdAsk(argv));
     if (cmd === 'mcp-serve') process.exit(await cmdMcpServe(argv));
     if (cmd === 'import') process.exit(await cmdImport(argv));
