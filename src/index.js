@@ -602,15 +602,32 @@ async function cmdBenchmark(argv) {
 /** `buddy lessons` (v0.52.0) — cross-session lessons: index stats, or ranked
  *  topic recall for a query. The same recall engine the live session rides. */
 async function cmdLessons(argv) {
-  const { values, positionals } = parseArgs({
-    args: argv,
-    options: {
-      dir: { type: 'string' },
-      task: { type: 'string' },
-      max: { type: 'string' },
-    },
-    allowPositionals: true,
-  });
+  let values, positionals;
+  try {
+    ({ values, positionals } = parseArgs({
+      args: argv,
+      options: {
+        dir: { type: 'string' },
+        task: { type: 'string' },
+        max: { type: 'string' },
+      },
+      allowPositionals: true,
+    }));
+  } catch {
+    // RED TEAM v0.52 fix: a dash-leading literal query (`buddy lessons -999`)
+    // is a QUERY, not an option cluster — parseArgs refused it with a generic
+    // exit 2. Scan the three known flags by hand; everything else is query.
+    values = {};
+    positionals = [];
+    for (let i = 0; i < argv.length; i++) {
+      const a = argv[i];
+      if ((a === '--dir' || a === '--task' || a === '--max') && i + 1 < argv.length) {
+        values[a.slice(2)] = argv[++i];
+        continue;
+      }
+      positionals.push(a);
+    }
+  }
   const L = await import('./lessons.js');
   const root = values.dir ? path.resolve(values.dir) : process.cwd();
   const query = values.task ?? (positionals.length ? positionals.join(' ') : null);

@@ -120,11 +120,12 @@ export function parseExperienceMd(raw, { maxEntries = 400, maxBytes = 524288 } =
     // any other line inside an entry is prose — ignored
   }
   flush();
-  stats.entries = entries.length;
   if (entries.length > maxEntries) {
-    entries.splice(0, entries.length - maxEntries); // keep the newest
+    stats.droppedOldest = entries.length - maxEntries; // reported, never silent
+    entries.splice(0, stats.droppedOldest); // keep the newest
     for (let i = 0; i < entries.length; i++) entries[i].id = i;
   }
+  stats.entries = entries.length; // the INDEXED count — the number every view prints (RED TEAM v0.52 fix: it used to report the pre-cap count while fewer were indexed)
   return { entries, stats };
 }
 
@@ -246,7 +247,23 @@ export function recallLessons(root, taskText, { max = 5, minScore = 0.35, exclud
 
 /** The context block the model sees for a recall — the injection firewall
  *  wrapper, shared by the REPL wiring and the CLI so tests pin ONE form.
- *  Budget-capped (≤ ~1800 chars); if no lesson line fits, no block at all. */
+ *  Budget-capped (≤ ~1800 chars); if no lesson line fits, no block at all.
+ *  Wrapper-lookalikes inside lesson text are NEUTRALIZED (brackets swapped
+ *  for parens, case-insensitive): a poisoned past must not be able to forge
+ *  the closing wrapper and make the task text that follows appear to sit
+ *  outside the firewall (RED TEAM v0.52 finding, pinned in redteam52). */
+const neutralizeWrapperSpoof = (s) =>
+  String(s ?? '').replace(/\[end experience recall\]/gi, '(end experience recall)').replace(/\[experience recall/gi, '(experience recall)');
+
+/** Renderer discipline (v0.50/v0.51 lesson carried): control bytes (ESC, CSI,
+ *  NUL…) can never ride a rendering. Whitespace is kept (it collapses later);
+ *  every other byte below 0x20 plus DEL is gone. */
+const stripControl = (s) => String(s ?? '').replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, ' ');
+
+/** Everything that leaves the library passes BOTH gates: control bytes
+ *  stripped, wrapper spoofs neutralized. */
+const sanitizeLessonText = (s) => neutralizeWrapperSpoof(stripControl(s));
+
 export function recallBlockText(recall) {
   const ms = Array.isArray(recall?.matches) ? recall.matches : [];
   if (!ms.length) return '';
@@ -254,8 +271,8 @@ export function recallBlockText(recall) {
   const lines = [];
   let budget = 1800 - header.length - (RECALL_WRAPPER_CLOSE.length + 1);
   for (const m of ms) {
-    const lesson = truncate(String(m.lesson).replace(/\s+/g, ' ').trim(), 200);
-    const cue = m.cue ? ` (cue: ${truncate(String(m.cue).replace(/\s+/g, ' ').trim(), 80)})` : '';
+    const lesson = truncate(sanitizeLessonText(String(m.lesson)).replace(/\s+/g, ' ').trim(), 200);
+    const cue = m.cue ? ` (cue: ${truncate(sanitizeLessonText(String(m.cue)).replace(/\s+/g, ' ').trim(), 80)})` : '';
     const conf = ['low', 'medium', 'high'].includes(m.confidence) ? m.confidence : 'unrated';
     const line = `• (${m.date || 'undated'}, ${conf}) ${lesson}${cue} [match ${m.score.toFixed(2)}]`;
     if (line.length > budget) break;
@@ -268,7 +285,7 @@ export function recallBlockText(recall) {
 
 const VIEWS = {
   header: (p) => `Experience index — ${p}`,
-  row: (m, i) => `  ${i + 1}. [${m.score.toFixed(2)}] (${m.date || 'undated'}, ${['low', 'medium', 'high'].includes(m.confidence) ? m.confidence : 'unrated'}) ${truncate(m.lesson.replace(/\s+/g, ' '), 160)}${m.cue ? `\n     cue: ${truncate(m.cue.replace(/\s+/g, ' '), 100)}` : ''}`,
+  row: (m, i) => `  ${i + 1}. [${m.score.toFixed(2)}] (${m.date || 'undated'}, ${['low', 'medium', 'high'].includes(m.confidence) ? m.confidence : 'unrated'}) ${truncate(sanitizeLessonText(m.lesson).replace(/\s+/g, ' '), 160)}${m.cue ? `\n     cue: ${truncate(sanitizeLessonText(m.cue).replace(/\s+/g, ' '), 100)}` : ''}`,
 };
 
 function readIndexOrProblem(root) {
@@ -294,7 +311,7 @@ export function lessonsIndexText(root) {
     .join(', ');
   const lines = [
     VIEWS.header(experienceFile(root)),
-    `  lessons indexed: ${s.entries} · NO_ENTRY: ${s.noEntries} · torn: ${s.torn} · orphan field lines: ${s.orphans}${s.truncatedFile ? ` · file tail read (${s.bytes} bytes, newest kept)` : ''}`,
+    `  lessons indexed: ${s.entries} · NO_ENTRY: ${s.noEntries} · torn: ${s.torn} · orphan field lines: ${s.orphans}${s.droppedOldest ? ` · oldest dropped: ${s.droppedOldest} (index cap)` : ''}${s.truncatedFile ? ` · file tail read (${s.bytes} bytes, newest kept)` : ''}`,
     `  vocabulary: ${index.vocabulary} token(s)${top ? ` · top by spread: ${top}` : ''}`,
   ];
   if (!s.entries) lines.push('  (no lessons indexed yet — honest NO_ENTRY rows never recall)');
@@ -309,7 +326,7 @@ export function lessonsRecallText(root, query, { max = 5 } = {}) {
   const recall = recallLessons(root, query, { max, index: r.index });
   const tokens = tokenize(query);
   const lines = [
-    `Query: ${truncate(String(query).replace(/\s+/g, ' '), 120)}`,
+    `Query: ${truncate(sanitizeLessonText(String(query)).replace(/\s+/g, ' '), 120)}`,
     `  ${tokens.length} topic token(s) · idf-damped scoring (cue×3 lesson×2 task×1.5 evidence×1) · threshold 0.35`,
   ];
   if (!recall.matches.length) {

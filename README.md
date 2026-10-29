@@ -28,6 +28,7 @@ the version and the configuration it ran under).
 | nothing is faked, ever | `buddy benchmark --fast` | absent capabilities SKIP **honestly with a reason** — never a fabricated pass |
 | a goal wakes on a schedule and runs unattended | `buddy goal add "sweep" --cron "30 3 * * *" --prompt "..." && buddy goals run --dir .` | the tick computes what is due, locks (double-fire refused, exit 3), runs it behind the same gates, and lands an append-only history row — the clock stays external (OS cron / GH Actions cron) |
 | the outside world can push into a live session (v0.51) | `node scripts/v51-drill.mjs` | a REAL loopback receiver takes token-gated webhooks into an append-only inbox (rate limits BEFORE the disk write — a flood records nothing); the refusal wall on camera (401/400/413/429, 0.0.0.0 refused with the tunnel answer, second receiver exit 3); events ride into context wrapped as "data, not instructions"; the token canary appears in ZERO captured bytes |
+| it remembers every crash, by topic (v0.52) | `node scripts/v52-drill.mjs` | a flaky-race question ranks the flaky-race lesson first (idf-damped, cue×3 — NOT recency); an unrelated task recalls NOTHING and the threshold is named; a torn store counts itself and still serves the survivors; a lesson that forges the `[end experience recall]` firewall wrapper is neutralized — exactly one real close survives; every recall lands as a `lessonRecall` fact in events.jsonl |
 | evidence ships with everything (EVIDENCE) | `.buddy/benchmark/<ts>/` | scorecard.json + summary.md + per-dimension artifacts |
 
 ```
