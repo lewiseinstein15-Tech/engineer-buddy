@@ -83,6 +83,16 @@ GitHub skills (CI):
                                         dimensions as real scored exercises with
                                         evidence artifacts (.buddy/benchmark/); live
                                         dimensions degrade to honest SKIP offline
+  engineer-buddy goals [list|add|enable|disable|remove|run|history|next]
+                                        (alias: goal) objectives that wake on a
+                                        schedule (.buddy/goals/); schedules:
+                                        --every <minutes> | --cron "min hour dom
+                                        mon dow" (UTC) | --at "YYYY-MM-DD HH:MM"
+                                        (one-shot); 'goals run' is a TICK — the
+                                        wake is external (OS cron, Actions cron);
+                                        store + history + artifacts record every
+                                        run; --dry provably calls no runner; HELD
+                                        junk is reported, never scheduled
   engineer-buddy mcp-serve [--allow-writes]   expose Buddy as an MCP stdio server
   engineer-buddy import <session.jsonl>       restore a shared session (then -r <name>)
 
@@ -572,6 +582,123 @@ async function cmdBenchmark(argv) {
   return 0;
 }
 
+async function cmdGoals(argv) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: {
+      dir: { type: 'string' },
+      name: { type: 'string' },
+      prompt: { type: 'string' },
+      every: { type: 'string' },
+      cron: { type: 'string' },
+      at: { type: 'string' },
+      'max-minutes': { type: 'string' },
+      yolo: { type: 'boolean', default: false },
+      fast: { type: 'boolean', default: false },
+      all: { type: 'boolean', default: false },
+      id: { type: 'string' },
+      dry: { type: 'boolean', default: false },
+      'timeout-minutes': { type: 'string' },
+    },
+    allowPositionals: true,
+  });
+  const G = await import('./goals.js');
+  const line = (s, n = 60) => G.oneLine(s, n);
+  const root = values.dir ? path.resolve(values.dir) : process.cwd();
+  const sub = String(positionals[0] ?? 'list').toLowerCase();
+  try {
+    if (sub === 'list' || sub === 'ls') {
+      const l = G.loadGoals(root);
+      console.error('\n' + G.goalsTableText(l.goals, l.problems) + '\n');
+      return 0;
+    }
+    if (sub === 'add' || sub === 'set') {
+      const { goal, problems } = G.addGoal(root, {
+        name: values.name ?? positionals[1],
+        prompt: values.prompt,
+        everyMinutes: values.every,
+        cron: values.cron,
+        at: values.at,
+        maxMinutes: values['max-minutes'],
+        yolo: values.yolo === true,
+      });
+      const due = G.nextDue(goal);
+      console.error(`goal added: ${goal.id} — ${line(goal.name, 40)}`);
+      console.error(`  ${G.scheduleText(goal)} · max ${goal.maxMinutes}m/run${goal.yolo ? ' · YOLO (gates off — operator choice)' : ''}`);
+      console.error(`  next: ${due ? due.toISOString() : '(never)'}`);
+      console.error('  the wake is external — OS cron / GitHub Actions cron calls: buddy goals run --dir .');
+      for (const p of problems) console.error(`! ${p}`);
+      return 0;
+    }
+    if (sub === 'enable' || sub === 'disable') {
+      const { goal } = G.setGoalEnabled(root, values.id ?? positionals[1], sub === 'enable');
+      console.error(`goal ${sub}d: ${goal.id} — ${line(goal.name, 40)}`);
+      return 0;
+    }
+    if (sub === 'remove' || sub === 'rm' || sub === 'del') {
+      const { goal } = G.removeGoal(root, values.id ?? positionals[1]);
+      console.error(`goal removed: ${goal.id} — ${line(goal.name, 40)}`);
+      return 0;
+    }
+    if (sub === 'history') {
+      const rows = G.readHistory(root, { id: values.id ?? null, limit: 50 });
+      if (!rows.length) { console.error('no goal runs recorded yet — history lands in .buddy/goals/history.jsonl after the first tick'); return 0; }
+      for (const r of rows) {
+        console.error(`${String(r.at).replace('T', ' ').slice(0, 19)}  ${line(`${r.name} (${r.id})`, 30).padEnd(31)} ${String(r.status).padEnd(9)} ${(Number(r.durationMs) / 1000).toFixed(1)}s${r.said ? ` — ${line(r.said, 70)}` : ''}${r.error ? ` — ${line(r.error, 70)}` : ''}`);
+      }
+      return 0;
+    }
+    if (sub === 'next') {
+      const { goals, problems } = G.loadGoals(root);
+      const nowMs = Date.now();
+      const wakes = goals
+        .map((g) => ({ g, d: G.nextDue(g, nowMs) }))
+        .filter((r) => r.d)
+        .sort((a, b) => a.d.getTime() - b.d.getTime());
+      console.error(wakes.length ? `next wake: ${wakes[0].d.toISOString()}` : 'nothing will ever wake (no enabled goals, or all maxed out / held)');
+      for (const { g, d } of wakes) console.error(`  ${d.toISOString().replace('T', ' ').slice(0, 16)}  ${g.id}  ${line(g.name, 28)} — ${G.scheduleText(g)}`);
+      for (const p of problems) console.error(`! ${p}`);
+      return 0;
+    }
+    if (sub === 'run') {
+      if (values.dry === true) {
+        // CLI-level dry run: a pure view over the exported nextDue — the tick
+        // (and its runner) is never invoked, so "no runner was called" is true
+        // BY CONSTRUCTION, not by promise.
+        const { goals, problems } = G.loadGoals(root);
+        const nowMs = Date.now();
+        const due = goals
+          .map((g) => ({ g, d: G.nextDue(g, nowMs) }))
+          .filter((r) => r.d && r.d.getTime() <= nowMs)
+          .sort((a, b) => a.d.getTime() - b.d.getTime());
+        console.error(`dry run — ${due.length} goal(s) would fire now, no runner was called:`);
+        for (const { g, d } of due) console.error(`  ${g.id} ${line(g.name, 32)} — ${G.scheduleText(g)} · overdue since ${d.toISOString()}`);
+        for (const g of goals.filter((x) => x.hold)) console.error(`  HELD ${g.id} ${line(g.name, 32)} — ${g.hold}`);
+        if (!due.length) console.error('  (nothing is due — the tick would be honestly idle)');
+        for (const p of problems) console.error(`! ${p}`);
+        return 0;
+      }
+      const tmo = Number(values['timeout-minutes']);
+      const out = await G.runDueGoals(root, {
+        fast: Boolean(values.fast),
+        force: values.all ? (values.id ?? positionals[1] ?? true) : null,
+        ...(Number.isFinite(tmo) && tmo >= 1 && tmo <= 720 ? { timeoutMs: tmo * 60000 } : {}),
+      });
+      console.error('\n' + G.runSummaryText(out));
+      if (out.problems?.length) for (const p of out.problems) console.error(`! ${p}`);
+      if (out.busy) return 3;
+      if (out.failed > 0) return 2;
+      if (out.passed === 0) return 1; // nothing scored (all skipped / idle) — honest, but not a pass
+      return 0;
+    }
+    console.error(`buddy: unknown goal subcommand "${line(sub, 24)}" — known: list | set | enable | disable | remove | run | history | next`);
+    return 2;
+  } catch (e) {
+    console.error(`buddy: goals failed honestly — ${e?.message || e}`);
+    return 2;
+  }
+}
+
 async function main() {
   const [cmd, ...argv] = process.argv.slice(2);
   try {
@@ -594,6 +721,7 @@ async function main() {
     if (cmd === 'release-notes') process.exit(await cmdReleaseNotes(argv));
     if (cmd === 'doctor') process.exit(await cmdDoctor(argv));
     if (cmd === 'benchmark') process.exit(await cmdBenchmark(argv));
+    if (cmd === 'goals' || cmd === 'goal') process.exit(await cmdGoals(argv));
     if (cmd === 'ask') process.exit(await cmdAsk(argv));
     if (cmd === 'mcp-serve') process.exit(await cmdMcpServe(argv));
     if (cmd === 'import') process.exit(await cmdImport(argv));
