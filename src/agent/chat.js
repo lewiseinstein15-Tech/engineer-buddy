@@ -20,7 +20,7 @@ export const PROTOCOL_PREAMBLE = [
   'Protocol: every reply must be EXACTLY ONE JSON object and nothing else:',
   '  {"tool":"<tool-name>","args":{...},"why":"..."}   to use a tool, or',
   '  {"tool":"say","message":"..."}        to speak to the user and end the turn.',
-  'The optional "why" field (tool calls only) is ONE short sentence — why this step, why this file — shown to the user next to the tool card and kept in the session log. Keep it under 20 words; skip it only when the reason is obvious from the tool name.',
+  'The "why" field (tool calls only) is ONE short sentence — why this step, why this file — shown to the user next to the tool card and kept in the session log. Keep it under 20 words. Include it on EVERY tool call by default — omit it only for purely mechanical repeats (re-reading the same file, retrying the same call). Decisions carry a why; that is the house discipline.',
   'Never output prose outside JSON. Never invent tool results. Never claim you ran a command you did not run.',
 ].join('\n');
 
@@ -113,6 +113,7 @@ export function createChat({
   effort = null, // mutable { level, maxSteps, maxTokens } — /effort low|medium|high retunes the loop live
   streaming = null, // mutable { enabled: boolean } — /stream on|off; deltas flow only when truthy-enabled AND onStream is set
   onStream = null, // (fragment: string) => void — raw gateway deltas as they arrive (TUI thought line); null = buffered chat
+  whyContract = false, // v0.46: hard-bounce why-less decision calls (opt-in; default teaches in-band — see the WHY CONTRACT block)
   onEvent = () => {},
 }) {
   const byName = new Map(tools.map((t) => [t.name, t]));
@@ -502,6 +503,8 @@ export function createChat({
       let denied = false;
       let preview = null;
       let durationMs = null; // Aurora: real wall time of the run, for the dotted-leader card
+      let decisionCall = false; // why contract: risky tools + todo — the plan IS decisions (v0.46)
+      let whyBounced = false; // set when the loop bounced a why-less decision call
       // Plan mode hard wall: refuse BEFORE caps burn or gates fire.
       if (impl && modes?.plan && !PLAN_TOOLS.has(tool)) {
         observation = `ERROR: plan mode is active — only research tools are allowed (${[...PLAN_TOOLS].join(', ')}). Use fs_search/fs_read/fs_list to investigate, then call exit_plan with your plan.`;
@@ -513,6 +516,40 @@ export function createChat({
         if (used >= cap) {
           observation = `ERROR: tool "${tool}" already used ${used}/${cap} times this turn. Work differently${modes?.plan ? ', say, or call exit_plan with the plan you have' : ' or say'}.`;
         } else {
+          // ── THE WHY CONTRACT (v0.46.0) ────────────────────────────
+          // The house discipline is "decisions carry a why" — and the v0.45
+          // full live benchmark caught the free-model reality: whys show up
+          // on the first calls, then decay. Teaching alone lost to drift.
+          // A decision-class call (risky tools + todo — the plan IS decisions)
+          // without a why gets: default = an in-band NOTE riding the next
+          // observation (zero extra round-trips); whyContract = ONE bounce —
+          // the model must resend the SAME call carrying its why. The why is
+          // always authored by the model, never fabricated; the bounce is
+          // bounded (one round, adopt only the same tool back, a brain blip
+          // degrades to un-bounced); the exchange never pollutes history.
+          decisionCall = impl.risky === true || tool === 'todo';
+          if (whyContract && decisionCall && !extractWhy(parsed.value)) {
+            whyBounced = true;
+            debugLog(`chat step ${step}: why-contract bounce on ${tool} — demanding the why sentence`);
+            messages.push({ role: 'assistant', content: truncate(res.text, 700) });
+            messages.push({ role: 'user', content: `WHY CONTRACT: every decision carries a why — your ${tool} call is missing the one-sentence "why" field. Resend the EXACT same call with a short "why" added: {"tool":"${tool}","args":{...},"why":"..."}. No other text.` });
+            let retry = null;
+            try { retry = await callModel(); } catch { retry = null; } // brain blip → the original call proceeds un-bounced
+            if (retry) {
+              let p2 = extractJson(retry.text);
+              if (!p2.ok || typeof p2.value !== 'object' || !p2.value || !p2.value.tool) {
+                const fixed = tryRepairJson(retry.text);
+                if (fixed && fixed.tool) p2 = { ok: true, value: fixed };
+              }
+              // Adopt only the SAME tool back — the bounce demanded a resend,
+              // not a new decision; anything else is ignored (bounded).
+              if (p2.ok && p2.value && typeof p2.value === 'object' && p2.value.tool === tool) {
+                parsed = p2;
+                res = retry; // attribution follows the call that actually runs
+              }
+              messages.splice(-2); // the bounce exchange stays out of history
+            }
+          }
           // Hooks run BEFORE the cap is burned, the gate fires, or anything
           // executes — the deterministic guarantee layer (exit 2 = block).
           if (hooks) {
@@ -596,9 +633,12 @@ export function createChat({
 
       debugLog(`chat step ${step}: ${tool}${denied ? ' (denied)' : ''} → ${truncate(observation, 120)}`);
       const why = extractWhy(parsed.value);
-      onEvent({ type: 'tool', tool, args, observation, denied, salvaged, preview, ...(why ? { why } : {}), argText: impl?.render ? String(impl.render(args) || '').slice(0, 200) : '', durationMs, model: res.model, gateway: res.gateway });
+      onEvent({ type: 'tool', tool, args, observation, denied, salvaged, preview, ...(why ? { why } : {}), ...(whyBounced ? { whyBounced: true } : {}), argText: impl?.render ? String(impl.render(args) || '').slice(0, 200) : '', durationMs, model: res.model, gateway: res.gateway });
       messages.push({ role: 'assistant', content: JSON.stringify({ tool, args }) });
-      messages.push({ role: 'user', content: `TOOL OBSERVATION:\n${observation}\n\nContinue with the next JSON step.` });
+      const whyNote = !whyContract && !denied && decisionCall && !why
+        ? '\n\nNOTE (why contract): every decision carries a why — add a one-sentence "why" field to decision calls (writes, commands, plan updates).'
+        : '';
+      messages.push({ role: 'user', content: `TOOL OBSERVATION:\n${observation}${whyNote}\n\nContinue with the next JSON step.` });
     }
 
     onEvent({

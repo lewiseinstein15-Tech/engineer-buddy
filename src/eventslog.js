@@ -93,6 +93,9 @@ export function projectEvent(ev) {
         // when it shipped one — the event log is the "why did it edit that
         // file" answer machine.
         ...(ev.why ? { why: String(ev.why) } : {}),
+        // The why contract (v0.46.0): the loop BOUNCED this call once for
+        // missing its why — enforcement is a fact the audit keeps.
+        ...(ev.whyBounced ? { whyBounced: true } : {}),
       };
     case 'compaction':
       return { ...base, kept: ev.kept, dropped: ev.dropped, auto: Boolean(ev.auto) };

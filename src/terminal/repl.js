@@ -280,7 +280,7 @@ export async function createBuddySession({ root = process.cwd(), router, yolo = 
   const { perms, warnings: permissionWarnings } = loadPermissions(root);
   // todoState is shared: the todo tool writes it (local.js), compaction reads
   // it (todo v2 plan anchor) — one object, one truth.
-  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, todoState, hooks, permissions: perms, yolo, root, onEvent, repoMap, effort, streaming, onStream });
+  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, todoState, hooks, permissions: perms, yolo, root, onEvent, repoMap, effort, streaming, onStream, whyContract: process.env.BUDDY_WHY_CONTRACT === '1' || getChatSetting(root, 'whyContract', false) === true });
   if (resumeFrom) {
     for (const m of resumeMessages(loadSession(resumeFrom))) session.messages.push(m);
   }

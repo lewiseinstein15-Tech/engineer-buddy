@@ -156,6 +156,36 @@ export function detectFalsePremiseCorrection(text, claimed) {
   return hit ? { caught: true, marker: String(hit) } : { caught: false, reason: `${claimed} appears but no correction marker near it` };
 }
 
+/** The file an fs_write event wrote, from ANY event shape the harness sees:
+ *  session events carry args:{path}; the one-shot stream carries argText in
+ *  EITHER the JSON form ({"path":"src/x.js"}) or the rendered card form
+ *  ("fs_write src/x.js") — the v0.45 full live run FAILED recover honestly
+ *  because the scorer only parsed the JSON form and the real stream ships the
+ *  rendered one (the checkpoint manifest sat on disk the whole time, mentioning
+ *  the very file the scorer claimed was unproven). Junk in → null, never a
+ *  guess: a target we cannot see is a target we cannot vouch for. */
+export function writeTargetFromEvent(ev) {
+  if (!ev || typeof ev !== 'object') return null;
+  const ap = ev.args && typeof ev.args === 'object' ? ev.args.path : null;
+  if (typeof ap === 'string' && ap.trim()) return path.basename(ap.trim());
+  const a = String(ev.argText ?? '');
+  const m = a.match(/"path"\s*:\s*"([^"]+)"/) || a.match(/^\s*fs_write\s+([^\s"']+)/);
+  return m ? path.basename(m[1]) : null;
+}
+
+/** The mid-run brain-outage signature: the one-shot reported "brain offline"
+ *  and never reached an ok result. A dimension that never ran is a SKIP with
+ *  the reason — reporting it as FAIL would claim the agent failed an exercise
+ *  it was never given (the v0.46 full live run caught verify exactly like
+ *  that: kilo rate-limited mid-run, the leg died at 0 steps). */
+export function brainOffline(events) {
+  const es = Array.isArray(events) ? events : [];
+  const err = es.find((e) => e && e.type === 'error' && /brain offline/i.test(String(e.text || '')));
+  if (!err) return null;
+  if (es.some((e) => e && e.type === 'result' && e.status === 'ok')) return null;
+  return truncate(String(err.text || 'brain offline'), 200);
+}
+
 /** Which fs_write targets does the transcript mention? (stream events carry
  *  argText; session-shaped events carry args — both are honored.) */
 export function writeMentioning(events, needle) {
@@ -179,7 +209,7 @@ export function runOneShot(args, { cwd, timeoutMs = 300000, env = {}, config = n
     try {
       child = spawn(process.execPath, [BUDDY_ENTRY, ...argv], {
         cwd,
-        env: { ...process.env, ...env },
+        env: { ...process.env, ...env, BUDDY_WHY_CONTRACT: '1' }, // the benchmark runs with the why contract ON — decisions carry a why, enforced
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (e) {
@@ -279,6 +309,8 @@ async function runResearch(ctx) {
   saveArtifact(dir, 'stream.jsonl', r.out);
   saveIfNonEmpty(dir, 'events.jsonl', readWsEvents(ctx.ws));
   const artifacts = [path.join(dir, 'stream.jsonl')];
+  const offline = brainOffline(events);
+  if (offline) return { status: 'SKIP', reason: `brain offline mid-run — the exercise never ran: ${offline}`, evidence: artifacts };
   const searched = events.some((e) => e.type === 'tool' && e.tool === 'web_search');
   const fetched = events.some((e) => e.type === 'tool' && e.tool === 'web_fetch');
   const say = events.filter((e) => e.type === 'say').map((e) => e.text || '').join('\n');
@@ -301,11 +333,17 @@ async function runReason(ctx) {
   const { dir } = ctx;
   fs.mkdirSync(path.join(ctx.ws, 'src'), { recursive: true });
   fs.writeFileSync(path.join(ctx.ws, 'src', 'util.js'), 'export function add(a, b) { return a + b; }\nexport function mul(a, b) { return a * b; }\n');
-  const task = 'First make a short plan with the todo tool. Then read src/util.js. Then write docs/summary.md — one sentence per exported function. Do not write anything before reading.';
+  // THE CONTRACT names the discipline in the task ("every decision carries a
+  // why") — the v0.45 full live run failed 1/5 whys because the model read the
+  // preamble's "skip it when obvious" as a default-off; the preamble now
+  // teaches default-include AND the task states the rubric, like a referee would.
+  const task = 'First make a short plan with the todo tool. Then read src/util.js. Then write docs/summary.md — one sentence per exported function. Do not write anything before reading. Every decision carries a why: put a one-sentence "why" on each tool call.';
   const r = await runOneShot(['-p', task, '--dir', ctx.ws], { timeoutMs: 240000, config: ctx.config });
   saveArtifact(dir, 'stream.jsonl', r.out);
   saveIfNonEmpty(dir, 'events.jsonl', readWsEvents(ctx.ws));
   const artifacts = [path.join(dir, 'stream.jsonl')];
+  const offline = brainOffline(r.events);
+  if (offline) return { status: 'SKIP', reason: `brain offline mid-run — the exercise never ran: ${offline}`, evidence: artifacts };
   const first = firstToolIsPlanner(r.events);
   const why = whyRatio(readWsEvents(ctx.ws)); // the event log carries the why sentences
   const summary = path.join(ctx.ws, 'docs', 'summary.md');
@@ -318,7 +356,8 @@ async function runReason(ctx) {
   else if (why.ratio < 0.6) fails.push(`only ${why.whys}/${why.total} tool calls carry a why (need ≥60%)`);
   if (!covers) fails.push('docs/summary.md missing or does not cover both exported functions');
   if (fails.length) return { status: 'FAIL', reason: fails.join(' · '), evidence: artifacts };
-  return { status: 'PASS', reason: `first call ${first.tool} · why on ${why.whys}/${why.total} calls · summary covers both exports`, evidence: artifacts };
+  const bounces = readWsEvents(ctx.ws).filter((e) => e && e.whyBounced).length;
+  return { status: 'PASS', reason: `first call ${first.tool} · why on ${why.whys}/${why.total} calls${bounces ? ` · ${bounces} why-contract bounce${bounces === 1 ? '' : 's'} enforced` : ''} · summary covers both exports`, evidence: artifacts };
 }
 
 async function runBuild(ctx) {
@@ -328,6 +367,8 @@ async function runBuild(ctx) {
   saveArtifact(dir, 'stream.jsonl', r.out);
   saveIfNonEmpty(dir, 'events.jsonl', readWsEvents(ctx.ws));
   const artifacts = [path.join(dir, 'stream.jsonl')];
+  const offline = brainOffline(r.events);
+  if (offline) return { status: 'SKIP', reason: `brain offline mid-run — the exercise never ran: ${offline}`, evidence: artifacts };
   const impl = path.join(ctx.ws, 'src', 'lib', 'slug.js');
   const test = path.join(ctx.ws, 'test', 'slug.test.js');
   if (!fs.existsSync(impl) || !fs.existsSync(test)) {
@@ -356,7 +397,7 @@ async function runRecover(ctx) {
   let killedOut = '';
   const spawnP = new Promise((resolve) => {
     child = spawn(process.execPath, [BUDDY_ENTRY, '-p', 'Implement SPEC.md exactly. The tests must pass.', '--dir', ctx.ws, '-o', 'stream-json', ...(ctx.config ? ['--config', ctx.config] : [])], {
-      cwd: ctx.ws, env: process.env, stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: ctx.ws, env: { ...process.env, BUDDY_WHY_CONTRACT: '1' }, stdio: ['ignore', 'pipe', 'pipe'],
     });
     let err = '';
     child.stdout.on('data', (d) => { killedOut += d; });
@@ -371,9 +412,10 @@ async function runRecover(ctx) {
   // the fs_write target comes from the killed child's own stream (argText) —
   // the events log records THAT it happened; the stream records WHAT it was
   const kstream = killedOut.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  const killedOffline = brainOffline(kstream);
+  if (killedOffline) return { status: 'SKIP', reason: `brain offline mid-run — the kill leg never started: ${killedOffline}`, evidence: [path.join(dir, 'killed-stream.jsonl')] };
   const kw = kstream.find((e) => e.type === 'tool' && e.tool === 'fs_write');
-  const pm = String(kw?.argText || '').match(/"path"\s*:\s*"([^"]+)"/);
-  const target = pm ? path.basename(pm[1]) : null;
+  const target = writeTargetFromEvent(kw); // both argText shapes + args.path — junk → null (never guessed)
   const manifestHits = [];
   const cpDir = path.join(ctx.ws, '.buddy', 'checkpoints');
   try {
@@ -412,6 +454,8 @@ async function runRecover(ctx) {
   }
   if (resumed.code !== 0) fails.push(`the resumed session exited ${resumed.code}${resumed.signal ? ` (${resumed.signal})` : ''}`);
   if (verify.code !== 0) fails.push(`final node --test on disk did NOT pass (exit ${verify.code})`);
+  const resumedOffline = brainOffline(resumed.events);
+  if (fails.length && resumedOffline) return { status: 'SKIP', reason: `brain offline mid-run — the resume leg did not finish: ${resumedOffline}`, evidence: ['kill-report.json', 'resumed-stream.jsonl'].map((f) => path.join(dir, f)) };
   if (fails.length) return { status: 'FAIL', reason: fails.join(' · '), evidence: ['kill-report.json', 'final-test-run.log', 'killed-stream.jsonl'].map((f) => path.join(dir, f)) };
   return { status: 'PASS', reason: `SIGKILL after the first completed fs_write (${target}) → checkpoint manifest found → a fresh agent recovered the state FROM DISK and finished → final node --test green`, evidence: ['kill-report.json', 'checkpoint-manifest.json', 'killed-stream.jsonl', 'resumed-stream.jsonl', 'final-test-run.log'].map((f) => path.join(dir, f)) };
 }
@@ -426,6 +470,8 @@ async function runVerify(ctx) {
   saveArtifact(dir, 'stream.jsonl', r.out);
   saveIfNonEmpty(dir, 'events.jsonl', readWsEvents(ctx.ws));
   const artifacts = [path.join(dir, 'stream.jsonl')];
+  const offline = brainOffline(events);
+  if (offline) return { status: 'SKIP', reason: `brain offline mid-run — the exercise never ran: ${offline}`, evidence: artifacts };
   const text = events.map((e) => [e.type === 'say' ? e.text : '', e.type === 'tool' ? e.observation : ''].join(' ')).join('\n');
   const catch_ = detectFalsePremiseCorrection(text, '3.2.0');
   const changelogWrites = writeMentioning(events, 'changelog');
@@ -589,7 +635,7 @@ export async function runBenchmark(opts = {}) {
   const skipped = results.filter((r) => r.status === 'SKIP').length;
   const scored = passed + failed;
   const score = scored ? passed / scored : null;
-  fs.writeFileSync(path.join(benchDir, 'scorecard.json'), JSON.stringify({ at: new Date().toISOString(), version: '0.45.0', fast, brain, passed, failed, skipped, score, results }, null, 2), 'utf8');
+  fs.writeFileSync(path.join(benchDir, 'scorecard.json'), JSON.stringify({ at: new Date().toISOString(), version: '0.46.0', fast, whyContract: true, brain, passed, failed, skipped, score, results }, null, 2), 'utf8');
   fs.writeFileSync(path.join(benchDir, 'summary.md'), scorecardText(results, { passed, failed, skipped, score, benchDir, fast, brain }) + '\n', 'utf8');
   return { benchDir, results, passed, failed, skipped, score, brain };
 }

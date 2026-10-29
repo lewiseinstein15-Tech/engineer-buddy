@@ -578,7 +578,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     {
       name: 'todo',
       description:
-        'Track a dependency-aware plan (todo v2). Call FIRST with the plan (all pending), then update statuses (in_progress / done) as you work. Items may declare "blocked_by" (ids that must be done first) — blocked items cannot start or finish until every blocker is done; the reply lists READY NOW items, start with those. Max 8 items, short texts. An empty items array clears the plan.',
+        'Track a dependency-aware plan (todo v2). Call FIRST with the plan (all pending), then update statuses (in_progress / done) as you work. Items may declare "blocked_by" (ids that must be done first) — blocked items cannot start or finish until every blocker is done; the reply lists READY NOW items, start with those. Max 8 items, short texts. An empty items array clears the plan. Every todo call carries a one-sentence "why" — the plan IS decisions.',
       args: '{"items":[{"id":"1","text":"read the failing test","status":"in_progress"},{"id":"2","text":"patch it","status":"pending","blocked_by":["1"]}]}',
       render: (a) => `todo (${(a?.items || []).length} items)`,
       run: async ({ items } = {}) => {
@@ -803,7 +803,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     },
     {
       name: 'fs_write',
-      description: 'Create or fully rewrite a file. Prefer fs_replace for existing files.',
+      description: 'Create or fully rewrite a file. Prefer fs_replace for existing files. Include a one-sentence "why" — writes are decisions.',
       args: '{"path":"src/file.js","content":"full new file content"}',
       risky: true,
       render: (a) => `fs_write ${a?.path}`,
