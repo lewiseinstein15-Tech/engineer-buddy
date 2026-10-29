@@ -27,6 +27,7 @@ import { createSchemaTool } from './schema.js';
 import { createBrowserTool } from './browser.js';
 import { createContainersTool } from './containers.js';
 import { createCloudTool } from './cloud.js';
+import { createFrontierTool } from './frontier.js';
 
 // ── Edit previews (shown before approval, Claude-Code style) ────────────────
 
@@ -575,6 +576,10 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     // v0.43.0 (checklist §10): cloud resource management — the machine's own
     // aws/gcloud/az, gate-free inspect, gated deploy, honest refusals.
     createCloudTool({ root: scope.root }),
+    // v0.50.0 (checklist §10): frontier toolchains — mobile / wasm+edge / ml /
+    // hardware-embedded; the machine's own tools, probed at call time, never
+    // bundled; gate-free status, gated build/run/template/flash/monitor.
+    createFrontierTool({ root: scope.root }),
     {
       name: 'todo',
       description:
