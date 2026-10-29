@@ -48,6 +48,57 @@ $ node src/index.js doctor
 3/4 gateways alive. Chain never fails while ≥1 is up.
 ```
 
+## Install
+
+Buddy is zero-dependency: clone and run. There is no `npm install` step — the
+whole engine is the Node.js standard library.
+
+**Prerequisites (all platforms):** [Node.js](https://nodejs.org) **>= 20**
+(`node --version` to check) and `git` on PATH. No API keys, no accounts, no
+monthly cost — the brain chain is keyless by contract.
+
+### macOS / Linux
+
+```bash
+git clone https://github.com/lewiseinstein15-Tech/engineer-buddy.git
+cd engineer-buddy
+node src/index.js doctor    # prove the brain chain on your machine
+node src/index.js           # interactive session in this repo
+npm link                    # optional: puts `buddy` on your PATH
+```
+
+### Windows 10 / 11 (official — CI-tested on windows-latest since v0.57.0)
+
+Windows is a first-class target: the full unit suite runs on
+`windows-latest` on every push, next to the ubuntu leg (see
+`.github/workflows/ci.yml` — the matrix exists so readline and ANSI
+differences are caught on Windows, not reported by users).
+
+```powershell
+git clone https://github.com/lewiseinstein15-Tech/engineer-buddy.git
+cd engineer-buddy
+node src/index.js doctor
+node src/index.js
+npm link   # optional: `buddy` on PATH
+```
+
+Windows notes, stated honestly:
+
+- **Terminal:** use **Windows Terminal** or PowerShell 7. Legacy `conhost`
+  consoles render ANSI colors only partially; Buddy's tables and diffs look
+  their best in a modern terminal, and everything honors `NO_COLOR`.
+- **Paths and state:** every project keeps its state in `.buddy/` at the repo
+  root — no registry writes, no machine-global state. Spawned shells receive a
+  Windows-correct environment (`USERPROFILE`-aware HOME fallback, v0.57.0).
+- **Honest absences:** voice dictation (`ctrl+g`) probes for `arecord` / `sox`
+  / `parecord` / `ffmpeg` capture shapes — none is a standard Windows fixture,
+  so dictation reports its absence honestly there. The `unshare -rn` network
+  sandbox is Linux-only and degrades to a plain, policy-guarded spawn
+  everywhere else — never a fake "sandboxed" claim.
+- **Shell policy is identical:** the bash tool's blocklist runs before
+  anything executes, on every OS; on Windows the system shell is cmd.exe via
+  Node's `shell: true` and the same allow/deny rules apply.
+
 ## Buddy Code — the terminal coding agent (v0.8)
 
 Like Claude Code, but keyless and $0. Run it in any repo:

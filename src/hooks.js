@@ -20,7 +20,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { debugLog, truncate } from './util.js';
+import { debugLog, truncate, baseSpawnEnv } from './util.js';
 import { enabledPlugins, pluginHookEntries } from './plugins.js';
 
 export const HOOK_EVENTS = [
@@ -116,7 +116,7 @@ function runHookCmd(command, payload, { cwd, timeoutMs = HOOK_TIMEOUT_MS } = {})
       child = spawn(String(command), {
         shell: true,
         cwd,
-        env: { PATH: process.env.PATH, HOME: process.env.HOME || '/tmp', LANG: 'C.UTF-8', NO_COLOR: '1' },
+        env: baseSpawnEnv(),
       });
     } catch (e) {
       resolve({ code: -1, stdout: '', stderr: e.message, timedOut: false });

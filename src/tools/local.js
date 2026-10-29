@@ -8,7 +8,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { BuddyError, truncate } from '../util.js';
+import { BuddyError, truncate, baseSpawnEnv } from '../util.js';
 import { LocalRepo } from './repo.js';
 import { isAgentDeniedPath } from '../harness/scaffold.js';
 import { renderTextDiff, renderDiff, diffLines } from '../terminal/difflib.js';
@@ -164,7 +164,7 @@ export function runBash(cmd, { cwd = process.cwd(), timeoutMs = 180000, maxOutpu
         timeout: timeoutMs,
         killSignal: 'SIGKILL',
         detached: process.platform !== 'win32', // own process group → we can kill sh AND its children
-        env: { PATH: process.env.PATH, HOME: process.env.HOME || '/tmp', LANG: 'C.UTF-8', NO_COLOR: '1', ...env, ...(sandbox ? sandbox.env : {}) },
+        env: { ...baseSpawnEnv(), ...env, ...(sandbox ? sandbox.env : {}) },
       });
     } catch (e) {
       resolve({ ok: false, code: -1, stdout: '', stderr: e.message, durationMs: 0, timedOut: false, command });

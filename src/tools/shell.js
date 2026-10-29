@@ -5,7 +5,7 @@
 // output cap, a scrubbed environment (no GitHub token leakage into
 // subprocesses beyond what Actions already provides), and captured exit code.
 import { spawn } from 'node:child_process';
-import { BuddyError, truncate } from '../util.js';
+import { BuddyError, truncate, baseSpawnEnv } from '../util.js';
 
 /** Commands the buddy is allowed to execute (first token + optional shape). */
 const ALLOWLIST = [
@@ -49,11 +49,8 @@ export function runCommand(cmd, { cwd = process.cwd(), timeoutMs = 300000, maxOu
         timeout: timeoutMs,
         killSignal: 'SIGKILL',
         env: {
-          PATH: process.env.PATH,
-          HOME: process.env.HOME || '/tmp',
-          LANG: 'C.UTF-8',
+          ...baseSpawnEnv(),
           CI: '1',
-          NO_COLOR: '1',
           ...env,
         },
       });

@@ -25,7 +25,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { truncate, debugLog } from '../util.js';
+import { truncate, debugLog, baseSpawnEnv } from '../util.js';
 import { enabledPlugins } from '../plugins.js';
 import { HttpMcpClient, RateLimiter, maskAuth } from '../mcphttp.js';
 
@@ -229,7 +229,7 @@ export class McpClient {
       try {
         child = spawn(this.command, this.args, {
           stdio: ['pipe', 'pipe', 'pipe'],
-          env: { PATH: process.env.PATH, HOME: process.env.HOME || '/tmp', NO_COLOR: '1', ...this.env },
+          env: { ...baseSpawnEnv(), ...this.env },
         });
       } catch (e) {
         reject(e);

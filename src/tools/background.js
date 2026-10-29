@@ -15,6 +15,7 @@
 // out the whole tree, and everything is reaped when Buddy exits.
 import { spawn } from 'node:child_process';
 import { blockedBashReason } from './local.js';
+import { baseSpawnEnv } from '../util.js';
 
 // All live registries share ONE process-exit listener (reaping must be sync —
 // 'exit' handlers cannot await). Registered lazily, never per-instance, so
@@ -79,7 +80,7 @@ export class BackgroundShells {
         cwd: this.cwd,
         shell: true,
         detached: process.platform !== 'win32', // own process group → killable as a tree
-        env: { PATH: process.env.PATH, HOME: process.env.HOME || '/tmp', LANG: 'C.UTF-8', NO_COLOR: '1' },
+        env: baseSpawnEnv(),
       });
     } catch (e) {
       return { error: e.message };

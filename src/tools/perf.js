@@ -22,7 +22,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { truncate } from '../util.js';
+import { truncate, baseSpawnEnv } from '../util.js';
 
 const PERF_TIMEOUT_MS = 120000;
 const MAX_OUT = 8000;
@@ -117,7 +117,7 @@ function run(argv, { cwd, timeoutMs = PERF_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(argv[0], argv.slice(1), { cwd, env: { PATH: process.env.PATH, HOME: process.env.HOME || '/tmp', NO_COLOR: '1', LANG: 'C.UTF-8' } });
+      child = spawn(argv[0], argv.slice(1), { cwd, env: baseSpawnEnv() });
     } catch (e) {
       resolve({ ok: false, code: -1, stdout: '', stderr: e.message, durationMs: 0, timedOut: false });
       return;

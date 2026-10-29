@@ -129,12 +129,12 @@ test('runBash + sandbox: HOME lands in the sandbox dir, flags flow, marker env s
   const root = tmpRoot();
   const ctx = makeSandboxContext(root, { probe: () => ({ status: 0 }) });
   ctx.enabled = true;
-  const r = await runBash('printenv HOME', { cwd: '/tmp', sandbox: ctx.spawnOverrides() });
+  const r = await runBash('printenv HOME', { cwd: os.tmpdir(), sandbox: ctx.spawnOverrides() });
   assert.equal(r.ok, true);
   assert.equal(r.stdout.trim(), ctx.home);
   assert.equal(r.sandboxed, true);
   assert.equal(r.netOff, true);
-  const marker = await runBash('printenv SANDBOX', { cwd: '/tmp', sandbox: ctx.spawnOverrides() });
+  const marker = await runBash('printenv SANDBOX', { cwd: os.tmpdir(), sandbox: ctx.spawnOverrides() });
   assert.equal(marker.stdout.trim(), '1');
 });
 
@@ -142,7 +142,7 @@ test('runBash + sandbox: DNS fails fast inside the namespace (network is OFF)', 
   const ctx = makeSandboxContext(tmpRoot(), { probe: () => ({ status: 0 }) });
   ctx.enabled = true;
   const t0 = Date.now();
-  const r = await runBash('getent hosts example.com', { cwd: '/tmp', sandbox: ctx.spawnOverrides(), timeoutMs: 30000 });
+  const r = await runBash('getent hosts example.com', { cwd: os.tmpdir(), sandbox: ctx.spawnOverrides(), timeoutMs: 30000 });
   assert.equal(r.ok, false, 'getent must fail with no network');
   assert.ok(r.durationMs < 5000, `DNS must fail instantly, not hang (took ${r.durationMs}ms)`);
 });
@@ -151,7 +151,7 @@ test('runBash + sandbox: local work still runs — node executes, files map to t
   const root = tmpRoot();
   const ctx = makeSandboxContext(root, { probe: () => ({ status: 0 }) });
   ctx.enabled = true;
-  const r = await runBash('node --version', { cwd: '/tmp', sandbox: ctx.spawnOverrides() });
+  const r = await runBash('node --version', { cwd: os.tmpdir(), sandbox: ctx.spawnOverrides() });
   assert.equal(r.ok, true);
   assert.match(r.stdout, /^v\d+\./);
   // A file created as mapped-root inside the ns must be owned by the real
@@ -164,7 +164,7 @@ test('runBash + sandbox: local work still runs — node executes, files map to t
 });
 
 test('runBash without sandbox: no sandboxed flag, byte-stable result shape', async () => {
-  const r = await runBash('node --version', { cwd: '/tmp' });
+  const r = await runBash('node --version', { cwd: os.tmpdir() });
   assert.equal(r.ok, true);
   assert.equal(r.sandboxed, undefined);
   assert.equal(r.netOff, undefined);
@@ -173,7 +173,7 @@ test('runBash without sandbox: no sandboxed flag, byte-stable result shape', asy
 test('runBash + sandbox: the policy blocklist still runs FIRST — sandbox never widens anything', async () => {
   const ctx = makeSandboxContext(tmpRoot(), { probe: () => ({ status: 0 }) });
   ctx.enabled = true;
-  const r = await runBash('echo $HOME', { cwd: '/tmp', sandbox: ctx.spawnOverrides() });
+  const r = await runBash('echo $HOME', { cwd: os.tmpdir(), sandbox: ctx.spawnOverrides() });
   assert.equal(r.blocked, true, 'command substitution stays blocked under sandbox');
   assert.match(r.stderr, /^BLOCKED:/);
 });

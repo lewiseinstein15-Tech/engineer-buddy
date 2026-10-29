@@ -1,4 +1,5 @@
 // util.js — shared primitives. Zero dependencies by design.
+import os from 'node:os';
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -43,6 +44,53 @@ export const debugLog = (...a) => {
 export function truncate(s, n = 500) {
   if (typeof s !== 'string') return String(s);
   return s.length <= n ? s : s.slice(0, n) + `…[+${s.length - n} chars]`;
+}
+
+/**
+ * Cross-platform HOME fallback for spawned children (v0.57.0 windows
+ * hardening). The historic `HOME: process.env.HOME || '/tmp'` wrote a POSIX
+ * path into a Windows child's environment — there is no /tmp there and the
+ * value is a lie. Priority: HOME (POSIX always; Git Bash sessions set it) →
+ * USERPROFILE (the native Windows home) → os.tmpdir() (always exists in both
+ * worlds). Injectable env/tmp for tests; never throws, never returns a
+ * non-string, never returns an empty string.
+ */
+export function homeFallback(env = process.env, { tmp } = {}) {
+  const own = (o, k) => {
+    try {
+      return o != null && Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined;
+    } catch {
+      return undefined; // hostile object (throwing trap) → treated as absent
+    }
+  };
+  const pick = (v) => (typeof v === 'string' && v.trim() ? v : null);
+  try {
+    // OWN-KEY reads only (the house rule): a polluted Object.prototype.HOME
+    // can never win — inherited junk is not this child's environment.
+    return pick(own(env, 'HOME')) || pick(own(env, 'USERPROFILE')) || pick(tmp) || os.tmpdir();
+  } catch {
+    return os.tmpdir(); // hostile env object (throwing Proxy etc.) → the safe answer
+  }
+}
+
+/**
+ * The ONE base env for every spawn site: PATH verbatim, HOME via
+ * homeFallback (Windows-correct), UTF-8 locale, colors off. Callers spread
+ * their extras ON TOP (caller env > base), the exact shape every tool family
+ * already built by hand — six duplicated `HOME || '/tmp'` sites collapsed
+ * into this definition (v0.57.0).
+ */
+export function baseSpawnEnv(env = process.env, opts = {}) {
+  const home = homeFallback(env, opts); // defensive inside — never throws
+  let p;
+  try {
+    p = env != null && Object.prototype.hasOwnProperty.call(env, 'PATH')
+      ? env.PATH // verbatim passthrough; a hostile env degrades to "no PATH", never a crash
+      : undefined;
+  } catch {
+    p = undefined;
+  }
+  return { PATH: p, HOME: home, LANG: 'C.UTF-8', NO_COLOR: '1' };
 }
 
 /** Parse a bare integer safely; returns fallback when NaN. */
