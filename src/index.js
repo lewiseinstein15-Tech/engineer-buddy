@@ -79,6 +79,10 @@ GitHub skills (CI):
   engineer-buddy release-notes --repo OWNER/NAME [--since TAG] [--dry-run] [--post-issue N]
   engineer-buddy doctor
   engineer-buddy ask "prompt"
+  engineer-buddy benchmark [--dim a,b] [--fast] [--list]   run THE CONTRACT's seven
+                                        dimensions as real scored exercises with
+                                        evidence artifacts (.buddy/benchmark/); live
+                                        dimensions degrade to honest SKIP offline
   engineer-buddy mcp-serve [--allow-writes]   expose Buddy as an MCP stdio server
   engineer-buddy import <session.jsonl>       restore a shared session (then -r <name>)
 
@@ -527,7 +531,48 @@ async function cmdMcpServe(argv) {
     process.stdin.once('end', done);
     process.stdin.once('close', done);
   });
-}async function main() {
+}/** `buddy benchmark` — THE CONTRACT, demonstrated on demand (v0.45.0). */
+async function cmdBenchmark(argv) {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      dir: { type: 'string' },
+      dim: { type: 'string' },
+      fast: { type: 'boolean', default: false },
+      list: { type: 'boolean', default: false },
+      config: { type: 'string' },
+    },
+    allowPositionals: false,
+  });
+  const { DIMENSIONS, parseDimList, runBenchmark, scorecardText } = await import('./benchmark.js');
+  if (values.list) {
+    console.error('buddy benchmark — THE CONTRACT (seven dimensions):\n');
+    for (const d of DIMENSIONS) {
+      console.error(`  ${d.title.padEnd(14)} ${d.kind.padEnd(10)} ${d.rubric}`);
+    }
+    console.error('\nusage: buddy benchmark [--dim research,reason,...] [--fast] — live dimensions need a reachable keyless brain; they SKIP honestly otherwise.');
+    return 0;
+  }
+  const sel = parseDimList(values.dim);
+  if (sel.error) {
+    console.error(`buddy: ${sel.error}`);
+    return 2;
+  }
+  const root = values.dir ? path.resolve(values.dir) : process.cwd();
+  let out;
+  try {
+    out = await runBenchmark({ root, dims: sel.dims, fast: Boolean(values.fast), config: values.config || null });
+  } catch (e) {
+    console.error(`buddy: benchmark failed honestly — ${e?.message || e}`);
+    return 2;
+  }
+  console.error('\n' + scorecardText(out.results, { passed: out.passed, failed: out.failed, skipped: out.skipped, score: out.score, benchDir: out.benchDir, fast: Boolean(values.fast), brain: out.brain }));
+  if (out.failed > 0) return 2;
+  if (out.passed === 0) return 1; // nothing scored (all skipped) — honest, but not a pass
+  return 0;
+}
+
+async function main() {
   const [cmd, ...argv] = process.argv.slice(2);
   try {
     if (cmd === undefined || cmd === 'chat') {
@@ -548,6 +593,7 @@ async function cmdMcpServe(argv) {
     if (cmd === 'triage') process.exit(await cmdTriage(argv));
     if (cmd === 'release-notes') process.exit(await cmdReleaseNotes(argv));
     if (cmd === 'doctor') process.exit(await cmdDoctor(argv));
+    if (cmd === 'benchmark') process.exit(await cmdBenchmark(argv));
     if (cmd === 'ask') process.exit(await cmdAsk(argv));
     if (cmd === 'mcp-serve') process.exit(await cmdMcpServe(argv));
     if (cmd === 'import') process.exit(await cmdImport(argv));

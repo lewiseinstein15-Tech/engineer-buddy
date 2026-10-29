@@ -6,6 +6,24 @@
 
 **Buddy Code** — a Claude Code-style coding agent in your terminal (chat, explore, edit, run, verify, **search the web**) — **plus five GitHub skills** (autonomous PR review, issue → fix PR, dependency auditing, issue triage, release notes).
 
+## Claims → proof (run it yourself)
+
+README claims score zero unless they can be demonstrated on demand — so every
+headline claim below maps to a command that demonstrates it live, with
+artifacts. Run `buddy benchmark` for the whole contract at once.
+
+| claim | prove it | what you'll see |
+|---|---|---|
+| keyless brain with failover | `buddy doctor` | per-gateway BUDDY_OK round-trips; the chain degrades honestly |
+| the agent can plan, build, and verify | `buddy -p "implement SPEC.md; tests must pass"` | steps on screen; tests green on disk |
+| it refuses false premises (VERIFY) | `buddy benchmark --dim verify` | a planted wrong version is caught + corrected, nothing fabricated |
+| it plans before it writes (REASON) | `buddy benchmark --dim reason` | first tool call is a planner/reader; `why` on every call |
+| it recovers from a kill (RECOVER) | `buddy benchmark --dim recover` | SIGKILLed mid-task → checkpoint manifests prove state → finished green |
+| its citations are fetchable (RESEARCH) | `buddy benchmark --dim research` | the harness fetches the cited URL ITSELF through the SSRF guard |
+| one MCP protocol, every level (CAPABILITIES) | `buddy benchmark --dim capabilities` | Buddy drives Buddy: tools/list, a real read, a refused write, unknown tools are errors |
+| nothing is faked, ever | `buddy benchmark --fast` | absent capabilities SKIP **honestly with a reason** — never a fabricated pass |
+| evidence ships with everything (EVIDENCE) | `.buddy/benchmark/<ts>/` | scorecard.json + summary.md + per-dimension artifacts |
+
 ```
 $ node src/index.js doctor
 
