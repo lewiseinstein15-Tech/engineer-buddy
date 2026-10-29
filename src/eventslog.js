@@ -123,6 +123,11 @@ export function projectEvent(ev) {
       };
     case 'error':
       return { ...base, text: String(ev.text || '').slice(0, 300) };
+    case 'lessonRecall':
+      // v0.52.0 — cross-session recall is an auditable fact: how many lessons
+      // rode into the task and how strong the top match was. The block itself
+      // lives in the task text; the log keeps counts, never the bulk.
+      return { ...base, count: Number(ev.count) || 0, topScore: typeof ev.topScore === 'number' ? ev.topScore : null };
     case 'turn_end':
       return {
         ...base,

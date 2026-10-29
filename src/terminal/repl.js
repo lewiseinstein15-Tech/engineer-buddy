@@ -35,7 +35,7 @@ import { connectMcpServers, buildMcpTools, describeMcpServers, MCP_CONFIG_PATH }
 import { ensureHarness, loadHarness, harnessContext } from '../harness/scaffold.js';
 import { HARNESS_DIR } from '../harness/defaults.js';
 import { SessionRecorder, listSessions, loadSession, sessionInfo, resumeMessages, writeExport, latestSession, findSession, renameSession, forkSession, writeHtmlExport, importSession } from '../session.js';
-import { reflect, recentLessons, experiencePath, recallBlock } from '../learn.js';
+import { reflect, recentLessons, experiencePath } from '../learn.js';
 import { recallLessons, recallBlockText, lessonsIndexText, lessonsRecallText } from '../lessons.js';
 import { c, PALETTE, logoBanner, spinner, renderToolCall, renderToolEvent, renderTodo, renderTable, formatMs, renderContextBar, setTheme, themeNames, currentTheme } from './ui.js';
 import { osc52, resolveCopyRef, formatCopyTable, copyFits, fmtBytes, CARDS } from './toolcards.js';
@@ -450,13 +450,16 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
     /* mentions are best effort — the raw task still runs */
   }
   // Cross-session recall (v0.52.0): headless runs get the same topic-matched
-  // lesson injection as the REPL — same firewall, same honest-empty rule.
-  // The fact lands in events.jsonl; the block rides in the task text itself.
+  // lesson injection as the REPL — the SAME engine (lessons.js), the same
+  // firewall, the same honest-empty rule. The session-level recency lessons
+  // are excluded so nothing double-rides; the fact lands in events.jsonl
+  // (audit), the block rides in the task text itself.
   try {
-    const rb = recallBlock(root, taskText);
-    if (rb) {
-      taskText = `${rb.text}\n\n${taskText}`;
-      appendEvent(root, { type: 'lessonRecall', count: rb.count, topScore: rb.topScore });
+    const rec = recallLessons(root, taskText, { exclude: recentLessons(root) });
+    const block = rec.matches.length ? recallBlockText(rec) : '';
+    if (block) {
+      taskText = `${block}\n\n${taskText}`;
+      appendEvent(root, { type: 'lessonRecall', count: rec.matches.length, topScore: rec.matches[0].score });
     }
   } catch {
     /* recall must never break a turn */
@@ -2502,21 +2505,6 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     // Attached only when the task actually STARTS (a busy-time queue push
     // must not consume the docs — they attach when the queue drains).
     let effective = inputText;
-    // Cross-session recall (v0.52.0): the task's topic pulls topic-matched
-    // lessons out of EXPERIENCE.md; they ride through the same injection
-    // firewall as /docs — data, not instructions. A miss injects nothing.
-    if (!busy) {
-      try {
-        const rb = recallBlock(root, inputText);
-        if (rb) {
-          effective = `${rb.text}\n\n${effective}`;
-          say(`  ${c.green('↳ experience recall')} ${c.dim(`attached (${rb.count} topic-matched, this task only)`)}`);
-          appendEvent(root, { type: 'lessonRecall', count: rb.count, topScore: rb.topScore });
-        }
-      } catch {
-        /* recall must never break a turn */
-      }
-    }
     if (!busy && lastReport) {
       const r = lastReport;
       lastReport = null;
@@ -2560,6 +2548,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
             effective = `${block}\n\n${effective}`;
             const n = rec.matches.length;
             say(`  ${c.green('↳ experience recall')} ${c.dim(`attached (${n} lesson${n === 1 ? '' : 's'} matched this task's topic)`)}`);
+            appendEvent(root, { type: 'lessonRecall', count: n, topScore: rec.matches[0].score });
           }
         }
       } catch {
