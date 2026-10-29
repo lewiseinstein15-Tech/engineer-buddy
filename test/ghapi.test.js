@@ -516,8 +516,8 @@ describe('buildGhTool + repl wiring', () => {
 
   test('repl tripwires: /ci + /pr-comments registered, busy-safe, attach wired', () => {
     const src = fs.readFileSync(path.join(__dirname, '../src/terminal/repl.js'), 'utf8');
-    assert.match(src, /'ci', 'pr-comments',\n\]/);                       // SLASH_COMMANDS
-    assert.match(src, /'terminal-setup', 'permissions', 'ci', 'pr-comments'\]/); // BUSY_OK
+    assert.match(src, /'ci', 'pr-comments', 'channels',\n\]/);                     // SLASH_COMMANDS (v0.51 appended channels)
+    assert.match(src, /'terminal-setup', 'permissions', 'ci', 'pr-comments', 'channels', 'channel'\]/); // BUSY_OK
     assert.match(src, /case 'ci':/);
     assert.match(src, /case 'pr-comments':/);
     assert.match(src, /lastPrComments = \{ pr: data\.pr/);               // attach capture

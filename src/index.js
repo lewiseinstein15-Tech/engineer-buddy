@@ -93,6 +93,15 @@ GitHub skills (CI):
                                         store + history + artifacts record every
                                         run; --dry provably calls no runner; HELD
                                         junk is reported, never scheduled
+  engineer-buddy channel [list|add|remove|serve|drain|status]
+                                        (alias: channels) push external events
+                                        into a live session: webhook → inbox →
+                                        next-turn message (.buddy/channels/);
+                                        token lives in the ENV, referenced by
+                                        name; receiver is LOOPBACK-ONLY with a
+                                        per-channel rate limit; one receiver at
+                                        a time (serve lock); 'channel drain'
+                                        consumes the inbox headless
   engineer-buddy mcp-serve [--allow-writes]   expose Buddy as an MCP stdio server
   engineer-buddy import <session.jsonl>       restore a shared session (then -r <name>)
 
@@ -582,6 +591,112 @@ async function cmdBenchmark(argv) {
   return 0;
 }
 
+async function cmdChannel(argv) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: {
+      dir: { type: 'string' },
+      'token-env': { type: 'string' },
+      path: { type: 'string' },
+      'max-per-minute': { type: 'string' },
+      'max-bytes': { type: 'string' },
+      port: { type: 'string' },
+      limit: { type: 'string' },
+      host: { type: 'string' },
+    },
+    allowPositionals: true,
+  });
+  const C = await import('./channels.js');
+  const line = (s, n = 60) => C.oneLine(s, n);
+  const root = values.dir ? path.resolve(values.dir) : process.cwd();
+  const sub = String(positionals[0] ?? 'list').toLowerCase();
+  try {
+    if (sub === 'list' || sub === 'ls') {
+      const l = C.loadChannels(root);
+      console.error('\n' + C.channelsTableText(l.channels, l.problems) + '\n');
+      return 0;
+    }
+    if (sub === 'add') {
+      const name = positionals[1];
+      if (!name) { console.error('usage: buddy channel add <name> --token-env NAME [--path /hook/x] [--max-per-minute N] [--max-bytes N]'); return 2; }
+      const { channel } = C.addChannel(root, {
+        name,
+        tokenEnv: values['token-env'],
+        hookPath: values.path,
+        maxPerMinute: values['max-per-minute'],
+        maxBytes: values['max-bytes'],
+      });
+      console.error(`channel added: ${channel.name} — POST ${channel.path}`);
+      console.error(`  token: $${channel.tokenEnv} (the VALUE lives in the environment, never in config) · rate ${channel.maxPerMinute}/min · ≤${channel.maxBytes}B`);
+      console.error('  receive: buddy channel serve --port 7788   drain: buddy channel drain');
+      return 0;
+    }
+    if (sub === 'remove' || sub === 'rm') {
+      const { channel } = C.removeChannel(root, positionals[1]);
+      console.error(`channel removed: ${channel.name} — POST ${channel.path} is no longer served`);
+      return 0;
+    }
+    if (sub === 'status') {
+      console.error('\n' + C.statusText(root) + '\n');
+      return 0;
+    }
+    if (sub === 'drain') {
+      const out = C.drainInbox(root, { limit: values.limit });
+      if (out.reset) console.error('! the inbox shrank below the cursor (rotated or truncated) — the drain reset to zero and says so');
+      if (out.torn) console.error(`! ${out.torn} torn trailing line skipped (a receiver died mid-write) — it cannot block the cursor`);
+      if (!out.events.length) {
+        console.error(out.skipped ? `0 new events (${out.skipped} junk line(s) skipped honestly)` : '0 new events — the inbox is drained');
+        return 0;
+      }
+      for (const e of out.events) {
+        console.error(`${String(e.at ?? '').replace('T', ' ').slice(0, 19)}  ${line(e.channel, 16).padEnd(17)} ${e.id ?? '(no id)'}`);
+        console.error(`  ${line(e.text, 200)}`);
+        const mk = Object.keys(e.meta ?? {});
+        if (mk.length) console.error(`  meta: ${mk.map((k) => `${k}=${line(e.meta[k], 40)}`).join(' ')}`);
+      }
+      if (out.skipped) console.error(`(${out.skipped} junk line(s) skipped honestly)`);
+      console.error(`cursor advanced — ${out.events.length} event(s) consumed`);
+      return 0;
+    }
+    if (sub === 'serve') {
+      const host = C.assertLoopbackHost(values.host ?? '127.0.0.1');
+      const port = Number(values.port ?? 7788);
+      if (!Number.isInteger(port) || port < 0 || port > 65535) { console.error(`invalid --port "${line(values.port, 20)}" — expected 0..65535`); return 2; }
+      const lock = C.acquireServeLock(root);
+      if (lock.busy) {
+        console.error(`! a receiver already holds ${C.lockPath(root)} (pid ${lock.info?.pid ?? '?'}, since ${lock.info?.at ?? '?'}) — one receiver at a time; a second writer on the inbox is a corruption vector, not a feature`);
+        return 3;
+      }
+      if (lock.stole) console.error(`! stale receiver lock stolen (holder since ${lock.staleHolder?.at ?? '?'}, pid ${lock.staleHolder?.pid ?? '?'}) — a dead receiver cannot own the inbox forever`);
+      const { channels } = C.loadChannels(root);
+      const unset = channels.filter((c) => !process.env[c.tokenEnv]);
+      for (const c of unset) console.error(`! $${c.tokenEnv} is not set — channel "${c.name}" will refuse every request with an honest 503 until the env var exists`);
+      const server = C.createChannelServer({ root, host, port, env: process.env, log: (row) => console.error(`  ${row.at.slice(11, 19)} ${row.method} ${row.path} → ${row.status}`) });
+      await new Promise((res, rej) => { server.once('listening', res); server.once('error', rej); });
+      const addr = server.address();
+      console.error(`channel receiver UP on http://${addr.address}:${addr.port} (loopback only) — ${channels.length} channel(s)`);
+      console.error('  webhook POSTs land in .buddy/channels/inbox.jsonl; the live session picks them up at the next idle — buddy channel drain consumes them headless');
+      console.error('  Ctrl+C stops the receiver (the lock is released, the inbox stays)');
+      let stopping = false;
+      process.on('SIGINT', () => {
+        if (stopping) return;
+        stopping = true;
+        console.error('\nreceiver stopping — lock released');
+        try { C.releaseServeLock(root); } catch { /* best effort on the way out */ }
+        server.close(() => process.exit(0));
+        setTimeout(() => process.exit(0), 500).unref();
+      });
+      process.on('exit', () => { try { C.releaseServeLock(root); } catch { /* best effort */ } });
+      return new Promise(() => {}); // the receiver owns the process until SIGINT
+    }
+    console.error(`buddy: unknown channel subcommand "${line(sub, 24)}" — known: list | add | remove | serve | drain | status`);
+    return 2;
+  } catch (e) {
+    console.error(`buddy: channel failed honestly — ${e?.message || e}`);
+    return 2;
+  }
+}
+
 async function cmdGoals(argv) {
   const { values, positionals } = parseArgs({
     args: argv,
@@ -722,6 +837,7 @@ async function main() {
     if (cmd === 'doctor') process.exit(await cmdDoctor(argv));
     if (cmd === 'benchmark') process.exit(await cmdBenchmark(argv));
     if (cmd === 'goals' || cmd === 'goal') process.exit(await cmdGoals(argv));
+    if (cmd === 'channel' || cmd === 'channels') process.exit(await cmdChannel(argv));
     if (cmd === 'ask') process.exit(await cmdAsk(argv));
     if (cmd === 'mcp-serve') process.exit(await cmdMcpServe(argv));
     if (cmd === 'import') process.exit(await cmdImport(argv));
