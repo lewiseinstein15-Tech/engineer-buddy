@@ -144,6 +144,19 @@ export function projectEvent(ev) {
         ...(ev.status != null ? { status: Number(ev.status) || 0 } : {}),
         ...(ev.reason ? { reason: String(ev.reason).slice(0, 80) } : {}),
       };
+    case 'route':
+      // v0.56.0 — multi-model routing is an auditable fact: which step class
+      // led which chain, under which effort. Gateway NAMES only (strings,
+      // capped), never message text — the events log is facts, not content.
+      return {
+        ...base,
+        class: ev.class === 'planning' ? 'planning' : 'chore',
+        effort: String(ev.effort || 'medium'),
+        chain: (Array.isArray(ev.chain) ? ev.chain : [])
+          .filter((n) => typeof n === 'string' && n)
+          .map((n) => n.slice(0, 20))
+          .slice(0, 12),
+      };
     case 'turn_end':
       return {
         ...base,

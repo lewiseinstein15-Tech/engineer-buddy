@@ -26,6 +26,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { runAgent } from './agent.js';
+import { makeStepRouter } from '../brain/effort.js';
 import { truncate } from '../util.js';
 import { enabledPlugins, pluginKindDirs } from '../plugins.js';
 
@@ -254,9 +255,10 @@ export function loadAgents(root = process.cwd(), { home = os.homedir() } = {}) {
  * @param {number} [p.maxTokens]   per-step completion budget
  * @param {(ev:object)=>void} [p.onStep] step tap for TUI narration
  * @param {(e:object)=>string} [p.approval] optional async gate for risky tools
+ * @param {object} [p.routing] v0.56 multi-model routing config { mode, tiers, effort }
  * @returns {Promise<string>} the sub-agent's report
  */
-export async function runSubagent({ router, agent, parentTools, task, maxTokens = 1500, onStep = null, approval = null, alwaysApproved = null }) {
+export async function runSubagent({ router, agent, parentTools, task, maxTokens = 1500, onStep = null, approval = null, alwaysApproved = null, routing = null }) {
   const label = `subagent:${agent?.name || '?'}`;
   try {
     if (!router) return 'ERROR: no brain available (router missing)';
@@ -307,6 +309,18 @@ export async function runSubagent({ router, agent, parentTools, task, maxTokens 
         })
       : tools;
 
+    // v0.56 multi-model routing: sub-agents ride the same effort policy as
+    // the parent — makeStepRouter reads the LIVE order (a parent /model pin
+    // holds here too) and returns null unless a tier actually reorders.
+    const stepRouter = makeStepRouter({
+      mode: routing?.mode === 'auto' ? 'auto' : 'off',
+      tiers: routing?.tiers && typeof routing.tiers === 'object' ? routing.tiers : {},
+      latency: router.latency,
+      pinned: router.pinned || null,
+      getOrder: () => router.order,
+      getEffort: () => routing?.effort || 'medium',
+    });
+
     const noteStep = (ev) => {
       if (onStep) {
         try {
@@ -325,6 +339,7 @@ export async function runSubagent({ router, agent, parentTools, task, maxTokens 
       maxSteps: agent.maxSteps || 8,
       maxTokens,
       onStep: (ev) => noteStep(ev),
+      route: stepRouter,
     });
 
     if (res.finished) {

@@ -53,6 +53,7 @@ export class GatewayRouter {
     this.state = new Map(); // name -> { failures, openUntil }
     for (const n of this.order) this.state.set(n, { failures: 0, openUntil: 0 });
     this.lastUsed = null;
+    this.pinned = null; // v0.56.0: the explicit /model <name> choice — routing never demotes it
     this.latency = new Map(); // name -> EMA ms (self-healing routing, v0.25.0)
     this.offlineFallbackUsed = false; // one engagement per router — a dead machine stays dead
   }
@@ -117,11 +118,28 @@ export class GatewayRouter {
     const wantsVision = (Array.isArray(messages) ? messages : []).some(
       (m) => Array.isArray(m.content) && m.content.some((p) => p?.type === 'image_url')
     );
-    let chain = this.order;
+    // Multi-model routing (v0.56.0): a per-call chain from the effort policy
+    // REPLACES the base order for THIS call only. Hostile names are filtered
+    // here — the router owns the registry, so it owns the filtering (non-
+    // strings, unknown names, duplicates, '__proto__' never became a Map
+    // key anyway). An all-junk chain degrades to the default order; circuit
+    // breakers, ctx windows and vision-first compose ON TOP unchanged.
+    let base = this.order;
+    if (Array.isArray(opts.chain) && opts.chain.length) {
+      const seen = new Set();
+      const filtered = [];
+      for (const n of opts.chain) {
+        if (typeof n !== 'string' || seen.has(n) || !this.gateways.has(n)) continue;
+        seen.add(n);
+        filtered.push(n);
+      }
+      if (filtered.length) base = filtered;
+    }
+    let chain = base;
     if (wantsVision) {
-      const canSee = this.order.filter((n) => this.gateways.get(n)?.vision);
-      if (canSee.length && canSee.length < this.order.length) {
-        chain = [...canSee, ...this.order.filter((n) => !canSee.includes(n))];
+      const canSee = base.filter((n) => this.gateways.get(n)?.vision);
+      if (canSee.length && canSee.length < base.length) {
+        chain = [...canSee, ...base.filter((n) => !canSee.includes(n))];
         debugLog(`router: image request — vision gateways first (${canSee.join(', ')})`);
       }
     }

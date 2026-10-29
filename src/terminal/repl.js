@@ -44,6 +44,7 @@ import { SEM, renderDoneRibbon } from './theme.js';
 import { BG, createBgTurn, bgFinish, bgBufferEvent, resolveBgId, parseBgArgs, renderBgList, renderBgView, renderBgNote } from './tasks.js';
 import { makeThoughtExtractor } from './streamthought.js';
 import { getChatSetting, setChatSetting, loadSettingsView } from '../settings.js';
+import { normalizeTier, normalizeRoutingMode } from '../brain/effort.js';
 import { voiceDirPath, readVoiceConfig, voiceStatusText, probeRecorders, startRecording, finalizeTornWav, parseWav, transcribeWav } from '../voice.js';
 import { listOutputStyles, loadOutputStyle } from '../harness/outputstyles.js';
 import { renderMarkdown } from './markdown.js';
@@ -89,7 +90,7 @@ export const SLASH_DESCRIPTIONS = {
   gateways: 'Health-probe the keyless chain',
   cost: 'Usage: brain calls, est. tokens, $0.00',
   stats: 'Usage dashboard — per-task token ledger, gateway mix, project history',
-  effort: 'low | medium | high — turn budget + reply room per task (/effort high)',
+  effort: 'low | medium | high — turn budget + reply room per task, and the routing bias (strongest for planning, fastest for chores) (/effort high)',
   stream: 'on | off — stream Buddy\'s reply live as it arrives (/stream off to buffer)',
   events: 'Tail the structured event log (.buddy/events.jsonl) — /events 30',
   permissions: 'Show session approvals',
@@ -156,6 +157,38 @@ export function applyEffort(chat, level) {
   return true;
 }
 
+/**
+ * buildRoutingConfig (v0.56.0) — the operator's routing declaration, read
+ * ONCE per session: gateways.<name>.tier from buddy.config.json (junk NAMED
+ * and ignored — the engine never guesses a tier) + chat.routing from
+ * settings ('auto' default, 'off' the explicit kill switch, junk named).
+ * effortRef (when given) rides as a LIVE getter so /effort retunes the
+ * sub-agent bias without rebuilding anything.
+ */
+export function buildRoutingConfig(config = {}, root = process.cwd(), effortRef = null) {
+  const tiers = {};
+  for (const [name, gc] of Object.entries(config.gateways || {})) {
+    const t = normalizeTier(gc?.tier);
+    if (gc && gc.tier !== undefined && !t) {
+      console.error(`[buddy] WARN gateways.${name}.tier: ${JSON.stringify(gc.tier)} is not strong|general|fast — ignored (no routing bias for ${name})`);
+    }
+    if (t) tiers[name] = t;
+  }
+  const rawMode = getChatSetting(root, 'routing', 'auto');
+  let mode = normalizeRoutingMode(rawMode);
+  if (!mode) {
+    console.error(`[buddy] WARN chat.routing: ${JSON.stringify(rawMode)} is not auto|off — using auto`);
+    mode = 'auto';
+  }
+  const cfg = { mode, tiers };
+  if (effortRef) {
+    Object.defineProperty(cfg, 'effort', { get: () => effortRef.level || 'medium', enumerable: true });
+  } else {
+    cfg.effort = 'medium';
+  }
+  return cfg;
+}
+
 /** /statusline — fill a template: {branch} {gateway} {ctx} {session} {todo} {cwd}. Pure. */
 export function renderStatusline(template, ctx = {}) {
   const t = String(template || '').trim();
@@ -198,7 +231,7 @@ export function formatDiffReport({ status = '', stat = '', diff = '', gitFailed 
 
 // ── Session factory ──────────────────────────────────────────────────────────
 
-async function makeScopeAndTools({ root, router = null, onEvent = () => {}, approval = null, modes = null, onPlanApproved = () => {} } = {}) {
+async function makeScopeAndTools({ root, router = null, onEvent = () => {}, approval = null, modes = null, onPlanApproved = () => {}, routing = null } = {}) {
   // Multi-root workspace (v0.26.0): permissions.additionalDirectories from
   // user + project settings become alias-addressable roots ("alias/path").
   const extraRoots = buildExtraRoots(root);
@@ -247,7 +280,7 @@ async function makeScopeAndTools({ root, router = null, onEvent = () => {}, appr
   // to warnings. Sub-agents see every base tool plus the bridged MCP tools
   // (agent frontmatter allowlists support `mcp__<server>__*`), never `task`.
   const { agents } = loadAgents(root);
-  const taskTool = buildTaskTool({ router, tools: [...base, ghTool, ...mcpTools], agents, approval, onSubEvent: onEvent });
+  const taskTool = buildTaskTool({ router, tools: [...base, ghTool, ...mcpTools], agents, approval, onSubEvent: onEvent, routing });
   // User-defined tools (.buddy/tools/<name>/) — sandboxed child-process tools
   // (v0.14.0). They can never shadow built-ins, task, skills or MCP tools.
   const { tools: userTools, warnings: userToolWarnings } = loadUserTools(root, {
@@ -280,8 +313,8 @@ function makeHarness(root, recencyTexts = null) {
 }
 
 /** Create a chat session bound to a workspace root. */
-export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {}, repoMap = null, effort = null, streaming = null, onStream = null } = {}) {
-  const { tools, todoState, mcp, shells, skills, userToolWarnings, scope, extraRoots, reporters, sandbox, plugins: installedPlugins, pluginWarnings } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved });
+export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {}, repoMap = null, effort = null, streaming = null, onStream = null, routing = null } = {}) {
+  const { tools, todoState, mcp, shells, skills, userToolWarnings, scope, extraRoots, reporters, sandbox, plugins: installedPlugins, pluginWarnings } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved, routing });
   const recencyLessonTexts = recentLessons(root); // read ONCE — same list the harness block and the task-level recall exclude-set see
   const harness = makeHarness(root, recencyLessonTexts).hctx;
   // Hooks: the deterministic guarantee layer (.buddy/settings.json). One
@@ -291,7 +324,7 @@ export async function createBuddySession({ root = process.cwd(), router, yolo = 
   const { perms, warnings: permissionWarnings } = loadPermissions(root);
   // todoState is shared: the todo tool writes it (local.js), compaction reads
   // it (todo v2 plan anchor) — one object, one truth.
-  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, todoState, hooks, permissions: perms, yolo, root, onEvent, repoMap, effort, streaming, onStream, whyContract: process.env.BUDDY_WHY_CONTRACT === '1' || getChatSetting(root, 'whyContract', false) === true });
+  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, todoState, hooks, permissions: perms, yolo, root, onEvent, repoMap, effort, streaming, onStream, routing, whyContract: process.env.BUDDY_WHY_CONTRACT === '1' || getChatSetting(root, 'whyContract', false) === true });
   if (resumeFrom) {
     for (const m of resumeMessages(loadSession(resumeFrom))) session.messages.push(m);
   }
@@ -413,6 +446,11 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
   // Structured event log (v0.25.0): CI one-shots write the same JSONL trail
   // as the REPL — a cascade failure in Actions gets the same debugging story.
   const eventsLogOn = config.chat?.eventsLog !== false;
+  // Effort (v0.25.0) applies headless too — v0.56.0: the persisted level owns
+  // the loop budget AND the routing bias. One dial everywhere: the REPL, the
+  // sub-agents and the CI one-shot now read the same chat.effort setting.
+  const persistedEffort = getChatSetting(root, 'effort', 'medium');
+  const effortRef = EFFORT_PRESETS[persistedEffort] ? { ...EFFORT_PRESETS[persistedEffort] } : null;
   const { chat, hooks } = await createBuddySession({
     root,
     router,
@@ -420,6 +458,8 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
     approval: defaultApproval({ safe }),
     charBudget: config.chat?.charBudget,
     resumeFrom,
+    effort: effortRef,
+    routing: buildRoutingConfig(config, root, effortRef),
     repoMap: repoMapProvider,
     onEvent: (ev) => {
       events.push(ev);
@@ -644,7 +684,11 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   };
   // Effort + learned routing are applied AFTER the session exists (the effort
   // ref is created inside createChat). Silent on fresh installs — nothing learned yet.
+  // v0.56: the effort ref is hoisted HERE so the session, the routing policy
+  // and /effort all share ONE object — a level change retunes routing live.
   const persistedEffort = getChatSetting(root, 'effort', 'medium');
+  const effortRef = { level: EFFORT_PRESETS[persistedEffort]?.level || 'medium', maxSteps: EFFORT_PRESETS[persistedEffort]?.maxSteps || 14, maxTokens: EFFORT_PRESETS[persistedEffort]?.maxTokens || 1500 };
+  const routingCfg = buildRoutingConfig(config, root, effortRef); // one declaration, shared by loop + sub-agents + /effort + /gateways
   let healedNote = false;
   const routingMemAtStart = loadRoutingMemory(root);
   if (selfHealingOn) healedNote = selfHeal(router, routingMemAtStart, { enabled: true });
@@ -654,7 +698,8 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     router,
     modes,
     resumeFrom,
-    effort: { level: 'medium', maxSteps: 14, maxTokens: 1500 },
+    effort: effortRef,
+    routing: routingCfg,
     streaming: streamRef,
     onStream: onStreamDelta,
     repoMap: config.chat?.repoMap === false ? null : createRepoMapProvider(root, { maxChars: config.chat?.repoMapChars || 2800 }),
@@ -1137,9 +1182,11 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       case 'effort': {
         if (!args) {
           const e = chat.effort;
+          const tierDesc = Object.entries(routingCfg.tiers).filter(([, t]) => t !== 'general');
           say(
             `\n  effort: ${c.bold(e.level)} — ${e.maxSteps} steps/task · ~${e.maxTokens} tok replies\n` +
               `  ${c.dim('low = quick chores (8 steps, tight replies) · medium = default · high = hard tasks (24 steps, more room)')}\n` +
+              `  ${c.dim(`routing: ${routingCfg.mode} — ${e.level === 'high' ? 'every step leads with the strong tier' : e.level === 'low' ? 'every step leads with the fast tier' : 'planning steps lead strong, chores lead fast'}`)}${tierDesc.length ? ` ${c.dim(`(tiers: ${tierDesc.map(([n, t]) => `${n}=${t}`).join(', ')})`)}` : c.dim(' (no tiers declared — routing inert; set gateways.<name>.tier in buddy.config.json)')}\n` +
               `  ${c.dim('set it: /effort low | /effort medium | /effort high')}\n`
           );
           break;
@@ -1207,10 +1254,12 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         }
         if (args === 'auto' || args === 'reset') {
           router.order = [...initialOrder];
+          router.pinned = null; // v0.56: the pin is absolute while it lives — restore releases it
           say(`\n  order restored: ${router.order.join(' → ')}\n`);
         } else if (router.gateways.has(args)) {
           router.order = [args, ...initialOrder.filter((n) => n !== args)];
-          say(`\n  ${c.green('pinned')} ${c.bold(args)} first — chain: ${router.order.join(' → ')}\n`);
+          router.pinned = args; // v0.56: routing never demotes an explicit pin
+          say(`\n  ${c.green('pinned')} ${c.bold(args)} first — chain: ${router.order.join(' → ')}${routingCfg.mode === 'auto' ? c.dim(' · routing keeps the pin absolute and biases the tail') : ''}\n`);
         } else {
           say(`\n  unknown gateway "${args}" — available: ${[...router.gateways.keys()].join(', ')}\n`);
         }
@@ -1230,7 +1279,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
               const ok = String(out.text || '').toUpperCase().includes('BUDDY_OK');
               if (ok) router.noteLatency(name, Date.now() - t0); // feed the self-healing memory (v0.25.0)
               const ema = router.latency.get(name);
-              return [ok ? c.green('✓') : c.yellow('?'), name, `${formatMs(Date.now() - t0)}`, ema ? `${formatMs(ema)} ema` : c.dim('—'), `${out.model || '-'} ${ok ? 'round-trip OK' : 'unexpected reply'}`];
+              return [ok ? c.green('✓') : c.yellow('?'), name, routingCfg.tiers?.[name] === 'strong' ? c.bold('strong') : routingCfg.tiers?.[name] === 'fast' ? c.cyan('fast') : c.dim('general'), `${formatMs(Date.now() - t0)}`, ema ? `${formatMs(ema)} ema` : c.dim('—'), `${out.model || '-'} ${ok ? 'round-trip OK' : 'unexpected reply'}`];
             } catch (e) {
               return [c.red('✗'), name, formatMs(Date.now() - t0), c.dim('—'), truncate(e.message, 48)];
             }
@@ -1246,8 +1295,9 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
             saveRoutingMemory(root, mem);
           }
         } catch { /* learning is best-effort */ }
-        say(`\n${renderTable(rows, { headers: ['alive', 'gateway', 'probe', 'learned', 'model / note'] })}` +
-          `\n${c.dim('  learned = EMA of observed latencies (.buddy/routing.json) — the chain self-orders by it; pin one with /model <name>')}` +
+        say(`\n${renderTable(rows, { headers: ['alive', 'gateway', 'tier', 'probe', 'learned', 'model / note'] })}` +
+          `\n${c.dim("  tier = the operator's declaration (gateways.<name>.tier: strong|general|fast) — routing leads with strong for planning, fast for chores")}` +
+          `\n${c.dim('  learned = EMA of observed latencies (.buddy/routing.json) — breaks ties inside the fast tier; pin one with /model <name>')}` +
           `\n${c.dim('  offline-first: if every gateway fails, Buddy probes local Ollama automatically (chat.selfHealing=false disables learning)')}\n`);
         break;
       }

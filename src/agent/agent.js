@@ -5,6 +5,8 @@
 //
 // v0.2 upgrades: one self-repair retry on protocol violation (free models
 // sometimes sneeze prose), per-tool call caps, and per-call maxTokens.
+// v0.56: an optional `route` hook (multi-model routing) — fn(stepCtx) =>
+// chain|null; a truthy chain rides that ONE router.chat as opts.chain.
 import { extractJson, debugLog, truncate } from '../util.js';
 
 export function describeTools(tools) {
@@ -35,9 +37,12 @@ export function systemPromptFor(tools) {
  * @param {number} p.maxSteps
  * @param {number} p.maxTokens  per-step completion budget
  * @param {(step:{tool,args,observation})=>void} p.onStep  observation tap
+ * @param {((ctx:{index:number,remaining:number,lastTool:string|null})=>Array|null)} [p.route]
+ *        v0.56 multi-model routing hook: return a gateway chain for this
+ *        step (a permutation of router.order) or null for the default.
  * @returns {{finished:boolean, result:any, steps:Array, history:Array}}
  */
-export async function runAgent({ router, tools, systemPrompt, messages, maxSteps = 6, maxTokens = 1200, onStep = null }) {
+export async function runAgent({ router, tools, systemPrompt, messages, maxSteps = 6, maxTokens = 1200, onStep = null, route = null }) {
   const byName = new Map(tools.map((t) => [t.name, t]));
   const callCounts = new Map();
   const history = [
@@ -46,13 +51,29 @@ export async function runAgent({ router, tools, systemPrompt, messages, maxSteps
   ];
   const steps = [];
 
+  // v0.56: chain for one step. The route hook owns classification (it sees
+  // the same pre-call facts the chat loop sees); a hostile/junk return value
+  // degrades to the default order — routing may never break the loop.
+  const chainOptFor = (index, lastToolName) => {
+    if (typeof route !== 'function') return {};
+    try {
+      const ctx = { index, remaining: maxSteps - index + 1, lastTool: lastToolName };
+      const chain = route(ctx);
+      return Array.isArray(chain) && chain.length ? { chain } : {};
+    } catch {
+      return {};
+    }
+  };
+
   const noteStep = (entry) => {
     steps.push(entry);
     if (onStep && entry.tool && entry.observation !== undefined) onStep({ tool: entry.tool, args: entry.args, observation: entry.observation });
   };
 
+  let lastToolName = null; // v0.56: pre-call routing fact for the NEXT step
   for (let i = 1; i <= maxSteps; i++) {
-    let { text, model, gateway, latencyMs } = await router.chat(history, { maxTokens });
+    const chainOpt = chainOptFor(i, lastToolName);
+    let { text, model, gateway, latencyMs } = await router.chat(history, { maxTokens, ...chainOpt });
     let parsed = extractJson(text);
     let repaired = false;
 
@@ -65,7 +86,7 @@ export async function runAgent({ router, tools, systemPrompt, messages, maxSteps
         content:
           'PROTOCOL ERROR: your reply was not a single JSON object with a "tool" key. Respond again with EXACTLY ONE JSON object: {"tool":"<name>","args":{...}} or {"tool":"finish","result":...}. No other text.',
       });
-      const retry = await router.chat(history, { maxTokens });
+      const retry = await router.chat(history, { maxTokens, ...chainOpt });
       parsed = extractJson(retry.text);
       if (!parsed.ok || typeof parsed.value !== 'object' || parsed.value === null || !parsed.value.tool) {
         noteStep({ step: i, error: 'protocol violation (after repair)', raw: truncate(text, 300), model: retry.model, gateway: retry.gateway, latencyMs });
@@ -78,6 +99,7 @@ export async function runAgent({ router, tools, systemPrompt, messages, maxSteps
 
     const meta = { model, gateway, latencyMs };
     const { tool, args = {} } = parsed.value;
+    lastToolName = tool;
 
     if (tool === 'finish') {
       // The payload may arrive as {"tool":"finish","result":X} or
@@ -134,7 +156,7 @@ export async function runAgent({ router, tools, systemPrompt, messages, maxSteps
         '{"tool":"finish","result":"<your complete final report based on what you gathered so far>"}. ' +
         'A partial answer is required — report what you know now.',
     });
-    let wrap = await router.chat(history, { maxTokens });
+    let wrap = await router.chat(history, { maxTokens, ...chainOptFor(maxSteps + 1, lastToolName) });
     let parsed = extractJson(wrap.text);
     if (!isFinish(parsed)) {
       // one self-repair retry, same contract as the main loop — anything that

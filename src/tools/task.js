@@ -19,8 +19,9 @@ import { truncate } from '../util.js';
  * @param {number} [p.maxCalls]    per-turn dispatch budget (default 3)
  * @param {function} [p.approval]  approval gate for risky sub-tools
  * @param {function} [p.onSubEvent] narration tap: {type:'subagent', phase, agent, tool, observation}
+ * @param {object} [p.routing] v0.56 multi-model routing config passed to sub-agents
  */
-export function buildTaskTool({ router, agents, tools, maxCalls = 3, approval = null, onSubEvent = () => {} } = {}) {
+export function buildTaskTool({ router, agents, tools, maxCalls = 3, approval = null, onSubEvent = () => {}, routing = null } = {}) {
   const byName = new Map((agents || []).map((a) => [a.name, a]));
   const alwaysApproved = new Set(); // shared across sub-agent runs in this session
   const agentList = (agents || [])
@@ -48,6 +49,7 @@ export function buildTaskTool({ router, agents, tools, maxCalls = 3, approval = 
         task: String(task),
         approval,
         alwaysApproved,
+        routing,
         onStep: (ev) => {
           try {
             onSubEvent({ type: 'subagent', phase: 'step', agent: ev.agent, tool: ev.tool, observation: ev.observation });

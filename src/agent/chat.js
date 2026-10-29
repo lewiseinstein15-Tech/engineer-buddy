@@ -14,6 +14,7 @@ import { describeSkillCatalog } from '../skills/loader.js';
 import { PLAN_TOOLS, planModePrompt } from '../tools/planmode.js';
 import { evaluatePermission, matchingRule, auditTrail } from '../permissions.js';
 import { estimateTokens } from '../brain/usage.js';
+import { classifyStep, routeForStep } from '../brain/effort.js';
 
 export const PROTOCOL_PREAMBLE = [
   'You are Engineer Buddy ("Buddy Code"), a software engineer working in the user\'s terminal inside this repository.',
@@ -114,6 +115,7 @@ export function createChat({
   streaming = null, // mutable { enabled: boolean } — /stream on|off; deltas flow only when truthy-enabled AND onStream is set
   onStream = null, // (fragment: string) => void — raw gateway deltas as they arrive (TUI thought line); null = buffered chat
   whyContract = false, // v0.46: hard-bounce why-less decision calls (opt-in; default teaches in-band — see the WHY CONTRACT block)
+  routing = null, // v0.56 multi-model routing: { mode:'auto'|'off', tiers:{name:'strong'|'general'|'fast'} } — tiers are the OPERATOR's declaration (buddy.config.json); undeclared = inert
   onEvent = () => {},
 }) {
   const byName = new Map(tools.map((t) => [t.name, t]));
@@ -143,6 +145,16 @@ export function createChat({
   // more reply room). Mutable by reference so /effort retunes the NEXT turn
   // without rebuilding the session.
   const effortRef = effort || { level: 'medium', maxSteps: maxStepsPerTurn, maxTokens };
+  // Multi-model routing (v0.56.0): the effort policy picks which gateway
+  // LEADS the chain for each brain call — strongest for planning, fastest
+  // for chores, the user's effort level scopes the bias, an explicit /model
+  // pin is absolute. Inert without tier data: no tiers declared → every
+  // routeForStep call returns the base order → no chain opt, no route fact,
+  // byte-identical behavior to v0.55. mode 'off' (or junk that degraded to
+  // it) is the same inertness, made explicit.
+  const routingCfg = routing && typeof routing === 'object' && routing.mode !== 'off'
+    ? { mode: 'auto', tiers: routing.tiers && typeof routing.tiers === 'object' ? routing.tiers : {} }
+    : { mode: 'off', tiers: {} };
   // Streaming toggle (v0.28.0): mutable by reference so /stream flips the
   // NEXT brain call without rebuilding the session. Default on — one-shot
   // and non-TUI callers simply never pass onStream, so nothing changes.
@@ -288,7 +300,7 @@ export function createChat({
     });
   }
 
-  async function callModel() {
+  async function callModel(stepCtx = null) {
     await maybeCompact();
     const history = [systemMsg(), ...messages];
     // Plan mode raises the ceiling: a full markdown plan inside one JSON
@@ -297,6 +309,35 @@ export function createChat({
     // level; plan mode's floor still wins when it is higher.
     const baseTok = effortRef.maxTokens || maxTokens;
     const maxTok = modes?.plan ? Math.max(baseTok, 2500) : baseTok;
+    // Multi-model routing (v0.56.0): classify THIS step (pre-call facts
+    // only) and let the effort policy lead the chain. The chain opt rides
+    // only when the permutation genuinely differs from the base order — a
+    // no-op classification must stay byte-identical on the wire. The route
+    // fact is names and classes, never message text.
+    let chainOpt = {};
+    if (routingCfg.mode === 'auto' && stepCtx) {
+      // The whole chain build is best-effort by contract: a hostile latency
+      // map, a poisoned tier table, a junk order — routing degrades to the
+      // default chain, the turn never notices (the makeStepRouter guarantee,
+      // mirrored at the second call site).
+      try {
+        const cls = classifyStep(stepCtx);
+        const chain = routeForStep({
+          cls,
+          effort: effortRef.level,
+          order: router.order,
+          tiers: routingCfg.tiers,
+          latency: router.latency,
+          pinned: router.pinned || null,
+        });
+        if (chain.length === router.order.length && chain.some((n, i) => n !== router.order[i])) {
+          chainOpt = { chain };
+          onEvent({ type: 'route', class: cls, effort: effortRef.level, chain });
+        }
+      } catch {
+        chainOpt = {};
+      }
+    }
     // Streaming thoughts (v0.28.0): when the TUI listens and the toggle is
     // on, gateways get onDelta and push raw fragments out as they arrive.
     // The reply is still assembled from the FULL text — deltas never change
@@ -305,6 +346,7 @@ export function createChat({
     const wantStream = Boolean(onStream) && streamingRef?.enabled !== false;
     const out = await router.chat(toWire(history), {
       maxTokens: maxTok,
+      ...chainOpt,
       ...(wantStream ? { onDelta: (frag) => onStream(String(frag ?? '')) } : {}),
     });
     // Usage telemetry (the /cost surface) — real tokens when the gateway
@@ -369,6 +411,13 @@ export function createChat({
     // (v0.25.0): the level owns the base step budget.
     let stepLimit = effortRef.maxSteps || maxStepsPerTurn;
     let planNudged = false; // mid-turn wrap-up nudge fires once
+    let lastToolName = null; // v0.56 routing: what the previous step executed (pre-call fact for classifyStep)
+    const stepRouteCtx = (step) => ({
+      index: step,
+      planMode: Boolean(modes?.plan),
+      lastTool: lastToolName,
+      remaining: stepLimit - step + 1,
+    });
 
     for (let step = 1; step <= stepLimit; step++) {
       if (signal?.aborted) {
@@ -399,7 +448,7 @@ export function createChat({
       }
       let res;
       try {
-        res = await callModel();
+        res = await callModel(stepRouteCtx(step));
       } catch (e) {
         onEvent({ type: 'error', text: `brain offline: ${e.message}` });
         return { said: null, steps: step - 1, error: true };
@@ -449,7 +498,7 @@ export function createChat({
         });
         let retry;
         try {
-          retry = await callModel();
+          retry = await callModel(stepRouteCtx(step)); // same step, same route ctx — a repair is not a new step
         } catch (e) {
           onEvent({ type: 'error', text: `brain offline: ${e.message}` });
           return { said: null, steps: step, error: true };
@@ -475,6 +524,7 @@ export function createChat({
       }
 
       const { tool, args = {} } = parsed.value;
+      lastToolName = tool; // v0.56 routing: the NEXT call classifies from what THIS step did
 
       // v0.2 heritage: models put payload fields at the top level instead of
       // inside args (the say/finish lesson). exit_plan gets the same
