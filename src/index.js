@@ -134,6 +134,21 @@ GitHub skills (CI):
                                         oversized notebooks are REFUSED, not
                                         repaired by guesswork; writes are
                                         atomic (tmp+rename)
+  engineer-buddy voice [status|record|transcribe|list]
+                                        keyless speech-to-text (§11): 'status'
+                                        shows the probed recorders + endpoint;
+                                        'record' captures a wav via the
+                                        machine's own recorder (arecord/rec/
+                                        parecord/ffmpeg, bounded); 'transcribe'
+                                        POSTs a RIFF WAV to the KEYLESS STT
+                                        endpoint (voice.stt.endpoint in
+                                        .buddy/settings.json — a local
+                                        whisper.cpp or OpenAI-compatible
+                                        server; NO credentials field exists,
+                                        voice is keyless by contract); 'list'
+                                        shows kept dictation audio. Broken or
+                                        oversized wavs are REFUSED before any
+                                        byte goes on the wire
   engineer-buddy mcp-serve [--allow-writes]   expose Buddy as an MCP stdio server
   engineer-buddy import <session.jsonl>       restore a shared session (then -r <name>)
 
@@ -778,6 +793,87 @@ async function cmdNotebook(argv) {
   }
 }
 
+/** `buddy voice` (v0.55.0) — keyless speech-to-text (§11): status / record /
+ *  transcribe / list. The engine is voice.js. Broken or oversized wavs are
+ *  refused with the parser's own position BEFORE any byte goes on the wire;
+ *  the endpoint contract is keyless (no credentials field exists to set);
+ *  refusals exit 2 with the reason on stderr. */
+async function cmdVoice(argv) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: {
+      file: { type: 'string', short: 'f' },
+      out: { type: 'string' },
+      secs: { type: 'string' },
+      dir: { type: 'string' },
+    },
+    allowPositionals: true,
+  });
+  const V = await import('./voice.js');
+  const { loadSettingsView } = await import('./settings.js');
+  const root = values.dir ? path.resolve(values.dir) : process.cwd();
+  const sub = String(positionals[0] ?? 'status').toLowerCase();
+  try {
+    if (!['status', 'record', 'transcribe', 'list'].includes(sub)) {
+      console.error(`buddy: unknown voice subcommand "${sub || '(none)'}" — known: status | record | transcribe | list`);
+      return 2;
+    }
+    const { cfg, problems } = V.readVoiceConfig(loadSettingsView(root));
+    if (sub === 'status') {
+      console.error('\n' + V.voiceStatusText(root, { settingsView: loadSettingsView(root) }) + '\n');
+      return 0;
+    }
+    if (problems.length) {
+      console.error(`buddy: voice config has problems — fix .buddy/settings.json before using voice:`);
+      for (const p of problems) console.error(`  - ${p}`);
+      return 2;
+    }
+    if (sub === 'list') {
+      const dir = V.voiceDirPath(root);
+      let entries = [];
+      try { entries = fs.readdirSync(dir).filter((f) => f.endsWith('.wav')); } catch { /* absent — normal */ }
+      if (!entries.length) {
+        console.error(`\nno kept audio in ${dir} — dictation wavs are deleted after transcription unless voice.record.keepAudio is true\n`);
+        return 0;
+      }
+      console.error(`\nkept audio (${dir}):`);
+      for (const f of entries) {
+        const st = fs.statSync(path.join(dir, f));
+        console.error(`  ${f}  ${st.size} bytes  ${st.mtime.toISOString()}`);
+      }
+      console.error('');
+      return 0;
+    }
+    if (sub === 'record') {
+      const dir = V.voiceDirPath(root);
+      fs.mkdirSync(dir, { recursive: true });
+      const name = values.out && !String(values.out).includes('..')
+        ? (String(values.out).endsWith('.wav') ? String(values.out) : `${String(values.out)}.wav`)
+        : `dictation-${Date.now()}.wav`;
+      const abs = path.isAbsolute(name) ? name : path.join(dir, name);
+      const secs = values.secs ?? cfg.maxSeconds;
+      const r = await V.recordAudio({ outPath: abs, seconds: secs, eventsRoot: root });
+      console.error(`OK record · ${r.recorder} · ${r.audio.sampleRate}Hz ${r.audio.channels}ch · ${r.audio.durationSec}s · ${r.bytes} bytes · ${r.ms}ms`);
+      console.error(`  saved: ${abs}`);
+      console.error(`  next : buddy voice transcribe -f ${abs}`);
+      return 0;
+    }
+    // transcribe
+    const rel = values.file;
+    if (!rel || String(rel).trim() === '') {
+      console.error('buddy: transcribe needs -f/--file <path.wav>');
+      return 2;
+    }
+    const abs = path.isAbsolute(rel) ? rel : path.resolve(values.dir ? path.resolve(values.dir) : process.cwd(), rel);
+    const r = await V.transcribeWav({ abs, cfg, eventsRoot: root });
+    console.error(V.transcribeReceiptText(r));
+    return 0;
+  } catch (e) {
+    console.error(`buddy: voice ${sub} refused — ${e?.message || e}`);
+    return 2;
+  }
+}
+
 /** `buddy lessons` (v0.52.0) — cross-session lessons: index stats, or ranked
  *  topic recall for a query. The same recall engine the live session rides. */
 async function cmdLessons(argv) {
@@ -1068,6 +1164,7 @@ async function main() {
     if (cmd === 'lesson' || cmd === 'lessons') process.exit(await cmdLessons(argv));
     if (cmd === 'telemetry' || cmd === 'metrics') process.exit(await cmdTelemetry(argv));
     if (cmd === 'notebook' || cmd === 'nb') process.exit(await cmdNotebook(argv));
+    if (cmd === 'voice') process.exit(await cmdVoice(argv));
     if (cmd === 'ask') process.exit(await cmdAsk(argv));
     if (cmd === 'mcp-serve') process.exit(await cmdMcpServe(argv));
     if (cmd === 'import') process.exit(await cmdImport(argv));

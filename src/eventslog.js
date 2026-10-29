@@ -128,6 +128,22 @@ export function projectEvent(ev) {
       // rode into the task and how strong the top match was. The block itself
       // lives in the task text; the log keeps counts, never the bulk.
       return { ...base, count: Number(ev.count) || 0, topScore: typeof ev.topScore === 'number' ? ev.topScore : null };
+    case 'voice':
+      // v0.55.0 — dictation/transcription is an auditable fact: recorder,
+      // endpoint HOST, audio bytes, seconds, transcript CHARS. Never the
+      // transcript text — the events log is facts, not content.
+      return {
+        ...base,
+        recorder: ev.recorder ?? null,
+        ok: Boolean(ev.ok),
+        ...(ev.endpointHost ? { endpointHost: String(ev.endpointHost) } : {}),
+        ...(ev.dialect ? { dialect: String(ev.dialect) } : {}),
+        ...(ev.audioBytes != null ? { audioBytes: Number(ev.audioBytes) || 0 } : {}),
+        ...(ev.seconds != null ? { seconds: Number(ev.seconds) || 0 } : {}),
+        ...(ev.transcriptChars != null ? { transcriptChars: Number(ev.transcriptChars) || 0 } : {}),
+        ...(ev.status != null ? { status: Number(ev.status) || 0 } : {}),
+        ...(ev.reason ? { reason: String(ev.reason).slice(0, 80) } : {}),
+      };
     case 'turn_end':
       return {
         ...base,

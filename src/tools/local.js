@@ -29,6 +29,7 @@ import { createContainersTool } from './containers.js';
 import { createCloudTool } from './cloud.js';
 import { createFrontierTool } from './frontier.js';
 import { createNotebookTools } from './notebook.js';
+import { createVoiceTools } from './voice.js';
 
 // ── Edit previews (shown before approval, Claude-Code style) ────────────────
 
@@ -585,6 +586,11 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     // SAME scope protections as the fs_* family: policy guard, containment,
     // the freshness guard (changed-since-read is refused), checkpoints.
     ...createNotebookTools({ scope }),
+    // v0.55.0 (checklist §11): voice input — voice_transcribe sends a WAV to
+    // the configured KEYLESS STT endpoint (risky: file bytes leave the
+    // machine); broken files are refused before upload, .wav-only teaching
+    // refusals elsewhere.
+    ...createVoiceTools({ scope }),
     {
       name: 'todo',
       description:

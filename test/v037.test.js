@@ -247,7 +247,10 @@ test('replay: runPlayback paints in order, waits the paced delays, honors stop a
   });
   assert.deepEqual(painted, ['1/3:user', '2/3:tool', '3/3:say']);
   assert.deepEqual(waits, [150, 300], 'delays divided by speed 2');
-  assert.deepEqual(out, { played: 3, total: 3, waitedMs: 0 });
+  // the injected wait is a microtask — waitedMs must stay NEAR zero, i.e. the
+  // paced delays (300/600ms) must never land in the counter; an exact === 0
+  // raced the scheduler (Date.now() can tick once across the await).
+  assert.ok(out.waitedMs < 50, `waitedMs ${out.waitedMs} must not include the paced delays`);
 
   stopped = true; // flip before the run: nothing paints
   out = await runPlayback(frames, { paint: () => painted.push('x'), wait: async () => {}, shouldStop: () => stopped });

@@ -43,7 +43,8 @@ import { detectTerminal, setupSteps, NO_SETUP } from './termkeys.js';
 import { SEM, renderDoneRibbon } from './theme.js';
 import { BG, createBgTurn, bgFinish, bgBufferEvent, resolveBgId, parseBgArgs, renderBgList, renderBgView, renderBgNote } from './tasks.js';
 import { makeThoughtExtractor } from './streamthought.js';
-import { getChatSetting, setChatSetting } from '../settings.js';
+import { getChatSetting, setChatSetting, loadSettingsView } from '../settings.js';
+import { voiceDirPath, readVoiceConfig, voiceStatusText, probeRecorders, startRecording, finalizeTornWav, parseWav, transcribeWav } from '../voice.js';
 import { listOutputStyles, loadOutputStyle } from '../harness/outputstyles.js';
 import { renderMarkdown } from './markdown.js';
 import { expandMentions } from './mentions.js';
@@ -72,7 +73,7 @@ export function fmtTok(n) {
 export const SLASH_COMMANDS = [
   'help', 'new', 'clear', 'screen', 'compact', 'context', 'map', 'model', 'gateways', 'cost', 'stats', 'effort', 'events', 'stream',
   'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'diff', 'hooks', 'docs', 'rename', 'branch', 'fork', 'share', 'verbosity', 'theme', 'output-style', 'statusline', 'why', 'compare', 'memory', 'experience', 'learn', 'review',
-  'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'sandbox', 'plugin', 'quit', 'exit', 'add-dir', 'report', 'copy', 'terminal-setup', 'vim', 'ci', 'pr-comments', 'channels',
+  'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'sandbox', 'plugin', 'quit', 'exit', 'add-dir', 'report', 'copy', 'terminal-setup', 'vim', 'ci', 'pr-comments', 'channels', 'dictate', 'voice',
 ];
 
 // Descriptions shown in the slash-command palette (Claude Code style menu).
@@ -122,6 +123,8 @@ export const SLASH_DESCRIPTIONS = {
   ci: 'Show the latest CI run per branch (GitHub/GitLab — /ci [branch])',
   'pr-comments': 'Pull PR/MR review comments — /pr-comments [n] · attaches to your next task',
   channels: 'Webhook channels — status / drain (.buddy/channels/)',
+  dictate: 'Voice dictation — press to start, press again to finish; the transcript lands in the draft (ctrl+g does the same)',
+  voice: 'Voice/STT status — endpoint, dialect, recorders probed on this machine, the keyless contract',
   hooks: 'Show lifecycle hooks (.buddy/settings.json) — exit 2 blocks a tool/prompt',
   memory: 'Show project memory (edit it to teach Buddy)',
   experience: 'Lessons from past tasks',
@@ -806,7 +809,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   const rl = createInputBox({
     title: 'Buddy',
     placeholder: 'type a task…   (/ for commands · ! shell · # remember)',
-    hint: '? shortcuts · esc stop · ctrl+o expand · ctrl+r transcript · ctrl+b background',
+    hint: '? shortcuts · esc stop · ctrl+o expand · ctrl+r transcript · ctrl+b background · ctrl+g dictate',
     record: recordPath,
     statusRight: () => {
       try {
@@ -855,6 +858,80 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
 
   const say = (s) => console.log(s);
 
+  // ── Dictation (v0.55.0, checklist §11): ctrl+g / /dictate ────────────────
+  // WIRE TRUTH (the v0.33.0 lesson generalized): terminals deliver key PRESS
+  // events only — no key-release exists on the wire, so hold-a-key is
+  // approximated honestly by the TOGGLE: first press starts the capture, the
+  // second stops it. The recorder is the machine's own (probed at call
+  // time); the endpoint is the KEYLESS voice.stt.endpoint; the transcript
+  // lands in the DRAFT — review, then Enter. Nothing auto-submits.
+  let dictation = null;
+  async function toggleDictation() {
+    if (dictation) return stopDictation();
+    return startDictation();
+  }
+  async function startDictation() {
+    if (busy) { say(c.dim('  · a turn is running — dictate after it finishes (esc interrupts)\n')); return; }
+    const { cfg, problems } = readVoiceConfig(loadSettingsView(root));
+    if (problems.length) { say(c.red(`  voice config refused: ${problems[0]}\n`)); return; }
+    const shapes = probeRecorders();
+    const chosen = shapes.find((s) => s.found);
+    if (!chosen) {
+      say(c.red(`  no audio recorder found — probed: ${shapes.filter((s) => !s.skipped).map((s) => s.name).join(', ')}. Install one (arecord / sox / parecord / ffmpeg) or run /voice\n`));
+      return;
+    }
+    try {
+      fs.mkdirSync(voiceDirPath(root), { recursive: true });
+      const outPath = path.join(voiceDirPath(root), `dictation-${Date.now()}.wav`);
+      const h = startRecording({ outPath, seconds: cfg.maxSeconds, shape: chosen });
+      dictation = { ...h, outPath, cfg, timer: setTimeout(() => { say(c.dim('\n  ⏺ dictation auto-stopped at the cap\n')); stopDictation(); }, (h.seconds + 2) * 1000) };
+      rl.setBgNote(`⏺ recording — ctrl+g to finish (auto-stops at ${h.seconds}s)`);
+      say(c.dim('  ⏺ listening — press ctrl+g (or /dictate) again to finish; the transcript lands in the draft\n'));
+    } catch (e) {
+      say(c.red(`  dictation failed honestly — ${e?.message || e}\n`));
+    }
+  }
+  async function stopDictation() {
+    const d = dictation;
+    if (!d) return;
+    dictation = null;
+    clearTimeout(d.timer);
+    rl.setBgNote(null);
+    d.proc.kill('SIGTERM');
+    const r = await Promise.race([d.done, new Promise((res) => setTimeout(() => res(null), 2000))]);
+    if (!r) { try { d.proc.kill('SIGKILL'); } catch { /* already gone */ } }
+    if (busy) { // a turn started mid-dictation: cancel honestly, transcribe nothing
+      try { if (!d.cfg.keepAudio) fs.rmSync(d.outPath, { force: true }); } catch { /* best effort */ }
+      appendEvent(root, { type: 'voice', recorder: d.shape.name, ok: false, reason: 'cancelled — turn started' });
+      say(c.dim('  ⏺ dictation cancelled — a turn is running\n'));
+      return;
+    }
+    rl.setBusy('transcribing…');
+    try {
+      let buf = fs.readFileSync(d.outPath);
+      let finalized = false;
+      try {
+        parseWav(buf);
+      } catch {
+        buf = finalizeTornWav(buf); // OUR capture artifact — header finalized to the bytes on disk
+        parseWav(buf);
+        fs.writeFileSync(d.outPath, buf);
+        finalized = true;
+      }
+      const t = await transcribeWav({ abs: d.outPath, cfg: d.cfg, eventsRoot: root });
+      rl.setBusy(null);
+      if (!d.cfg.keepAudio) { try { fs.rmSync(d.outPath, { force: true }); } catch { /* best effort */ } }
+      if (t.empty) { say(c.dim('  ⏺ the server heard nothing — transcript empty\n')); return; }
+      rl.setDraft(t.text);
+      say(c.dim(`  ⏺ dictated ${t.text.length} chars into the draft${finalized ? ' (capture finalized)' : ''} — review, then Enter\n`));
+    } catch (e) {
+      rl.setBusy(null);
+      try { if (!d.cfg.keepAudio) fs.rmSync(d.outPath, { force: true }); } catch { /* best effort */ }
+      say(c.red(`  dictation failed honestly — ${e?.message || e}\n`));
+    }
+  }
+  rl.on('dictate', toggleDictation);
+
   // ── Slash command handlers ────────────────────────────────────────────────
 
   async function handleSlash({ name, args }) {
@@ -867,6 +944,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
             '',
             `  ${c.bold('type a task')}      give Buddy work ("add input validation to X")`,
             `  ${c.bold('ctrl+j')}           newline inside the draft — multi-line tasks (alt+enter works too)`,
+            `  ${c.bold('ctrl+g')}           dictate — press to start, press again to finish; the transcript lands in the draft (/voice for setup)`,
             `  ${c.bold('\\ at line end')}   continue on the next line (multi-line tasks)`,
             `  ${c.bold('!cmd')}            run a shell command yourself (trusted, no gate)`,
             `  ${c.bold('@path')}           attach a file to the task (e.g. explain @src/app.js)`,
@@ -1265,6 +1343,18 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           c.dim(`  accepted events render as ⚡ cards and ride into context on the NEXT task (data, not instructions)\n`) +
           c.dim(`  headless drain: buddy channel drain · run the receiver: buddy channel serve --port 7788${auto ? '\n  channelsAutoRun: inbound events START a turn by themselves (operator setting)' : ''}\n`)
         );
+        break;
+      }
+      case 'voice': {
+        // v0.55.0 — the keyless STT card: endpoint, dialect, recorders probed
+        // on THIS machine, the keyless contract. Disk-only facts.
+        say(`\n${voiceStatusText(root, { settingsView: loadSettingsView(root) })}\n`);
+        break;
+      }
+      case 'dictate': {
+        // v0.55.0 — same state machine as ctrl+g (discoverability for people
+        // who never read hint bars)
+        await toggleDictation();
         break;
       }
       case 'plugin': {
@@ -2398,7 +2488,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       // even with a turn in flight — that's the whole point of a background
       // task: the prompt keeps working. Everything else still refuses (state
       // mutations mid-turn would race the running turn).
-      const BUSY_OK = new Set(['tasks', 'copy', 'help', 'context', 'cost', 'stats', 'status', 'todo', 'why', 'tools', 'agents', 'skills', 'mcp', 'memory', 'experience', 'events', 'stream', 'theme', 'verbosity', 'statusline', 'vim', 'terminal-setup', 'permissions', 'ci', 'pr-comments', 'channels', 'channel']);
+      const BUSY_OK = new Set(['tasks', 'copy', 'help', 'context', 'cost', 'stats', 'status', 'todo', 'why', 'tools', 'agents', 'skills', 'mcp', 'memory', 'experience', 'events', 'stream', 'theme', 'verbosity', 'statusline', 'vim', 'terminal-setup', 'permissions', 'ci', 'pr-comments', 'channels', 'channel', 'voice']);
       if (busy && !BUSY_OK.has(slash.name)) {
         say(bg
           ? `  (task t${bg.id} is running in the background — /tasks to check · /tasks stop ${bg.id} to end it)`

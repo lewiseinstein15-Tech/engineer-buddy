@@ -90,6 +90,7 @@ export function applyKey(key, ctx = {}) {
   if (key.ctrl && name === 'w') return { action: 'kill-word-before' };
   if (key.ctrl && name === 'o') return { action: 'verbose-toggle' }; // v0.30.0: expand/collapse the stream transcript
   if (key.ctrl && name === 'r') return { action: 'transcript' }; // v0.31.0: open the ctrl+r transcript viewer
+  if (key.ctrl && name === 'g') return { action: 'dictate' }; // v0.55.0: press-to-talk toggle (repl owns the state machine)
   if (key.ctrl && name === 'b') {
     // v0.34.0: ctrl+b is DUAL-DUTY at the busy boundary (esc already works
     // this way: idle = clear draft, busy = interrupt). While a turn runs it
@@ -666,6 +667,9 @@ export function createInputBox({
       case 'detach': // ctrl+b (v0.34.0): background the running turn — the repl
         handlers.detach?.(); // owns the note + footer release; no repaint here
         return;
+      case 'dictate': // ctrl+g (v0.55.0): press-to-talk toggle — repl owns the
+        handlers.dictate?.(); // recording state machine; no repaint here
+        break;
       case 'mode-cycle': handlers.modecycle?.(); break; // shift+tab: normal → auto-accept → plan
       case 'submit': submitLine(); return; // submitLine handles its own repaint
       case 'escape':
@@ -742,6 +746,14 @@ export function createInputBox({
     // repl at detach, cleared at attach/completion
     setBgNote(t) {
       bgNote = t || null;
+      redraw();
+    },
+    // v0.55.0: put dictated text into the draft (the transcript lands as
+    // editable text — review, then Enter; nothing auto-submits)
+    setDraft(t) {
+      text = String(t ?? '');
+      cursor = text.length;
+      resetPaletteState();
       redraw();
     },
     _handleKeypress(key) { onKeypress(key || {}); }, // test / harness seam
