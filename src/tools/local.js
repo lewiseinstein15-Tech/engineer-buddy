@@ -511,15 +511,19 @@ function fmtResult(r) {
  * Build the local tool set.
  * @returns tools with {name, description, args, run, risky?, render?}
  */
-export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { latest: null }, symbolIndex = null, lspEnabled = true, sandbox = null } = {}) {
+export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { latest: null }, symbolIndex = null, lspEnabled = true, lspServers = null, sandbox = null } = {}) {
   const testTool = createTestTool({ root: scope.root });
   const gitTool = buildGitTool({ root: scope.root });
   const gitWriteTool = buildGitWriteTool({ root: scope.root });
   // Symbol index (v0.16.0) — lazy provider, shared TTL cache; read-only.
   const syms = symbolIndex || createSymbolIndexProvider(scope.root);
-  // LSP hub (v0.17.0) — lazy per-language connections to the repo's own
-  // language servers; diagnostics ride along on every edit (best-effort).
-  const lsp = lspEnabled ? createLspHub(scope.root) : null;
+  // LSP hub (v0.17.0, default-on; the chat.lsp knob became REAL in
+  // v0.62.0) — lazy per-language connections to the repo's own language
+  // servers; diagnostics ride along on every edit (best-effort).
+  // lspServers (v0.62.0): validated chat.lsp.servers overrides — replace a
+  // default command or add an extension; junk entries are refused upstream
+  // and never reach this door.
+  const lsp = lspEnabled ? createLspHub(scope.root, { servers: lspServers }) : null;
   const DIAG_OFF = () => Promise.resolve('');
   // Auto-format after edit (v0.23.0): chat.autoFormat in .buddy/settings.json
   // maps file extensions to formatter commands, e.g.
@@ -546,7 +550,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
         try {
           if (!rel) return '';
           const fmt = autoFormatFile(rel);
-          if (!lspExtFor(rel)) return fmt;
+          if (!lsp.extFor(rel)) return fmt;
           const out = await lsp.diagnosticsFor(String(rel), { waitMs: 900 });
           if (!out.length) return fmt;
           const errs = out.filter((d) => d.severity === 1).length;
@@ -558,6 +562,87 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     : (rel) => {
         try { return Promise.resolve(rel ? autoFormatFile(rel) : ''); } catch { return Promise.resolve(''); }
       };
+  // The lsp_* tools are REGISTERED ONLY WHEN THE HUB EXISTS (v0.62.0):
+  // chat.lsp: false removes them from the registry entirely — a removed
+  // tool can never be called, so the model is never teased with a door
+  // that only ever answers 'ERROR: LSP disabled'. The in-run `if (!lsp)`
+  // checks stay as belt-and-braces defenses, never the kill-switch.
+  const lspToolDefs = lsp
+    ? [
+    {
+      name: 'lsp_diagnostics',
+      description:
+        'Ask the language server for errors/warnings in a file (ts/js via typescript-language-server, python via pylsp, go via gopls — only when installed). Zero-dep Buddy spawns the repo server on first use.',
+      args: '{"path":"src/index.js"}',
+      render: (a) => `lsp_diagnostics ${a?.path}`,
+      run: async (args = {}) => {
+        let p;
+        try { p = args?.path; } catch { return 'ERROR: unreadable args — path must be a plain string'; }
+        if (!p) return 'ERROR: path required';
+        let ps;
+        try { ps = String(p); } catch { return 'ERROR: unreadable path — must be a plain string'; }
+        if (!lsp) return 'ERROR: LSP disabled (chat.lsp: false)';
+        if (!lsp.extFor(ps)) return `ERROR: no language server support for ${ps} (supported: js/jsx/ts/tsx/py/go + chat.lsp.servers overrides)`;
+        const items = await lsp.diagnosticsFor(ps, { waitMs: 2500 });
+        if (!items.length) return `no diagnostics for ${ps} — clean as far as the language server sees`;
+        return `${items.length} diagnostic${items.length === 1 ? '' : 's'} for ${ps}:\n${formatDiagnostics(items, ps, { maxItems: 12 })}`;
+      },
+    },
+    {
+      name: 'lsp_goto_def',
+      description: 'Compiler-grade go-to-definition via the language server (precise — unlike the regex go_to_def). Position is 1-based line/column in the file.',
+      args: '{"path":"src/app.js","line":12,"column":20}',
+      render: (a) => `lsp_goto_def ${a?.path}:${a?.line}`,
+      run: async (args = {}) => {
+        let p, line, column = 1;
+        try {
+          p = args?.path;
+          line = args?.line;
+          column = args?.column ?? 1;
+        } catch { return 'ERROR: unreadable args — path/line/column must be plain values'; }
+        if (!p || line == null) return 'ERROR: path and line required';
+        let ps;
+        try { ps = String(p); } catch { return 'ERROR: unreadable path — must be a plain string'; }
+        if (!lsp) return 'ERROR: LSP disabled (chat.lsp: false)';
+        if (!lsp.extFor(ps)) return `ERROR: no language server support for ${ps} (add one via chat.lsp.servers)`;
+        try {
+          const res = await lsp.definition(ps, Number(line) - 1, Math.max(Number(column) - 1, 0));
+          const locs = Array.isArray(res) ? res : res ? [res] : [];
+          if (!locs.length) return `(language server found no definition at ${p}:${line})`;
+          return locs.map((l) => `${(l.uri || '').replace('file://', '')}:${(l.range?.start?.line ?? 0) + 1}:${(l.range?.start?.character ?? 0) + 1}`).join('\n');
+        } catch (e) {
+          return `ERROR: ${e?.message || e}`;
+        }
+      },
+    },
+    {
+      name: 'lsp_refs',
+      description: 'Compiler-grade find-references via the language server (type-aware — sees renames, not just names). Position is 1-based line/column.',
+      args: '{"path":"src/app.js","line":12,"column":20}',
+      render: (a) => `lsp_refs ${a?.path}:${a?.line}`,
+      run: async (args = {}) => {
+        let p, line, column = 1;
+        try {
+          p = args?.path;
+          line = args?.line;
+          column = args?.column ?? 1;
+        } catch { return 'ERROR: unreadable args — path/line/column must be plain values'; }
+        if (!p || line == null) return 'ERROR: path and line required';
+        let ps;
+        try { ps = String(p); } catch { return 'ERROR: unreadable path — must be a plain string'; }
+        if (!lsp) return 'ERROR: LSP disabled (chat.lsp: false)';
+        if (!lsp.extFor(ps)) return `ERROR: no language server support for ${ps} (add one via chat.lsp.servers)`;
+        try {
+          const res = await lsp.references(ps, Number(line) - 1, Math.max(Number(column) - 1, 0), { includeDecl: false });
+          if (!res?.length) return '(no references found by the language server)';
+          return `${res.length} reference${res.length === 1 ? '' : 's'}:\n${res.slice(0, 40).map((l) => `${(l.uri || '').replace('file://', '')}:${(l.range?.start?.line ?? 0) + 1}:${(l.range?.start?.character ?? 0) + 1}`).join('\n')}${res.length > 40 ? `\n… +${res.length - 40} more` : ''}`;
+        } catch (e) {
+          return `ERROR: ${e?.message || e}`;
+        }
+      },
+    },
+    ]
+    : [];
   return [
     testTool,
     gitTool,
@@ -765,58 +850,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
         return parts.join('\n');
       },
     },
-    {
-      name: 'lsp_diagnostics',
-      description:
-        'Ask the language server for errors/warnings in a file (ts/js via typescript-language-server, python via pylsp, go via gopls — only when installed). Zero-dep Buddy spawns the repo server on first use.',
-      args: '{"path":"src/index.js"}',
-      render: (a) => `lsp_diagnostics ${a?.path}`,
-      run: async ({ path: p } = {}) => {
-        if (!p) return 'ERROR: path required';
-        if (!lsp) return 'ERROR: LSP disabled (chat.lsp: false)';
-        if (!lspExtFor(String(p))) return `ERROR: no language server support for ${p} (supported: js/jsx/ts/tsx/py/go)`;
-        const items = await lsp.diagnosticsFor(String(p), { waitMs: 2500 });
-        if (!items.length) return `no diagnostics for ${p} — clean as far as the language server sees`;
-        return `${items.length} diagnostic${items.length === 1 ? '' : 's'} for ${p}:\n${formatDiagnostics(items, String(p), { maxItems: 12 })}`;
-      },
-    },
-    {
-      name: 'lsp_goto_def',
-      description: 'Compiler-grade go-to-definition via the language server (precise — unlike the regex go_to_def). Position is 1-based line/column in the file.',
-      args: '{"path":"src/app.js","line":12,"column":20}',
-      render: (a) => `lsp_goto_def ${a?.path}:${a?.line}`,
-      run: async ({ path: p, line, column = 1 } = {}) => {
-        if (!p || line == null) return 'ERROR: path and line required';
-        if (!lsp) return 'ERROR: LSP disabled (chat.lsp: false)';
-        if (!lspExtFor(String(p))) return `ERROR: no language server support for ${p}`;
-        try {
-          const res = await lsp.definition(String(p), Number(line) - 1, Math.max(Number(column) - 1, 0));
-          const locs = Array.isArray(res) ? res : res ? [res] : [];
-          if (!locs.length) return `(language server found no definition at ${p}:${line})`;
-          return locs.map((l) => `${(l.uri || '').replace('file://', '')}:${(l.range?.start?.line ?? 0) + 1}:${(l.range?.start?.character ?? 0) + 1}`).join('\n');
-        } catch (e) {
-          return `ERROR: ${e?.message || e}`;
-        }
-      },
-    },
-    {
-      name: 'lsp_refs',
-      description: 'Compiler-grade find-references via the language server (type-aware — sees renames, not just names). Position is 1-based line/column.',
-      args: '{"path":"src/app.js","line":12,"column":20}',
-      render: (a) => `lsp_refs ${a?.path}:${a?.line}`,
-      run: async ({ path: p, line, column = 1 } = {}) => {
-        if (!p || line == null) return 'ERROR: path and line required';
-        if (!lsp) return 'ERROR: LSP disabled (chat.lsp: false)';
-        if (!lspExtFor(String(p))) return `ERROR: no language server support for ${p}`;
-        try {
-          const res = await lsp.references(String(p), Number(line) - 1, Math.max(Number(column) - 1, 0), { includeDecl: false });
-          if (!res?.length) return '(no references found by the language server)';
-          return `${res.length} reference${res.length === 1 ? '' : 's'}:\n${res.slice(0, 40).map((l) => `${(l.uri || '').replace('file://', '')}:${(l.range?.start?.line ?? 0) + 1}:${(l.range?.start?.character ?? 0) + 1}`).join('\n')}${res.length > 40 ? `\n… +${res.length - 40} more` : ''}`;
-        } catch (e) {
-          return `ERROR: ${e?.message || e}`;
-        }
-      },
-    },
+    ...lspToolDefs,
     {
       name: 'fs_write',
       description: 'Create or fully rewrite a file. Prefer fs_replace for existing files. Include a one-sentence "why" — writes are decisions.',

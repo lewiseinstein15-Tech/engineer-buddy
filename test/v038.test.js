@@ -233,7 +233,7 @@ test('source asserts: makeScopeAndTools reads the persisted flag, threads the ct
   const repl = fs.readFileSync(new URL('../src/terminal/repl.js', import.meta.url), 'utf8');
   assert.match(repl, /makeSandboxContext\(root\)/, 'context built once per session');
   assert.match(repl, /getChatSetting\(root, 'sandbox', false\) === true/, 'enabled state comes from settings');
-  assert.match(repl, /buildLocalTools\(\{ scope, todoState, sandbox \}\)/, 'bash tool sees the ctx');
+  assert.match(repl, /buildLocalTools\(\{ scope, todoState, sandbox, lspEnabled: lspInfo\.on, lspServers: lspInfo\.servers \}\)/, 'bash tool sees the ctx (v0.62.0: the LSP knob rides the same call');
   assert.match(repl, /setChatSetting\(root, 'sandbox', sandboxCtx\.enabled\)/, '/sandbox persists the flip');
   assert.match(repl, /dockerProfile\(\{ root \}\)/, '/sandbox profile prints the strong option');
   const local = fs.readFileSync(new URL('../src/tools/local.js', import.meta.url), 'utf8');

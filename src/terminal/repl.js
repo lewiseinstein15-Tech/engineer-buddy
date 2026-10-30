@@ -29,6 +29,7 @@ import { loadPermissions, evaluatePermission } from '../permissions.js';
 import { loadSkills } from '../skills/loader.js';
 import { buildExitPlanTool, listPlans, PLANS_DIR } from '../tools/planmode.js';
 import { listCheckpoints, restoreCheckpoint } from '../agent/checkpoints.js';
+import { resolveLspSetting, validateLspServers } from '../agent/lsp.js';
 import { buildRepoMap, createRepoMapProvider } from '../agent/repomap.js';
 import { HookRunner } from '../hooks.js';
 import { connectMcpServers, buildMcpTools, describeMcpServers, MCP_CONFIG_PATH } from '../tools/mcp.js';
@@ -232,7 +233,7 @@ export function formatDiffReport({ status = '', stat = '', diff = '', gitFailed 
 
 // ── Session factory ──────────────────────────────────────────────────────────
 
-async function makeScopeAndTools({ root, router = null, onEvent = () => {}, approval = null, modes = null, onPlanApproved = () => {}, routing = null } = {}) {
+export async function makeScopeAndTools({ root, router = null, onEvent = () => {}, approval = null, modes = null, onPlanApproved = () => {}, routing = null } = {}) {
   // Multi-root workspace (v0.26.0): permissions.additionalDirectories from
   // user + project settings become alias-addressable roots ("alias/path").
   const extraRoots = buildExtraRoots(root);
@@ -251,7 +252,29 @@ async function makeScopeAndTools({ root, router = null, onEvent = () => {}, appr
   // reads it on every call; /sandbox flips the same object mid-session.
   const sandbox = makeSandboxContext(root);
   sandbox.enabled = getChatSetting(root, 'sandbox', false) === true;
-  const base = [...buildLocalTools({ scope, todoState, sandbox }), ...buildWebTools(), buildHttpTool({ reporters }), ...buildBackgroundTools({ shells })];
+  // LSP default-on (v0.62.0 — the capability audit's gap #6): the chat.lsp
+  // knob is read HERE, at the one assembly point every surface shares
+  // (REPL, one-shot, channels) — before this wave the tools' error message
+  // cited `chat.lsp: false` while no code path parsed it (a lying knob).
+  // absent → on; false|'off' → off; junk → NAMED, on holds; an object
+  // shape carries chat.lsp.servers overrides (validated, junk NAMED).
+  const lspInfo = (() => {
+    try {
+      const raw = getChatSetting(root, 'lsp', undefined);
+      const setting = resolveLspSetting(raw);
+      const notes = setting.note ? [setting.note] : [];
+      let servers = null;
+      if (setting.on && raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        const v = validateLspServers(raw.servers);
+        servers = v.servers;
+        notes.push(...v.notes);
+      }
+      return { on: setting.on, notes, servers };
+    } catch {
+      return { on: true, notes: [], servers: null }; // settings unreadable — the default holds
+    }
+  })();
+  const base = [...buildLocalTools({ scope, todoState, sandbox, lspEnabled: lspInfo.on, lspServers: lspInfo.servers }), ...buildWebTools(), buildHttpTool({ reporters }), ...buildBackgroundTools({ shells })];
   // gh tool (v0.35.0): GitHub/GitLab over REST with the user's env token —
   // PR/MR ops + CI status; provider auto-detected from the origin remote.
   const ghTool = buildGhTool({ root });
@@ -288,7 +311,7 @@ async function makeScopeAndTools({ root, router = null, onEvent = () => {}, appr
     extraNames: new Set([...base, ghTool, taskTool, skillTool, ...mcpTools, ...(exitPlanTool ? [exitPlanTool] : [])].map((t) => t.name)),
   });
   const tools = [...base, ghTool, taskTool, skillTool, ...(exitPlanTool ? [exitPlanTool] : []), ...mcpTools, ...userTools];
-  return { scope, tools, todoState, mcp, shells, skills, userToolWarnings, extraRoots, reporters, sandbox, plugins: installedPlugins, pluginWarnings };
+  return { scope, tools, todoState, mcp, shells, skills, userToolWarnings, extraRoots, reporters, sandbox, plugins: installedPlugins, pluginWarnings, lsp: lspInfo };
 }
 
 function makeHarness(root, recencyTexts = null) {
@@ -315,7 +338,7 @@ function makeHarness(root, recencyTexts = null) {
 
 /** Create a chat session bound to a workspace root. */
 export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {}, repoMap = null, effort = null, streaming = null, onStream = null, routing = null } = {}) {
-  const { tools, todoState, mcp, shells, skills, userToolWarnings, scope, extraRoots, reporters, sandbox, plugins: installedPlugins, pluginWarnings } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved, routing });
+  const { tools, todoState, mcp, shells, skills, userToolWarnings, scope, extraRoots, reporters, sandbox, plugins: installedPlugins, pluginWarnings, lsp: lspInfo } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved, routing });
   const recencyLessonTexts = recentLessons(root); // read ONCE — same list the harness block and the task-level recall exclude-set see
   const harness = makeHarness(root, recencyLessonTexts).hctx;
   // Hooks: the deterministic guarantee layer (.buddy/settings.json). One
@@ -623,6 +646,23 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   } catch {
     workspaceWatch = null; // a watcher that cannot start never breaks the session
   }
+  // LSP default-on (v0.62.0 — the capability audit's gap #6): an honest
+  // startup line only — the REAL wiring happened in makeScopeAndTools (the
+  // one assembly point). Off is stated, junk is named, servers that are
+  // missing stay silent until a tool call names them (honest absence lives
+  // in the connection, not in startup noise).
+  try {
+    const lspRaw = config?.chat?.lsp !== undefined ? config?.chat?.lsp : getChatSetting(root, 'lsp', undefined);
+    const lspSetting = resolveLspSetting(lspRaw);
+    if (lspSetting.note) console.log(c.yellow(`  ⚠ ${lspSetting.note}`));
+    if (!lspSetting.on) console.log(c.dim('  ↳ LSP off (chat.lsp: false) — lsp_* tools removed, no post-edit diagnostics'));
+    else if (lspSetting.on && lspRaw && typeof lspRaw === 'object' && !Array.isArray(lspRaw)) {
+      const v = validateLspServers(lspRaw.servers);
+      for (const n of v.notes) console.log(c.yellow(`  ⚠ ${n}`));
+      const overrideCount = Object.keys(v.servers).length;
+      if (overrideCount) console.log(c.dim(`  ↳ LSP on (default) · ${overrideCount} server override${overrideCount === 1 ? '' : 's'} from chat.lsp.servers`));
+    }
+  } catch { /* the startup line never breaks the session */ }
   let busyLabel = null;
   let approvalDeny = null;
   let qToken = 0;

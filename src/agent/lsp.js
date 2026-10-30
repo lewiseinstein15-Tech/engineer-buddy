@@ -15,6 +15,21 @@
 // Honest scope: definition/references/diagnostics/didOpen/didChange are the
 // supported surface. Completions and rename stay open (small free models
 // rarely benefit; the regex index already navigates).
+//
+// v0.62.0 (the capability audit's gap #6 — LSP default-on): the knob
+// becomes REAL. `chat.lsp` in .buddy/settings.json now actually controls
+// every surface (before this, the setting was parsed nowhere and the
+// tools' own error message cited a config path that could not do what it
+// claimed — a lying knob). Rules mirror chat.workspaceWatch (v0.60):
+//   absent | true            → on (the default)
+//   false | 'off' | 'false'  → off (lsp_* tools removed, no post-edit
+//                              diagnostics, no spawn is ever attempted)
+//   anything else            → junk: NAMED, not applied, default (on) holds
+// plus per-language server overrides:
+//   chat.lsp.servers: { "rs": ["rust-analyzer"], "js": ["/path/ls", "--stdio"] }
+// an override ADDS an extension not in the default map or REPLACES the
+// default command for a known one. Junk shapes are NAMED per-entry and the
+// default applies — one bad entry never vetoes the good ones.
 import { spawn, spawnSync } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -34,6 +49,93 @@ const LANG_ID = { js: 'javascript', jsx: 'javascript', ts: 'typescript', tsx: 't
 
 let nextId = 1;
 
+/** Safe property read: a throwing getter is junk, never a crash. */
+function safeGet(obj, key) {
+  try { return obj == null ? undefined : obj[key]; } catch { return undefined; }
+}
+
+function plainObject(v) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null; // Map/class instances are not config shapes
+}
+
+/**
+ * Resolve the chat.lsp value (v0.62.0). Mirrors resolveWatchSetting:
+ * junk is NAMED and the default (on) applies.
+ * @returns {{on: boolean, note: string|null}}
+ */
+export function resolveLspSetting(v) {
+  if (v === undefined || v === null || v === true) return { on: true, note: null };
+  if (v === false || v === 'off' || v === 'false') return { on: false, note: null };
+  if (plainObject(v)) {
+    // An object shape is a config (e.g. { servers: {...} }) — LSP stays on;
+    // the servers inside are validated separately by validateLspServers.
+    return { on: true, note: null };
+  }
+  let shown = '?';
+  try { shown = sanitizeLspText(JSON.stringify(String(v)).slice(0, 60)); } catch { /* keep '?' */ }
+  return { on: true, note: `chat.lsp: ${shown} is junk — NAMED, not applied; LSP stays on (false | 'off' turns it off)` };
+}
+
+const EXT_KEY_RE = /^[a-z][a-z0-9]{0,7}$/;
+const MAX_SERVER_OVERRIDES = 16;
+const MAX_CMD_PARTS = 8;
+
+/**
+ * Validate chat.lsp.servers (v0.62.0): one object whose values are
+ * non-empty arrays of non-empty strings (command + args). Every junk
+ * entry is NAMED and skipped — the defaults cover the rest. Extension
+ * keys must match /^[a-z][a-z0-9]{0,7}$/ (this also refuses
+ * __proto__/constructor-style keys, so a hostile settings file cannot
+ * grow the prototype chain through the override door).
+ * @returns {{servers: Object<string,string[]>, notes: string[]}}
+ */
+export function validateLspServers(raw) {
+  const servers = {};
+  const notes = [];
+  if (raw === undefined || raw === null) return { servers, notes };
+  if (!plainObject(raw)) {
+    let shown = '?';
+    try { shown = sanitizeLspText(JSON.stringify(String(raw)).slice(0, 60)); } catch { /* keep '?' */ }
+    notes.push(`chat.lsp.servers: ${shown} is not an object — NAMED, ignored; the default servers apply`);
+    return { servers, notes };
+  }
+  let keys;
+  try { keys = Object.keys(raw); } catch { return { servers, notes: [...notes, 'chat.lsp.servers: unreadable — NAMED, ignored'] }; }
+  let accepted = 0;
+  for (const key of keys) {
+    if (accepted >= MAX_SERVER_OVERRIDES) {
+      notes.push(`chat.lsp.servers: more than ${MAX_SERVER_OVERRIDES} entries — the rest are NAMED and ignored`);
+      break;
+    }
+    if (typeof key !== 'string' || !EXT_KEY_RE.test(key)) {
+      notes.push(`chat.lsp.servers.${sanitizeLspText(String(key).slice(0, 20))}: not a file extension — NAMED, ignored (use e.g. "ts", "py", "rs")`);
+      continue;
+    }
+    const arr = safeGet(raw, key);
+    if (!Array.isArray(arr) || arr.length === 0 || arr.length > MAX_CMD_PARTS) {
+      notes.push(`chat.lsp.servers.${key}: command must be a non-empty array of strings (max ${MAX_CMD_PARTS} parts) — NAMED, ignored`);
+      continue;
+    }
+    let ok = true;
+    const cmd = [];
+    for (const part of arr) {
+      let s;
+      try { s = typeof part === 'string' ? part : String(part); } catch { ok = false; break; }
+      if (typeof part !== 'string' || !s.trim() || s.length > 256) { ok = false; break; } // a 1e6-char arg is an E2BIG at spawn time — refuse here
+      cmd.push(s);
+    }
+    if (!ok) {
+      notes.push(`chat.lsp.servers.${key}: every command part must be a non-empty string (max 256 chars) — NAMED, ignored`);
+      continue;
+    }
+    servers[key] = cmd;
+    accepted += 1;
+  }
+  return { servers, notes };
+}
+
 function encode(message) {
   const body = Buffer.from(message, 'utf8');
   return Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, 'utf8'), body]);
@@ -44,11 +146,13 @@ function encode(message) {
  * binary is a clean `available:false`, never a crash.
  */
 export class LspConnection {
-  constructor(root, ext, { timeoutMs = 10000 } = {}) {
+  constructor(root, ext, { timeoutMs = 10000, cmd = null } = {}) {
     this.root = root;
     this.ext = ext;
-    this.lang = LANG_ID[ext] || 'javascript';
-    this.cmd = SERVER_FOR_EXT[ext] || null;
+    this.lang = LANG_ID[ext] || 'plaintext';
+    // cmd override (v0.62.0): a validated chat.lsp.servers entry replaces
+    // the default command for this extension; null falls back to the map.
+    this.cmd = Array.isArray(cmd) && cmd.length ? [...cmd] : SERVER_FOR_EXT[ext] || null;
     this.timeoutMs = timeoutMs;
     this.child = null;
     this.buffer = Buffer.alloc(0);
@@ -129,15 +233,23 @@ export class LspConnection {
       const header = this.buffer.slice(0, headerEnd).toString('utf8');
       const m = /Content-Length:\s*(\d+)/i.exec(header);
       if (!m) {
-        this.buffer = this.buffer.slice(headerEnd + 4);
+        this._resync(headerEnd + 4); // header without a usable Content-Length — search after it
         continue;
       }
       const len = Number(m[1]);
+      if (!Number.isFinite(len) || len < 0 || len > LspConnection.MAX_FRAME_BYTES) {
+        this._resync(headerEnd + 4); // hostile claimed length — search after it
+        continue;
+      }
+      if (this.buffer.length > LspConnection.MAX_FRAME_BYTES) {
+        this.buffer = Buffer.alloc(0); // unbounded-growth guard
+        continue;
+      }
       if (this.buffer.length < headerEnd + 4 + len) return; // body not here yet
       const body = this.buffer.slice(headerEnd + 4, headerEnd + 4 + len).toString('utf8');
       this.buffer = this.buffer.slice(headerEnd + 4 + len);
       let msg = null;
-      try { msg = JSON.parse(body); } catch { continue; }
+      try { msg = JSON.parse(body); } catch { this._resync(); continue; } // a body that lied about its own framing
       if (msg?.method === 'textDocument/publishDiagnostics') {
         this.diagnostics.set(msg.params?.uri, msg.params?.diagnostics || []);
       } else if (msg?.id !== undefined && msg?.id !== null) {
@@ -150,6 +262,28 @@ export class LspConnection {
         }
       }
     }
+  }
+
+  // A claimed Content-Length larger than any real frame is hostile — without
+  // a cap it wedges the connection (the parser waits for a 1e9-byte body)
+  // and grows the buffer without bound. Over the cap: resync at the next
+  // header (frames are independent; the next valid one carries its own).
+  static MAX_FRAME_BYTES = 10 * 1024 * 1024;
+
+  /**
+   * Lost-framing recovery (v0.62.0 red-team catch): a short-claimed length
+   * (or an unparseable body) leaves residue in the buffer, and the next
+   * VALID frame appended after it desyncs the stream forever. Resync scans
+   * forward to the next plausible header start — every frame carries
+   * 'Content-Length:' as its first header field, so a live server is found;
+   * a dead one is bounded by the request timeouts, never a hang.
+   */
+  _resync(after = 0) {
+    const s = this.buffer.toString('latin1');
+    const hay = after > 0 ? s.slice(after) : s;
+    const m = /content-length:/i.exec(hay);
+    this.buffer = Buffer.alloc(0);
+    if (m) this.buffer = Buffer.from(s.slice(after + m.index), 'latin1');
   }
 
   request(method, params = {}, timeoutMs = this.timeoutMs) {
@@ -233,7 +367,11 @@ export class LspConnection {
     const uri = `file://${abs}`;
     await this.open(rel);
     // A change nudges the server to re-publish even if it cached the doc.
-    const text = fs.readFileSync(abs, 'utf8').split('\n');
+    // An unreadable file (missing, deleted mid-flight, unreadable perms) is
+    // honest empty — never a throw out of the hub (v0.62.0 red-team catch:
+    // the ENOENT escaped this function and rejected the caller).
+    let text;
+    try { text = fs.readFileSync(abs, 'utf8').split('\n'); } catch { return this.diagnostics.get(uri) || []; }
     this.notify('textDocument/didChange', {
       textDocument: { uri, version: Date.now() },
       contentChanges: [{ text: text.join('\n') }],
@@ -256,9 +394,11 @@ export class LspConnection {
   }
 }
 
-/** Which extension a path maps to (null = no language server support). */
+/** Which extension a path maps to under the DEFAULT map (null = unsupported).
+ * Kept for back-compat — surfaces that hold a hub should prefer hub.extFor,
+ * which honors chat.lsp.servers overrides. */
 export function lspExtFor(rel) {
-  const ext = path.extname(rel).slice(1).toLowerCase();
+  const ext = path.extname(String(rel || '')).slice(1).toLowerCase();
   return SERVER_FOR_EXT[ext] ? ext : null;
 }
 
@@ -267,22 +407,46 @@ export function lspExtFor(rel) {
  * first use, cached. `status()` lists what is live / missing (for /context
  * or the /tools footer).
  */
-export function createLspHub(root) {
+export function createLspHub(root, { servers = {} } = {}) {
+  // The merged extension map (v0.62.0): validated overrides REPLACE the
+  // default command for a known extension or ADD a new one. Everything the
+  // hub routes by — get(), extFor(), status() — reads this map, so an
+  // override is honored on every path (before this, override-shaped
+  // config could not have reached the hub at all).
+  const merged = { ...SERVER_FOR_EXT };
+  if (servers && typeof servers === 'object' && !Array.isArray(servers)) {
+    for (const [ext, cmd] of Object.entries(servers)) {
+      if (EXT_KEY_RE.test(ext) && Array.isArray(cmd) && cmd.length) merged[ext] = [...cmd];
+    }
+  }
   const conns = new Map(); // ext -> LspConnection
   let probe = null; // memoized availability report
   const get = (ext) => {
-    if (!conns.has(ext)) conns.set(ext, new LspConnection(root, ext));
+    if (!conns.has(ext)) conns.set(ext, new LspConnection(root, ext, { cmd: merged[ext] }));
     return conns.get(ext);
   };
+  const extFor = (rel) => {
+    try {
+      const e = path.extname(String(rel || '')).slice(1).toLowerCase();
+      return merged[e] ? e : null;
+    } catch {
+      return null; // a hostile path value (throwing toString) is unsupported, never a crash
+    }
+  };
+  const extLabel = (rel) => {
+    try { return `.${path.extname(String(rel || '')).slice(1) || '?'}`; } catch { return '(unreadable path)'; }
+  };
   const hub = {
-    async definition(rel, line, char) { return get(lspExtFor(rel)).definition(rel, line, char); },
-    async references(rel, line, char, opts) { return get(lspExtFor(rel)).references(rel, line, char, opts); },
-    async diagnosticsFor(rel, opts) { return get(lspExtFor(rel)).diagnosticsFor(rel, opts); },
+    /** Extension for a path under the MERGED map (null = unsupported). */
+    extFor,
+    async definition(rel, line, char) { const e = extFor(rel); return e ? get(e).definition(rel, line, char) : Promise.reject(new Error(`no language server known for ${extLabel(rel)} — set one under chat.lsp.servers`)); },
+    async references(rel, line, char, opts) { const e = extFor(rel); return e ? get(e).references(rel, line, char, opts) : Promise.reject(new Error(`no language server known for ${extLabel(rel)} — set one under chat.lsp.servers`)); },
+    async diagnosticsFor(rel, opts) { const e = extFor(rel); return e ? get(e).diagnosticsFor(rel, opts) : Promise.resolve([]); },
     status() {
       if (!probe) {
         const present = [];
         const missing = [];
-        for (const [ext, cmd] of Object.entries(SERVER_FOR_EXT)) {
+        for (const [ext, cmd] of Object.entries(merged)) {
           try {
             const r = spawnSync(cmd[0], ['--version'], { timeout: 2000 });
             if (r.status === 0) present.push(ext);
@@ -300,13 +464,34 @@ export function createLspHub(root) {
   return hub;
 }
 
+/**
+ * Server-supplied text is DATA (v0.62.0): the chat.lsp.servers override
+ * door can point at ANY binary, so a hostile language server is a real
+ * surface. Whole ANSI/OSC sequences are stripped (an unterminated sequence
+ * swallows to its terminator, the next ESC, or end-of-string — the
+ * v0.55/v0.61 lesson carried to the LSP plane), control bytes dropped
+ * (tab and newline survive), visible words survive — a hostile diagnostic
+ * cannot paint a terminal or smuggle line machinery into an observation.
+ */
+export function sanitizeLspText(s) {
+  let t;
+  try { t = String(s ?? ''); } catch { t = '?'; } // a toString bomb is data, never a crash
+  // eslint-disable-next-line no-control-regex
+  return t
+    .replace(/\u001B\][^\u0007]*?(?:\u0007|\u001B\\|(?=\u001B)|$)/g, '')
+    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\u001B\[[0-?]*[ -/]*$/g, '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, ''); // keep \t (\u0009) and \n (\u000A)
+}
+
 /** Render LSP diagnostic items into a model-friendly capped string. */
 export function formatDiagnostics(items, rel, { maxItems = 12 } = {}) {
   if (!items.length) return '';
   const sev = (s) => (s === 1 ? 'error' : s === 2 ? 'warning' : 'info');
   const lines = items.slice(0, maxItems).map((d) => {
     const pos = d.range?.start ? `${(d.range.start.line ?? 0) + 1}:${(d.range.start.character ?? 0) + 1}` : '?';
-    return `  ${rel}:${pos} ${sev(d.severity)}: ${truncate(String(d.message || ''), 200).replace(/\n+/g, ' ')}`;
+    return `  ${rel}:${pos} ${sev(d.severity)}: ${truncate(sanitizeLspText(d.message || ''), 200).replace(/\n+/g, ' ')}`;
   });
   const more = items.length > maxItems ? `\n  … +${items.length - maxItems} more` : '';
   return `${lines.join('\n')}${more}`;

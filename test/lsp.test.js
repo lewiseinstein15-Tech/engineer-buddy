@@ -106,7 +106,12 @@ test('tools: lsp_* degrade with honest errors when no server; disabled mode', as
   const out = await tools.lsp_goto_def.run({ path: 'src/app.js', line: 1, column: 1 });
   assert.match(out, /unavailable|install|timed out/i);
   const off = Object.fromEntries(buildLocalTools({ scope, lspEnabled: false }).map((t) => [t.name, t]));
-  assert.match(await off.lsp_diagnostics.run({ path: 'src/app.js' }), /LSP disabled/);
+  // v0.62.0: chat.lsp:false REMOVES the lsp_* tools from the registry
+  // entirely (a removed tool can never be called — stronger than the old
+  // run-time 'ERROR: LSP disabled' refusal, which teased a dead door).
+  assert.equal(off.lsp_diagnostics, undefined);
+  assert.equal(off.lsp_goto_def, undefined);
+  assert.equal(off.lsp_refs, undefined);
 });
 
 test('edits still work with LSP enabled (diagnostics ride along silently)', async () => {
