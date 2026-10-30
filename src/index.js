@@ -27,6 +27,8 @@ import { runDepAudit } from './skills/dep-auditor.js';
 import { runIssueTriage } from './skills/issue-triage.js';
 import { runReleaseNotes } from './skills/release-notes.js';
 import { startRepl, runOneShot, VERSION } from './terminal/repl.js';
+import { runAutonomous, detectVerifyCmd, planPrompt, focusPrompt, runVerify } from './agent/orchestrator.js';
+import { appendEvent } from './eventslog.js';
 import { cmdUpdate } from './update.js';
 import { latestSession, findSession } from './session.js';
 import { importSession } from './session.js';
@@ -48,6 +50,12 @@ function usage() {
 Local coding agent (Buddy Code — like Claude Code, in your terminal):
   engineer-buddy                        interactive session in the current directory
   engineer-buddy -p "task"              one-shot autonomous task (add --safe to deny writes)
+  engineer-buddy run-auto "task"        run-until-done (v0.58.0): plan once (todo v2), then
+                                        pick the next ready item → ONE focused turn → verify
+                                        (npm test, or --verify-cmd) → mark done/blocked → repeat,
+                                        until the plan is finished or --max-turns is spent
+                                        (default 25). An existing .buddy/todo.json is ADOPTED —
+                                        a resumed run continues where it stopped.
   engineer-buddy --worktree             isolate the run in its own git worktree
                                         (.buddy/worktrees/<slug>, branch buddy/<slug> —
                                         your dirty tree stays untouched; the tree is kept
@@ -1137,6 +1145,110 @@ async function cmdGoals(argv) {
   }
 }
 
+// cmdRunAuto — v0.58.0 `run-auto`: the capability audit's gap #1. One
+// command, a whole plan: plan once (or ADOPT the persisted .buddy/todo.json),
+// then pick the next ready item → ONE focused turn (the real runOneShot —
+// same router, same tools, same approval policy as `buddy -p`) → verify with
+// the operator's declared command (npm test by default) → mark done or
+// blocked → repeat until finished or the turn budget is spent. Every step
+// is a bounded fact on stderr AND in .buddy/events.jsonl.
+async function cmdRunAuto(argv) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: {
+      p: { type: 'string' },
+      'max-turns': { type: 'string' },
+      'verify-cmd': { type: 'string' },
+      'verify-timeout-ms': { type: 'string' },
+      safe: { type: 'boolean', default: false },
+      yolo: { type: 'boolean', default: false },
+      quiet: { type: 'boolean', default: false },
+      config: { type: 'string' },
+      dir: { type: 'string' },
+    },
+    allowPositionals: true,
+  });
+  const task = values.p || positionals.join(' ');
+  if (!task || !task.trim()) {
+    console.error('buddy: run-auto needs a task — buddy run-auto "make the failing test pass"');
+    return 2;
+  }
+  const cfg = loadConfig({ file: values.config });
+  const root = values.dir ? path.resolve(values.dir) : process.cwd();
+  const maxTurns = Number.parseInt(values['max-turns'] ?? '', 10);
+  const verifyTimeoutMs = Number.parseInt(values['verify-timeout-ms'] ?? '', 10);
+  const budget = Number.isFinite(maxTurns) && maxTurns >= 1 && maxTurns <= 100 ? maxTurns : 25;
+  const vTimeout = Number.isFinite(verifyTimeoutMs) && verifyTimeoutMs >= 1000 ? verifyTimeoutMs : 300000;
+  const verify = detectVerifyCmd(root, values['verify-cmd'] || null);
+
+  console.error(`buddy run-auto — run-until-done (v${VERSION})`);
+  console.error(`  task    : ${truncate(task, 100)}`);
+  console.error(`  root    : ${root}`);
+  console.error(`  budget  : ${budget} turns · verify: ${verify ?? '(none declared — a finished turn is accepted)'}`);
+  console.error(`  plan    : .buddy/todo.json — an existing plan is ADOPTED, a fresh one is planned\n`);
+
+  let lastVerifyTail = '';
+  const router = buildRouter(cfg); // ONE carrier for the whole run — the
+  // latency EMA, the pin and the effort ref stay shared across turns (the
+  // v0.56 contract: REPL, one-shots and sub-agents share one object).
+  const out = await runAutonomous({
+    root,
+    task,
+    maxTurns: budget,
+    verifyCmd: values['verify-cmd'] || null,
+    verifyTimeoutMs: vTimeout,
+    runOneTurn: async ({ phase, task: t, focus, turn }) => {
+      const text = phase === 'plan' ? planPrompt(t, verify) : focusPrompt(t, focus, verify);
+      if (phase === 'plan') console.error(`  [turn ${turn}] PLANNING — ask for the todo v2 plan, nothing else`);
+      else console.error(`  [turn ${turn}] FOCUS #${focus.id} — ${truncate(String(focus.text), 80)}`);
+      const r = await runOneShot({
+        router,
+        root,
+        task: text,
+        safe: Boolean(values.safe),
+        yolo: Boolean(values.yolo),
+        quiet: Boolean(values.quiet),
+        config: cfg,
+        outputFormat: 'text',
+      });
+      return { ok: Boolean(r?.said) };
+    },
+    runVerifyCmd: async (cmd) => {
+      console.error(`  [verify] ${cmd}`);
+      const v = runVerify(root, cmd, vTimeout);
+      lastVerifyTail = v.tail || '';
+      console.error(`  [verify] exit ${v.exitCode} in ${(v.durationMs / 1000).toFixed(1)}s — ${v.ok ? 'GREEN' : 'RED'}`);
+      return v;
+    },
+    onEvent: (ev) => {
+      if (ev.type === 'orchestratorPlan') console.error(`  [plan] ${ev.mode}${ev.items ? ` — ${ev.items} item(s)` : ''}`);
+      if (ev.type === 'orchestratorBlocked') {
+        console.error(`  [blocked] #${ev.focus} — ${ev.reason}`);
+        if (lastVerifyTail) {
+          const tail = lastVerifyTail.trim().split('\n').slice(-4).map((l) => `      │ ${l}`).join('\n');
+          console.error(`      verify tail (last 4 lines):\n${tail}`);
+          lastVerifyTail = '';
+        }
+      }
+      try {
+        appendEvent(root, { ...ev, cmdLine: 'run-auto' });
+      } catch {
+        /* the audit trail is best effort at the edges — never break the loop */
+      }
+    },
+  });
+
+  const s = out.summary;
+  console.error(`\nbuddy run-auto — ${s.plannedBy} plan: ${s.planned} item(s) · ${s.turns}/${s.maxTurns} turns · ${(s.durationMs / 1000).toFixed(1)}s`);
+  for (const it of out.items) {
+    const mark = it.status === 'done' ? '✔' : it.status === 'in_progress' ? '~' : '✘';
+    console.error(`  ${mark} #${it.id} ${truncate(String(it.text), 72)}${it.notes ? `  (${it.notes})` : ''}`);
+  }
+  console.error(`  done ${s.done} · blocked ${s.blocked} · remaining ${s.remaining} · verify: ${s.verifyCmd ?? 'none'}`);
+  console.error(`  facts : .buddy/events.jsonl (orchestrator*) · plan: .buddy/todo.json`);
+  return s.blocked === 0 && s.remaining === 0 ? 0 : 1;
+}
+
 async function main() {
   const [cmd, ...argv] = process.argv.slice(2);
   try {
@@ -1145,6 +1257,7 @@ async function main() {
       return 0;            // quitting happens in the REPL's own close handler ("bye" + exit 0)
     }
     if (cmd === '-p' || cmd === '--prompt' || cmd === 'run') process.exit(await cmdChat(argv, { oneShot: true }));
+    if (cmd === 'run-auto') process.exit(await cmdRunAuto(argv));
     // Flags-first invocations (e.g. `buddy -c -p "task"`, `buddy -r name`, `buddy --safe -p "…"`)
     // used to fall through to usage() because argv[0] isn't a command word. Route the FULL
     // arg vector to cmdChat — its own parser + TTY detection decide one-shot vs interactive.
