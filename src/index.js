@@ -56,6 +56,9 @@ Local coding agent (Buddy Code — like Claude Code, in your terminal):
                                         until the plan is finished or --max-turns is spent
                                         (default 25). An existing .buddy/todo.json is ADOPTED —
                                         a resumed run continues where it stopped.
+  engineer-buddy watch [--json]         watch the workspace (v0.60.0): coalesced change rows
+                                        (path + kind — facts only, files are never read);
+                                        --debounce ms / --max-events n tune the bounds; Ctrl+C stops
   engineer-buddy --worktree             isolate the run in its own git worktree
                                         (.buddy/worktrees/<slug>, branch buddy/<slug> —
                                         your dirty tree stays untouched; the tree is kept
@@ -1114,6 +1117,64 @@ async function cmdGoals(argv) {
   }
 }
 
+// cmdWatch — v0.60.0 `buddy watch`: the background workspace watcher as a
+// standalone CLI (the capability audit's gap #4, the surface for scripts and
+// CI). Prints coalesced change rows — path + kind, FACTS ONLY (the file is
+// never opened, the drill proves a canary body stays in zero bytes) — until
+// Ctrl+C. --json emits one JSON object per row; junk flag values degrade to
+// the watcher's own clamps (junk in, bounded budget out, named on stderr).
+async function cmdWatch(argv) {
+  const { startWorkspaceWatcher } = await import('./watch/watcher.js');
+  let json = false;
+  let debounceMs = 400;
+  let maxEvents = 512;
+  const rest = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--json') json = true;
+    else if (a === '--debounce') debounceMs = Number(argv[++i]);
+    else if (a === '--max-events') maxEvents = Number(argv[++i]);
+    else if (a === '-h' || a === '--help') {
+      console.error('buddy watch [--json] [--debounce ms] [--max-events n] [dir] — watch a workspace; Ctrl+C to stop');
+      return 2;
+    } else rest.push(a);
+  }
+  const root = path.resolve(rest.length && typeof rest[0] === 'string' && rest[0] ? rest[0] : process.cwd());
+  const w = startWorkspaceWatcher(root, {
+    debounceMs,
+    maxEvents,
+    onFlush: ({ rows, suppressed }) => {
+      try {
+        for (const r of rows) {
+          if (json) process.stdout.write(`${JSON.stringify({ at: new Date(r.at).toISOString(), path: r.path, kind: r.kind })}\n`);
+          else console.log(`  ${new Date(r.at).toLocaleTimeString()}  ${r.kind === 'rename' ? 'create/remove' : 'modify      '}  ${r.path}`);
+        }
+        if (suppressed) console.log(`  ... +${suppressed} more suppressed (the drift cap)`);
+      } catch {
+        /* the printer can never take the watcher down */
+      }
+    },
+  });
+  if (!w.started) {
+    console.error(`buddy watch: ${w.reason}`);
+    return 2;
+  }
+  console.error(`buddy watch — ${root}`);
+  console.error('  fs.watch recursive · facts only (path + kind, files are never read) · Ctrl+C to stop');
+  process.on('SIGINT', () => {
+    const s = w.stats;
+    console.error(`\nbuddy watch — stopped · events=${s.eventsSeen} suppressed=${s.suppressed}`);
+    w.stop();
+    process.exit(0);
+  });
+  process.on('SIGTERM', () => {
+    w.stop();
+    process.exit(0);
+  });
+  await new Promise(() => {}); // run until signalled — a watcher is a long-running surface
+  return 0;
+}
+
 // cmdRunAuto — v0.58.0 `run-auto`: the capability audit's gap #1. One
 // command, a whole plan: plan once (or ADOPT the persisted .buddy/todo.json),
 // then pick the next ready item → ONE focused turn (the real runOneShot —
@@ -1227,6 +1288,7 @@ async function main() {
     }
     if (cmd === '-p' || cmd === '--prompt' || cmd === 'run') process.exit(await cmdChat(argv, { oneShot: true }));
     if (cmd === 'run-auto') process.exit(await cmdRunAuto(argv));
+    if (cmd === 'watch') process.exit(await cmdWatch(argv));
     // Flags-first invocations (e.g. `buddy -c -p "task"`, `buddy -r name`, `buddy --safe -p "…"`)
     // used to fall through to usage() because argv[0] isn't a command word. Route the FULL
     // arg vector to cmdChat — its own parser + TTY detection decide one-shot vs interactive.

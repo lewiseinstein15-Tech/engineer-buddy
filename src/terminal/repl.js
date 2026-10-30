@@ -37,6 +37,7 @@ import { HARNESS_DIR } from '../harness/defaults.js';
 import { SessionRecorder, listSessions, loadSession, sessionInfo, resumeMessages, writeExport, latestSession, findSession, renameSession, forkSession, writeHtmlExport, importSession } from '../session.js';
 import { reflect, recentLessons, experiencePath } from '../learn.js';
 import { recallLessons, recallBlockText, lessonsIndexText, lessonsRecallText } from '../lessons.js';
+import { startWorkspaceWatcher, drainDriftForTurn, resolveWatchSetting } from '../watch/watcher.js';
 import { c, PALETTE, logoBanner, spinner, renderToolCall, renderToolEvent, renderTodo, renderTable, formatMs, renderContextBar, setTheme, themeNames, currentTheme } from './ui.js';
 import { osc52, resolveCopyRef, formatCopyTable, copyFits, fmtBytes, CARDS } from './toolcards.js';
 import { detectTerminal, setupSteps, NO_SETUP } from './termkeys.js';
@@ -604,6 +605,24 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   let busy = false;
   let aborter = null;
   let msgQueue = []; // messages typed while a turn runs (Claude Code queueing)
+  // Workspace watcher (v0.60.0 — the capability audit's gap #4): what moved
+  // in the workspace BETWEEN turns surfaces as a bounded data fence at the
+  // next turn start. The OS watch is PAUSED for the whole duration of a
+  // turn (resumed in the turn's finally), so the agent's own writes can
+  // never echo back into its context. chat.workspaceWatch: false|'off'
+  // kills it; junk values are NAMED and the default (on) applies.
+  let workspaceWatch = null;
+  try {
+    const watchSetting = resolveWatchSetting(config?.chat?.workspaceWatch);
+    if (watchSetting.note) console.log(c.yellow(`  ⚠ ${watchSetting.note}`));
+    if (watchSetting.on) {
+      workspaceWatch = startWorkspaceWatcher(root);
+      if (workspaceWatch.started) console.log(c.dim('  ↳ watching the workspace between turns (facts only: paths + kinds, files are never read · chat.workspaceWatch: false turns this off)'));
+      else console.log(c.dim(`  ↳ workspace watcher not running (honest reason: ${workspaceWatch.reason})`));
+    }
+  } catch {
+    workspaceWatch = null; // a watcher that cannot start never breaks the session
+  }
   let busyLabel = null;
   let approvalDeny = null;
   let qToken = 0;
@@ -2695,6 +2714,20 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         /* recall is additive — a failure here never blocks the turn */
       }
     }
+    // Workspace drift (v0.60.0): what moved BETWEEN turns, drained once per
+    // submitted line. Mid-turn the watch is PAUSED, so a queued message
+    // drains nothing — the fence only ever speaks for the quiet window.
+    // The block is DATA (paths + counts, content never read) and sits above
+    // the task; the workspaceDrift fact row carries the same bounded facts.
+    try {
+      const drift = drainDriftForTurn(workspaceWatch, root);
+      if (drift) {
+        effective = `${drift.block}\n\n${effective}`;
+        say(`  ${c.cyan('↳ workspace drift')} ${c.dim(`${drift.count} file${drift.count === 1 ? '' : 's'} changed between turns${drift.suppressed ? ` · +${drift.suppressed} suppressed` : ''}`)}`);
+      }
+    } catch {
+      /* drift can never break a turn */
+    }
     if (busy) {
       msgQueue.push({ text: inputText });
       if (bg) {
@@ -2828,6 +2861,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     } finally {
       aborter = null;
       busy = false;
+      try { workspaceWatch?.resume(); } catch { /* the watch resumes best-effort */ }
       rl.prompt();
     }
   }
