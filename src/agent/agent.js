@@ -106,7 +106,7 @@ export async function runAgent({ router, tools, systemPrompt, messages, maxSteps
       };
       const wireCut = (r) => r?.truncated === true || looksTruncatedJson(r?.text);
       const TRUNCATION_MSG =
-        'PROTOCOL ERROR: your reply was CUT OFF by the output token limit before the JSON closed — the payload did not fit in one reply. Do NOT rewrite the same big payload. Respond again with EXACTLY ONE complete JSON object and make it fit: call the same tool with a much smaller payload (for a large file: fs_write a short first part, then fs_append the rest in one or more follow-up calls), or do a smaller step. No other text.';
+        'PROTOCOL ERROR: your reply was CUT OFF by the output token limit before the JSON closed — the payload did not fit in one reply. Do NOT rewrite the same big payload. Respond again with EXACTLY ONE complete JSON object and make it fit: call the same tool with a payload of ≤1200 characters (for a large file: fs_write the first ≤1200 characters, then fs_append the rest in follow-up calls of ≤1200 characters each), or do a smaller step. No other text.';
       const GENERIC_MSG =
         'PROTOCOL ERROR: your reply was not a single JSON object with a "tool" key. Respond again with EXACTLY ONE JSON object: {"tool":"<name>","args":{...}} or {"tool":"finish","result":...}. No other text.';
       const firstText = text;

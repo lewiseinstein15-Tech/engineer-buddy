@@ -307,7 +307,9 @@ test('v063 agent: the second cut earns the second gear; a generic sneeze keeps o
 // ── prevention up front: the preamble carries the split lesson ─────────────
 
 test('v063 preamble: large payloads are taught to split BEFORE the first cut', () => {
-  assert.match(PROTOCOL_PREAMBLE, /fs_write a short first part, then fs_append the rest/);
+  // v0.64.0: the teaching gained CONCRETE chunk sizes (≤1200 characters) —
+  // weak free models do not know what "short" means, numbers they obey.
+  assert.match(PROTOCOL_PREAMBLE, /fs_write the first part \(≤1200 characters\), then fs_append the rest/);
   assert.match(PROTOCOL_PREAMBLE, /output token limit/);
   // the protocol-first pin still holds
   assert.ok(PROTOCOL_PREAMBLE.startsWith('You are Engineer Buddy'));

@@ -23,7 +23,7 @@ export const PROTOCOL_PREAMBLE = [
   '  {"tool":"say","message":"..."}        to speak to the user and end the turn.',
   'The "why" field (tool calls only) is ONE short sentence — why this step, why this file — shown to the user next to the tool card and kept in the session log. Keep it under 20 words. Include it on EVERY tool call by default — omit it only for purely mechanical repeats (re-reading the same file, retrying the same call). Decisions carry a why; that is the house discipline.',
   'Never output prose outside JSON. Never invent tool results. Never claim you ran a command you did not run.',
-  'Keep each reply small enough to finish: a reply that hits the output token limit is cut off mid-JSON and fails. For a large file, do NOT put the whole body in one call — fs_write a short first part, then fs_append the rest in follow-up calls.',
+  'Keep each reply small enough to finish: a reply that hits the output token limit is cut off mid-JSON and fails. For a large file, do NOT put the whole body in one call — fs_write the first part (≤1200 characters), then fs_append the rest in follow-up calls of ≤1200 characters each.',
 ].join('\n');
 
 // Decision rationale (v0.37.0): the model may ship a `why` sentence with each
@@ -523,7 +523,7 @@ export function createChat({
         };
         const wireCut = (r) => r?.truncated === true || looksTruncatedJson(r?.text);
         const TRUNCATION_MSG =
-          'PROTOCOL ERROR: your reply was CUT OFF by the output token limit before the JSON closed — the payload did not fit in one reply. Do NOT rewrite the same big payload. Reply again with EXACTLY ONE complete JSON object and make it fit: call the same tool with a much smaller payload (for a large file: fs_write a short first part, then fs_append the rest in one or more follow-up calls), or do a smaller step. No other text.';
+          'PROTOCOL ERROR: your reply was CUT OFF by the output token limit before the JSON closed — the payload did not fit in one reply. Do NOT rewrite the same big payload. Reply again with EXACTLY ONE complete JSON object and make it fit: call the same tool with a payload of ≤1200 characters (for a large file: fs_write the first ≤1200 characters, then fs_append the rest in follow-up calls of ≤1200 characters each), or do a smaller step. No other text.';
         const GENERIC_MSG =
           'PROTOCOL ERROR: your reply was not a single JSON object with a "tool" key. Reply again with EXACTLY ONE JSON object: {"tool":"<name>","args":{...}} or {"tool":"say","message":"..."}. No other text.';
         const firstText = res.text;

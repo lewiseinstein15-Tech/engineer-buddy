@@ -22,6 +22,16 @@
 // Frames are rebuilt from state on every change (the React/Ink model):
 // cheap because a frame is ~6 lines, and correct because nothing is ever
 // incrementally patched.
+//
+// v0.64.0 — THE BLINKING TYPE BOX: render() used to emit erase and frame as
+// SEPARATE write() syscalls (three for erase: \r, cursor-up, erase-down).
+// The busy spinner repaints at 8 fps, so every 120ms the terminal received
+// [blank region] → [frame] as distinct reads — and a terminal (or an SSH
+// link, or a loaded machine) that draws what it gets BLINKS the box. The
+// fix is the standard Ink discipline: each repaint is ONE write containing
+// erase + frame back to back, so the terminal never sees the erased
+// intermediate state — plus a skip when the frame text is unchanged, so a
+// state churn that paints the same frame costs zero bytes at all.
 
 import { rowCount } from './text.js';
 
@@ -29,32 +39,40 @@ export function createRenderer({ out, frame = null, onPrint = null } = {}) {
   let frameRows = 0;   // screen rows currently occupied by the dynamic frame
   let closed = false;
   let pending = '';    // partial line held until a newline arrives
+  let lastFrame = null; // last frame text actually painted (skip identical repaints)
 
   const cols = () => Math.max(20, (out.columns ?? process.stdout?.columns) || 80);
 
-  function erase() {
-    if (frameRows <= 0) return;
+  /** The erase sequence for the CURRENT frame (caller owns frameRows state). */
+  function eraseSeq() {
+    if (frameRows <= 0) return '';
     // cursor sits somewhere on the LAST row of the frame
-    out.write('\r');                                          // column 1
-    if (frameRows > 1) out.write(`\x1b[${frameRows - 1}A`);   // up to frame top
-    out.write('\x1b[J');                                      // erase down
-    frameRows = 0;
+    let s = '\r';                                           // column 1
+    if (frameRows > 1) s += `\x1b[${frameRows - 1}A`;       // up to frame top
+    s += '\x1b[J';                                          // erase down
+    return s;
   }
 
-  function draw() {
+  function resetFrameState() {
+    frameRows = 0;
+    lastFrame = null;
+  }
+
+  /** Re-render the dynamic region in place (state changed). ONE write. */
+  function render() {
     if (closed || typeof frame !== 'function') return;
     const lines = frame(cols());
-    if (!Array.isArray(lines) || lines.length === 0) return;
+    if (!Array.isArray(lines) || lines.length === 0) {
+      // frame vanished (empty box) — erase what is on screen, paint nothing
+      if (frameRows > 0) out.write(eraseSeq());
+      resetFrameState();
+      return;
+    }
     const text = lines.join('\n');
-    out.write(text);
+    if (text === lastFrame && frameRows > 0) return; // identical frame — zero bytes
+    out.write(eraseSeq() + text); // ONE write: the terminal never sees the blank
     frameRows = rowCount(text, cols());
-  }
-
-  /** Re-render the dynamic region in place (state changed). */
-  function render() {
-    if (closed) return;
-    erase();
-    draw();
+    lastFrame = text;
   }
 
   /** Static content: printed above the frame, which is re-anchored below.
@@ -67,15 +85,28 @@ export function createRenderer({ out, frame = null, onPrint = null } = {}) {
     const text = pending;
     pending = '';
     try { onPrint?.(text); } catch { /* capture is best-effort */ }
-    erase();
-    out.write(text.endsWith('\n') ? text : text + '\n');
-    draw();
+    // ONE write: erase + static content + re-anchored frame. Separating these
+    // into three writes made every printed line blink the whole bottom block.
+    let buf = eraseSeq();
+    resetFrameState();
+    buf += text.endsWith('\n') ? text : text + '\n';
+    if (typeof frame === 'function') {
+      const lines = frame(cols());
+      if (Array.isArray(lines) && lines.length > 0) {
+        const t = lines.join('\n');
+        buf += t;
+        frameRows = rowCount(t, cols());
+        lastFrame = t;
+      }
+    }
+    out.write(buf);
   }
 
   /** Erase the frame but remember nothing (screen clear, etc.). */
   function clear() {
     if (closed) return;
-    erase();
+    if (frameRows > 0) out.write(eraseSeq());
+    resetFrameState();
     pending = '';
   }
 
@@ -84,7 +115,8 @@ export function createRenderer({ out, frame = null, onPrint = null } = {}) {
     if (closed) return;
     closed = true;
     pending = '';
-    erase();
+    if (frameRows > 0) out.write(eraseSeq());
+    resetFrameState();
     out.write('\x1b[?25h');
   }
 

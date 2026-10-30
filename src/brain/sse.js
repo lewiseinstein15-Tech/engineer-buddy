@@ -119,13 +119,24 @@ function openAiDeltaOf(payload) {
     let text = null;
     if (typeof d?.content === 'string') text = d.content;
     else if (Array.isArray(d?.content)) text = d.content.map((p) => p?.text || '').join('');
+    // Reasoning deltas (v0.64.0 live-wire lesson): reasoning models stream
+    // their thinking as `delta.reasoning_content` (DeepSeek shape) or
+    // `delta.reasoning` (OpenRouter shape) — INVISIBLE to every content
+    // reader. A model can burn the ENTIRE output budget on these tokens and
+    // end with finish_reason 'length' and ZERO content (2026-10-31 probe:
+    // nemotron-3.5-super-vl:free, 5063 reasoning chars, empty content, 135s
+    // of silence). Count them so the gateway can tell 'no content' from
+    // 'content eaten by reasoning' honestly.
+    let reasoning = null;
+    if (typeof d?.reasoning_content === 'string') reasoning = d.reasoning_content;
+    else if (typeof d?.reasoning === 'string') reasoning = d.reasoning;
     // finish_reason rides the last content chunk (v0.63.0): 'length' means the
     // relay cut the reply on the output budget — the wire's own truncation
     // witness, surfaced so the chat loop can diagnose instead of mislabeling
     // a cut-off reply as a formatting sneeze.
-    return { text, usage: j?.usage ?? null, finish: j?.choices?.[0]?.finish_reason ?? null };
+    return { text, reasoning, usage: j?.usage ?? null, finish: j?.choices?.[0]?.finish_reason ?? null };
   } catch {
-    return { text: null, usage: null, finish: null };
+    return { text: null, reasoning: null, usage: null, finish: null };
   }
 }
 
@@ -138,14 +149,16 @@ function openAiDeltaOf(payload) {
 export async function streamOpenAI(res, onDelta, opts = {}) {
   const t0 = Date.now();
   let text = '';
+  let reasoningChars = 0;
   let usage = null;
   let chunks = 0;
   let ttms = null;
   let finish = null;
   for await (const payload of sseData(res, opts)) {
-    const { text: delta, usage: u, finish: f } = openAiDeltaOf(payload);
+    const { text: delta, reasoning, usage: u, finish: f } = openAiDeltaOf(payload);
     if (u) usage = extractUsage({ usage: u }); // normalized here — callers pass it straight through
     if (f) finish = f; // last chunk wins
+    if (typeof reasoning === 'string' && reasoning) reasoningChars += reasoning.length;
     if (typeof delta === 'string' && delta) {
       if (ttms === null) ttms = Date.now() - t0;
       chunks++;
@@ -155,7 +168,7 @@ export async function streamOpenAI(res, onDelta, opts = {}) {
       } catch { /* a slow painter must never kill the stream */ }
     }
   }
-  return { text, usage, chunks, ttms, finish };
+  return { text, usage, chunks, ttms, finish, reasoningChars };
 }
 
 /** Extract the content delta from one Ollama NDJSON line (or null). */
@@ -219,8 +232,8 @@ function mapOllamaUsage(final) {
 export async function openAIStreamOrBuffer(res, onDelta, opts = {}) {
   const ctype = String(res.headers?.get?.('content-type') || '');
   if (/text\/event-stream/i.test(ctype)) {
-    const { text, usage, ttms, finish } = await streamOpenAI(res, onDelta, opts);
-    return { text, usage, streamed: true, ttms, truncated: finish === 'length' };
+    const { text, usage, ttms, finish, reasoningChars } = await streamOpenAI(res, onDelta, opts);
+    return { text, usage, streamed: true, ttms, truncated: finish === 'length', reasoningChars };
   }
   const json = await res.json().catch(() => null);
   const msg = json?.choices?.[0]?.message;
@@ -230,6 +243,9 @@ export async function openAIStreamOrBuffer(res, onDelta, opts = {}) {
       : Array.isArray(msg?.content)
         ? msg.content.map((p) => p?.text || '').join('')
         : null;
+  // Buffered reasoning (v0.64.0): same witness as the SSE path — a reasoning
+  // model's thinking lands on message.reasoning / message.reasoning_content.
+  const reasoning = typeof msg?.reasoning === 'string' ? msg.reasoning : typeof msg?.reasoning_content === 'string' ? msg.reasoning_content : '';
   // finish_reason 'length' = the relay cut the reply on max_tokens (v0.63.0).
-  return { text, usage: json?.usage ?? null, streamed: false, ttms: null, truncated: json?.choices?.[0]?.finish_reason === 'length' };
+  return { text, usage: json?.usage ?? null, streamed: false, ttms: null, truncated: json?.choices?.[0]?.finish_reason === 'length', reasoningChars: reasoning.length };
 }

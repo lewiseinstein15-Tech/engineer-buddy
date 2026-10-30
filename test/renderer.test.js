@@ -32,15 +32,21 @@ test('renderer: first render writes the frame with no erase', () => {
   assert.equal(r.rows, 2);
 });
 
-test('renderer: second render erases exactly the previous frame rows first', () => {
+test('renderer: second render erases exactly the previous frame rows first (v0.64: ONE write, and an unchanged frame paints nothing)', () => {
   const out = fakeOut();
-  const r = createRenderer({ out, frame: () => ['a', 'b', 'c'] });
+  let lines = ['a', 'b', 'c'];
+  const r = createRenderer({ out, frame: () => lines });
   r.render();
-  const before = out.writes.length;
+  // v0.64.0 contract: an UNCHANGED frame costs zero bytes (the spinner tick of
+  // a static box no longer repaints the region 8×/second — the blink fix).
   r.render();
-  const seq = out.writes.slice(before).join('');
+  assert.equal(out.writes.length, 1, 'unchanged frame → no write at all');
+  // a CHANGED frame repaints: erase of exactly the previous rows + new frame, ONE write
+  lines = ['a', 'b', 'c!'];
+  r.render();
+  const seq = out.writes[1];
   assert.ok(seq.startsWith('\r\x1b[2A\x1b[J'), `got: ${JSON.stringify(seq)}`);
-  assert.ok(seq.includes('a\nb\nc'));
+  assert.ok(seq.endsWith('a\nb\nc!'));
   assert.equal(r.rows, 3);
 });
 
@@ -80,14 +86,17 @@ test('renderer: close erases the frame and restores the cursor; renders after ar
   assert.equal(out.writes.length, n);
 });
 
-test('renderer: erase math matches wrapped multi-row frames', () => {
+test('renderer: erase math matches wrapped multi-row frames (v0.64: coalesced into ONE write)', () => {
   const out = fakeOut();
   const long = 'y'.repeat(200); // 3 rows at 80 cols
-  const r = createRenderer({ out, frame: () => [long, 'z'.repeat(90)] }); // 3 + 2 = 5 rows
+  let tail = 'z'.repeat(90); // 2 rows
+  const r = createRenderer({ out, frame: () => [long, tail] }); // 3 + 2 = 5 rows
   r.render();
   assert.equal(r.rows, 5);
-  const before = out.writes.length;
+  tail += '!'; // change → repaint
   r.render();
-  const seq = out.writes.slice(before).join('');
+  assert.equal(out.writes.length, 2, 'repaint is exactly one write (no blank flash between erase and frame)');
+  const seq = out.writes[1];
   assert.ok(seq.startsWith('\r\x1b[4A\x1b[J'), `got: ${JSON.stringify(seq)}`);
+  assert.ok(seq.endsWith(long + '\n' + tail), 'the frame rides the same write as the erase');
 });

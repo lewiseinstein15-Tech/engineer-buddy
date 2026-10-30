@@ -802,6 +802,10 @@ export function createInputBox({
     };
     renderer = null;
     ensureRenderer(rout);
+    // hide the hardware cursor BEFORE the first paint (v0.64.0): after it, the
+    // first frame rendered with the real cursor visible — a one-blink ghost at
+    // the box edge on every session start.
+    rout.write('\x1b[?25l');
     // print-above: ALL stdout writes route through the renderer, which erases
     // the frame, prints the content, and re-anchors the frame below it
     const patched = function patchedWrite(chunk, ...rest) {
@@ -816,7 +820,6 @@ export function createInputBox({
     process.stdin.on('keypress', (_ch, key) => onKeypress(key || { sequence: _ch }));
     process.stdout.on('resize', onResize);
     renderer.render();
-    rout.write('\x1b[?25l'); // hide the hardware cursor — the box draws its own block cursor
   };
 
   return rl;
