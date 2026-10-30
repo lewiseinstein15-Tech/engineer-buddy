@@ -280,7 +280,7 @@ async function makeScopeAndTools({ root, router = null, onEvent = () => {}, appr
   // to warnings. Sub-agents see every base tool plus the bridged MCP tools
   // (agent frontmatter allowlists support `mcp__<server>__*`), never `task`.
   const { agents } = loadAgents(root);
-  const taskTool = buildTaskTool({ router, tools: [...base, ghTool, ...mcpTools], agents, approval, onSubEvent: onEvent, routing });
+  const taskTool = buildTaskTool({ router, tools: [...base, ghTool, ...mcpTools], agents, approval, onSubEvent: onEvent, routing, root });
   // User-defined tools (.buddy/tools/<name>/) — sandboxed child-process tools
   // (v0.14.0). They can never shadow built-ins, task, skills or MCP tools.
   const { tools: userTools, warnings: userToolWarnings } = loadUserTools(root, {

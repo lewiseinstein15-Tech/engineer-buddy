@@ -60,6 +60,13 @@ const facts = {
   maxTokensSeen: [],
   msgCharsSeen: [],
   delayMsTotal: 0,
+  // v0.59: the CONCURRENCY witness — how many chat requests were in flight
+  // at once, and the high-water mark. The fleet drill (scripts/v59-drill.mjs)
+  // proves parallel fan-out with the SERVER'S own counter (the v0.55 lesson:
+  // the other end is the witness, never a client-side claim). Counts and
+  // shapes only — never message text.
+  inFlight: 0,
+  maxInFlight: 0,
   startedAt: new Date().toISOString(),
   log: [], // { n, path, model, maxTokens, msgChars, at } — sizes and shapes, never text
 };
@@ -97,6 +104,8 @@ const server = http.createServer((req, res) => {
       facts.maxTokensSeen = [];
       facts.msgCharsSeen = [];
       facts.delayMsTotal = 0;
+      facts.inFlight = 0;
+      facts.maxInFlight = 0;
       facts.log = [];
       if (cursorFile) fs.writeFileSync(cursorFile, '0'); // the shared script cursor resets too
       return reply(res, 200, { ok: true, label: LABEL });
@@ -124,16 +133,20 @@ const server = http.createServer((req, res) => {
     facts.maxTokensSeen.push(maxTokens);
     facts.msgCharsSeen.push(msgChars);
     facts.log.push({ n, path: pathOnly, model: body.model || null, maxTokens, msgChars, at: new Date().toISOString() });
+    facts.inFlight += 1;
+    if (facts.inFlight > facts.maxInFlight) facts.maxInFlight = facts.inFlight;
 
     const idx = nextScriptIndex();
     const text = script[Math.min(idx, script.length - 1)];
-    const done = () =>
+    const done = () => {
+      facts.inFlight = Math.max(0, facts.inFlight - 1);
       reply(res, 200, {
         id: `mock-${LABEL}-${n}`,
         model: MODEL,
         choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
         usage: { prompt_tokens: Math.ceil(msgChars / 4), completion_tokens: Math.ceil(text.length / 4) },
       });
+    };
     if (DELAY > 0) {
       facts.delayMsTotal += DELAY;
       setTimeout(done, DELAY);

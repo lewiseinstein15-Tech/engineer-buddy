@@ -40,9 +40,14 @@ export function systemPromptFor(tools) {
  * @param {((ctx:{index:number,remaining:number,lastTool:string|null})=>Array|null)} [p.route]
  *        v0.56 multi-model routing hook: return a gateway chain for this
  *        step (a permutation of router.order) or null for the default.
- * @returns {{finished:boolean, result:any, steps:Array, history:Array}}
+ * @param {AbortSignal} [p.signal] v0.59 cooperative cancel: checked at EVERY
+ *        step boundary — an aborted signal stops NEW work (the next brain
+ *        call never starts); the step already in flight completes (a tool
+ *        run is never interrupted mid-air). The caller learns of a cut via
+ *        { finished:false, aborted:true } — never a thrown error.
+ * @returns {{finished:boolean, result:any, steps:Array, history:Array, aborted?:boolean}}
  */
-export async function runAgent({ router, tools, systemPrompt, messages, maxSteps = 6, maxTokens = 1200, onStep = null, route = null }) {
+export async function runAgent({ router, tools, systemPrompt, messages, maxSteps = 6, maxTokens = 1200, onStep = null, route = null, signal = null }) {
   const byName = new Map(tools.map((t) => [t.name, t]));
   const callCounts = new Map();
   const history = [
@@ -72,6 +77,12 @@ export async function runAgent({ router, tools, systemPrompt, messages, maxSteps
 
   let lastToolName = null; // v0.56: pre-call routing fact for the NEXT step
   for (let i = 1; i <= maxSteps; i++) {
+    // v0.59 deadline discipline: the abort is honored at the STEP BOUNDARY —
+    // a cancelled child stops starting new work immediately; the step in
+    // flight (one brain call + one tool run) completes. No mid-air cuts.
+    if (signal?.aborted) {
+      return { finished: false, aborted: true, steps, history };
+    }
     const chainOpt = chainOptFor(i, lastToolName);
     let { text, model, gateway, latencyMs } = await router.chat(history, { maxTokens, ...chainOpt });
     let parsed = extractJson(text);

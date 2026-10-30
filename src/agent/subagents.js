@@ -29,9 +29,14 @@ import { runAgent } from './agent.js';
 import { makeStepRouter } from '../brain/effort.js';
 import { truncate } from '../util.js';
 import { enabledPlugins, pluginKindDirs } from '../plugins.js';
+import { recallLessons, recallBlockText } from '../lessons.js';
+import { appendEvent } from '../eventslog.js';
 
 export const AGENTS_DIR = '.buddy/agents';
 export const RESULT_CHAR_CAP = 8000; // sub-agent report budget back to the main loop
+export const CHILD_TIMEOUT_MS = 240000; // v0.59: per-child wait budget (the deadline, not a mid-air cut)
+export const CHILD_TIMEOUT_MAX_MS = 600000; // v0.59 red-team clamp: no child may promise a 9-digit wait
+export const BATCH_MAX = 4; // v0.59: one batch call carries at most this many children
 
 /** Parse one agent markdown file (frontmatter + body). Exported for tests. */
 export function parseAgentMd(raw, { fallbackName = '' } = {}) {
@@ -256,9 +261,19 @@ export function loadAgents(root = process.cwd(), { home = os.homedir() } = {}) {
  * @param {(ev:object)=>void} [p.onStep] step tap for TUI narration
  * @param {(e:object)=>string} [p.approval] optional async gate for risky tools
  * @param {object} [p.routing] v0.56 multi-model routing config { mode, tiers, effort }
+ * @param {string} [p.root] v0.59 workspace root — when given, the child's task
+ *        gets the SAME cross-session lesson recall as every other surface
+ *        (top-3 topic matches, the v0.52 firewall wrapper, budget-capped;
+ *        a `lessonRecall` fact with phase:'subagent' lands in events.jsonl
+ *        ONLY when something actually injected). Recall must never break a run.
+ * @param {number} [p.timeoutMs] v0.59 per-child wait budget (default 240s, min 1s).
+ *        THE DEADLINE IS HONEST ABOUT ITS SHAPE: the parent stops WAITING and
+ *        reports PARTIAL; the abort signal stops new steps at the next boundary;
+ *        the brain call in flight completes under the router's own wire timeout.
+ *        No child can silently outlive its report.
  * @returns {Promise<string>} the sub-agent's report
  */
-export async function runSubagent({ router, agent, parentTools, task, maxTokens = 1500, onStep = null, approval = null, alwaysApproved = null, routing = null }) {
+export async function runSubagent({ router, agent, parentTools, task, maxTokens = 1500, onStep = null, approval = null, alwaysApproved = null, routing = null, root = null, timeoutMs = CHILD_TIMEOUT_MS }) {
   const label = `subagent:${agent?.name || '?'}`;
   try {
     if (!router) return 'ERROR: no brain available (router missing)';
@@ -331,16 +346,85 @@ export async function runSubagent({ router, agent, parentTools, task, maxTokens 
       }
     };
 
-    const res = await runAgent({
-      router,
-      tools: gatedTools,
-      systemPrompt: agent.systemPrompt || `You are ${agent.name}, a sub-agent of Engineer Buddy.`,
-      messages: [{ role: 'user', content: task.trim() }],
-      maxSteps: agent.maxSteps || 8,
-      maxTokens,
-      onStep: (ev) => noteStep(ev),
-      route: stepRouter,
+    // v0.59 — sub-agent memory (the capability audit's gap #2, sub-agent
+    // slice): the child sees the SAME topic-matched cross-session lessons
+    // every other surface gets — one engine (lessons.js), one firewall
+    // (recallBlockText neutralizes wrapper forgeries), one budget (top-3).
+    // The injected block is CONTEXT, not a command; the fact row carries
+    // counts and scores, never the lesson text (facts, not content).
+    let childTask = task.trim();
+    if (root) {
+      try {
+        const rec = recallLessons(root, childTask, { max: 3 });
+        const block = rec.matches.length ? recallBlockText(rec) : '';
+        if (block) {
+          childTask = `${block}\n\n${childTask}`;
+          appendEvent(root, {
+            type: 'lessonRecall',
+            phase: 'subagent',
+            agent: agent.name,
+            count: rec.matches.length,
+            topScore: rec.matches[0].score,
+          });
+        }
+      } catch {
+        /* recall must never break a run */
+      }
+    }
+
+    // v0.59 — the per-child deadline. The RACE owns the wait; the SIGNAL
+    // owns the next step. A child that misses its deadline comes back as a
+    // PARTIAL time-budget report (never a hang, never a thrown error, and
+    // never a fake finish), and its controller keeps firing so the orphaned
+    // loop stops at its next step boundary instead of running on unseen.
+    // The in-flight brain call is bounded by the router's own wire timeout;
+    // once it settles, the aborted signal ends the orphan with no new work.
+    const waitMs = Math.min(
+      CHILD_TIMEOUT_MAX_MS,
+      Math.max(1000, Number.isFinite(timeoutMs) ? Math.floor(timeoutMs) : CHILD_TIMEOUT_MS)
+    );
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, waitMs);
+    const deadline = new Promise((resolve) => {
+      controller.signal.addEventListener('abort', () => {
+        if (timedOut) resolve({ timeout: true });
+      }, { once: true });
     });
+
+    let res;
+    try {
+      const outcome = await Promise.race([
+        runAgent({
+          router,
+          tools: gatedTools,
+          systemPrompt: agent.systemPrompt || `You are ${agent.name}, a sub-agent of Engineer Buddy.`,
+          messages: [{ role: 'user', content: childTask }],
+          maxSteps: agent.maxSteps || 8,
+          maxTokens,
+          onStep: (ev) => noteStep(ev),
+          route: stepRouter,
+          signal: controller.signal,
+        }).then(
+          (v) => ({ done: true, v }),
+          (e) => ({ failed: true, e })
+        ),
+        deadline,
+      ]);
+      if (outcome.timeout) {
+        return truncate(
+          `PARTIAL: ${label} hit its time budget (${Math.round(waitMs / 1000)}s) without a final report — the wait was cut, the child stops at its next step boundary.`,
+          RESULT_CHAR_CAP
+        );
+      }
+      if (outcome.failed) throw outcome.e;
+      res = outcome.v;
+    } finally {
+      clearTimeout(timer);
+    }
 
     if (res.finished) {
       const out = typeof res.result === 'string' ? res.result : JSON.stringify(res.result);
@@ -355,6 +439,15 @@ export async function runSubagent({ router, agent, parentTools, task, maxTokens 
     }
     const did = [...toolCounts.entries()].map(([t, n]) => (n > 1 ? `${t} ×${n}` : t)).join(', ');
     const last = [...res.steps].reverse().find((s) => s.observation);
+    // v0.59: a deadline cut is reported as its own honest shape — the parent
+    // must be able to tell "ran out of steps" from "ran out of time".
+    if (timedOut || res.aborted) {
+      return truncate(
+        `PARTIAL: ${label} hit its time budget (${Math.round(waitMs / 1000)}s) without a final report — the wait was cut, the child stops at its next step boundary.` +
+          (did ? ` Steps used: ${did}.` : ' No completed step captured.'),
+        RESULT_CHAR_CAP
+      );
+    }
     return truncate(
       `PARTIAL: ${label} hit its step budget (${agent.maxSteps || 8}) without a final report.` +
         (did ? ` Steps used: ${did}.` : '') +
