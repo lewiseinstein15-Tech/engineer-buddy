@@ -358,6 +358,47 @@ export function tryRepairJson(text) {
   }
 }
 
+/**
+ * Heuristic: does this reply look like a JSON tool call that was CUT OFF by
+ * the output token limit (v0.63.0 live-test lesson: a 4.4KB fs_write payload
+ * at the default 1500-token budget never closes its string, the relay reports
+ * finish_reason "length" — and some relays don't even report that, so the
+ * shape has to speak for itself)?
+ *
+ * String-aware scan from the first '{' (braces inside string literals do not
+ * move the depth counter). Truncated means: the scan ran off the end of the
+ * input while still inside a string or with open brackets, AND the head
+ * carries a "tool" key (prose that merely contains a '{' is never diagnosed).
+ * A balanced outer object is NOT truncation — if extractJson still failed on
+ * one, it is a sloppy-JSON content problem and tryRepairJson's job.
+ * Never throws.
+ */
+export function looksTruncatedJson(text) {
+  const s = String(text ?? '');
+  const start = s.indexOf('{');
+  if (start === -1) return false;
+  if (!s.slice(start, start + 400).includes('"tool"')) return false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === '{' || c === '[') depth++;
+    else if (c === '}' || c === ']') {
+      depth--;
+      if (depth <= 0) return false; // the outer object closed — not truncation
+    }
+  }
+  return inStr || esc || depth > 0;
+}
+
 /** tiny glob matcher supporting ** * ? — enough for excludeFiles lists. */
 export function globMatches(pattern, path) {
   const re = pattern

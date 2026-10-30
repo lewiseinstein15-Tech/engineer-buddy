@@ -57,7 +57,7 @@ export function createLlm7Gateway(cfg, timeouts) {
           throw lastErr;
         }
         if (wantsStream) {
-          const { text: sseText, usage: sseUsage, streamed, ttms } = await openAIStreamOrBuffer(res, onDelta, {
+          const { text: sseText, usage: sseUsage, streamed, ttms, truncated } = await openAIStreamOrBuffer(res, onDelta, {
             idleMs: STREAM_IDLE_MS,
             totalMs: timeoutMs * 3,
           }).catch((e) => {
@@ -69,6 +69,7 @@ export function createLlm7Gateway(cfg, timeouts) {
               out.streamed = true;
               if (ttms != null) out.ttms = ttms;
             }
+            if (truncated) out.truncated = true; // finish_reason 'length' (v0.63.0)
             return out;
           }
           lastErr = new BuddyError('llm7: empty response', { code: 'EMPTY_RESPONSE' });
@@ -76,7 +77,9 @@ export function createLlm7Gateway(cfg, timeouts) {
         }
         const json = await res.json().catch(() => null);
         const text = json?.choices?.[0]?.message?.content;
-        if (typeof text === 'string' && text.trim()) return { text, model: json?.model || m, gateway: 'llm7', usage: extractUsage(json) };
+        // finish_reason 'length' = cut off on max_tokens (v0.63.0)
+        if (typeof text === 'string' && text.trim())
+          return { text, model: json?.model || m, gateway: 'llm7', usage: extractUsage(json), ...(json?.choices?.[0]?.finish_reason === 'length' ? { truncated: true } : {}) };
         lastErr = new BuddyError('llm7: empty response', { code: 'EMPTY_RESPONSE', data: json });
       }
       throw lastErr || new BuddyError('llm7: all models failed', { code: 'ALL_MODELS_FAILED' });

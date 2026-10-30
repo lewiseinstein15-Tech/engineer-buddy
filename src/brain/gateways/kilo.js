@@ -130,7 +130,7 @@ export function createKiloGateway(cfg, timeouts) {
         // SSE when the relay honors stream:true; buffered-JSON fallback when
         // it silently ignores it — either way onDelta got the pieces that
         // actually arrived and the returned text is the full reply.
-        const { text: sseText, usage: sseUsage, streamed, ttms } = await openAIStreamOrBuffer(res, onDelta, {
+        const { text: sseText, usage: sseUsage, streamed, ttms, truncated } = await openAIStreamOrBuffer(res, onDelta, {
           idleMs: STREAM_IDLE_MS,
           totalMs: timeoutMs * 3,
         }).catch((e) => {
@@ -142,6 +142,7 @@ export function createKiloGateway(cfg, timeouts) {
             out.streamed = true;
             if (ttms != null) out.ttms = ttms;
           }
+          if (truncated) out.truncated = true; // finish_reason 'length' — the wire's own cut-off witness (v0.63.0)
           return out;
         }
         throw new BuddyError('kilo: empty response', { code: 'EMPTY_RESPONSE' });
@@ -149,15 +150,19 @@ export function createKiloGateway(cfg, timeouts) {
 
       const json = await res.json().catch(() => null);
       const usage = extractUsage(json);
+      // finish_reason 'length' = the relay cut the reply on max_tokens
+      // (v0.63.0) — carried on the result so the chat loop can diagnose a
+      // truncated tool call instead of calling it a formatting sneeze.
+      const wasCut = json?.choices?.[0]?.finish_reason === 'length';
       const text = json?.choices?.[0]?.message?.content;
       if (typeof text === 'string' && text.trim()) {
-        return { text, model: json?.model || chosen, gateway: 'kilo', usage };
+        return { text, model: json?.model || chosen, gateway: 'kilo', usage, ...(wasCut ? { truncated: true } : {}) };
       }
       // Some models return content as an array of parts.
       const parts = json?.choices?.[0]?.message?.content;
       if (Array.isArray(parts)) {
         const joined = parts.map((p) => p?.text || '').join('').trim();
-        if (joined) return { text: joined, model: json?.model || chosen, gateway: 'kilo', usage };
+        if (joined) return { text: joined, model: json?.model || chosen, gateway: 'kilo', usage, ...(wasCut ? { truncated: true } : {}) };
       }
       throw new BuddyError('kilo: empty response', { code: 'EMPTY_RESPONSE', data: json });
     },

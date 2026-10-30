@@ -119,9 +119,13 @@ function openAiDeltaOf(payload) {
     let text = null;
     if (typeof d?.content === 'string') text = d.content;
     else if (Array.isArray(d?.content)) text = d.content.map((p) => p?.text || '').join('');
-    return { text, usage: j?.usage ?? null };
+    // finish_reason rides the last content chunk (v0.63.0): 'length' means the
+    // relay cut the reply on the output budget — the wire's own truncation
+    // witness, surfaced so the chat loop can diagnose instead of mislabeling
+    // a cut-off reply as a formatting sneeze.
+    return { text, usage: j?.usage ?? null, finish: j?.choices?.[0]?.finish_reason ?? null };
   } catch {
-    return { text: null, usage: null };
+    return { text: null, usage: null, finish: null };
   }
 }
 
@@ -137,9 +141,11 @@ export async function streamOpenAI(res, onDelta, opts = {}) {
   let usage = null;
   let chunks = 0;
   let ttms = null;
+  let finish = null;
   for await (const payload of sseData(res, opts)) {
-    const { text: delta, usage: u } = openAiDeltaOf(payload);
+    const { text: delta, usage: u, finish: f } = openAiDeltaOf(payload);
     if (u) usage = extractUsage({ usage: u }); // normalized here — callers pass it straight through
+    if (f) finish = f; // last chunk wins
     if (typeof delta === 'string' && delta) {
       if (ttms === null) ttms = Date.now() - t0;
       chunks++;
@@ -149,7 +155,7 @@ export async function streamOpenAI(res, onDelta, opts = {}) {
       } catch { /* a slow painter must never kill the stream */ }
     }
   }
-  return { text, usage, chunks, ttms };
+  return { text, usage, chunks, ttms, finish };
 }
 
 /** Extract the content delta from one Ollama NDJSON line (or null). */
@@ -213,8 +219,8 @@ function mapOllamaUsage(final) {
 export async function openAIStreamOrBuffer(res, onDelta, opts = {}) {
   const ctype = String(res.headers?.get?.('content-type') || '');
   if (/text\/event-stream/i.test(ctype)) {
-    const { text, usage, ttms } = await streamOpenAI(res, onDelta, opts);
-    return { text, usage, streamed: true, ttms };
+    const { text, usage, ttms, finish } = await streamOpenAI(res, onDelta, opts);
+    return { text, usage, streamed: true, ttms, truncated: finish === 'length' };
   }
   const json = await res.json().catch(() => null);
   const msg = json?.choices?.[0]?.message;
@@ -224,5 +230,6 @@ export async function openAIStreamOrBuffer(res, onDelta, opts = {}) {
       : Array.isArray(msg?.content)
         ? msg.content.map((p) => p?.text || '').join('')
         : null;
-  return { text, usage: json?.usage ?? null, streamed: false, ttms: null };
+  // finish_reason 'length' = the relay cut the reply on max_tokens (v0.63.0).
+  return { text, usage: json?.usage ?? null, streamed: false, ttms: null, truncated: json?.choices?.[0]?.finish_reason === 'length' };
 }

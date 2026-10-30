@@ -63,7 +63,7 @@ export function createPollinationsGateway(cfg, timeouts) {
       }
 
       if (wantsStream) {
-        const { text: sseText, usage: sseUsage, streamed, ttms } = await openAIStreamOrBuffer(res, onDelta, {
+        const { text: sseText, usage: sseUsage, streamed, ttms, truncated } = await openAIStreamOrBuffer(res, onDelta, {
           idleMs: STREAM_IDLE_MS,
           totalMs: timeoutMs * 3,
         }).catch((e) => {
@@ -75,6 +75,7 @@ export function createPollinationsGateway(cfg, timeouts) {
             out.streamed = true;
             if (ttms != null) out.ttms = ttms;
           }
+          if (truncated) out.truncated = true; // finish_reason 'length' (v0.63.0)
           return out;
         }
         throw new BuddyError('pollinations: empty response', { code: 'EMPTY_RESPONSE' });
@@ -89,7 +90,9 @@ export function createPollinationsGateway(cfg, timeouts) {
           : Array.isArray(msg?.content)
             ? msg.content.map((p) => p?.text || '').join('').trim()
             : null;
-        if (text) return { text, model: json?.model || m, gateway: 'pollinations', usage: extractUsage(json) };
+        // finish_reason 'length' = cut off on max_tokens (v0.63.0)
+        if (text)
+          return { text, model: json?.model || m, gateway: 'pollinations', usage: extractUsage(json), ...(json?.choices?.[0]?.finish_reason === 'length' ? { truncated: true } : {}) };
         if (typeof json === 'string' && json.trim()) return { text: json, model: m, gateway: 'pollinations' };
         throw new BuddyError('pollinations: empty response', { code: 'EMPTY_RESPONSE', data: json });
       } catch (e) {

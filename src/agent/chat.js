@@ -8,7 +8,7 @@
 //   - approval gates for risky tools (write/replace/append/bash)
 //   - context compaction (Harness² "evidence stays small in context" rule)
 //   - per-turn tool call caps + one protocol-repair retry (v0.2 heritage)
-import { extractJson, tryRepairJson, debugLog, truncate } from '../util.js';
+import { extractJson, tryRepairJson, looksTruncatedJson, debugLog, truncate } from '../util.js';
 import { describeTools } from './agent.js';
 import { describeSkillCatalog } from '../skills/loader.js';
 import { PLAN_TOOLS, planModePrompt } from '../tools/planmode.js';
@@ -23,6 +23,7 @@ export const PROTOCOL_PREAMBLE = [
   '  {"tool":"say","message":"..."}        to speak to the user and end the turn.',
   'The "why" field (tool calls only) is ONE short sentence — why this step, why this file — shown to the user next to the tool card and kept in the session log. Keep it under 20 words. Include it on EVERY tool call by default — omit it only for purely mechanical repeats (re-reading the same file, retrying the same call). Decisions carry a why; that is the house discipline.',
   'Never output prose outside JSON. Never invent tool results. Never claim you ran a command you did not run.',
+  'Keep each reply small enough to finish: a reply that hits the output token limit is cut off mid-JSON and fails. For a large file, do NOT put the whole body in one call — fs_write a short first part, then fs_append the rest in follow-up calls.',
 ].join('\n');
 
 // Decision rationale (v0.37.0): the model may ship a `why` sentence with each
@@ -300,7 +301,14 @@ export function createChat({
     });
   }
 
-  async function callModel(stepCtx = null) {
+  // tokenBoost (v0.63.0): the protocol-repair ladder's second gear. A reply
+  // that was cut off by the output token limit cannot be fixed by asking
+  // again at the SAME budget — the model writes the same big payload and is
+  // cut at the same byte. Boosted repairs ask for 2× the budget (capped at
+  // 6000 — free relays vary, and max_tokens is a cap the relay may clamp, so
+  // this stays a request, never a promise). Plan mode's floor applies first.
+  const REPAIR_BOOST_CAP = 6000;
+  async function callModel(stepCtx = null, tokenBoost = 1) {
     await maybeCompact();
     const history = [systemMsg(), ...messages];
     // Plan mode raises the ceiling: a full markdown plan inside one JSON
@@ -308,7 +316,8 @@ export function createChat({
     // (v0.9.2 live-test lesson). Effort (v0.25.0): maxTokens follows the
     // level; plan mode's floor still wins when it is higher.
     const baseTok = effortRef.maxTokens || maxTokens;
-    const maxTok = modes?.plan ? Math.max(baseTok, 2500) : baseTok;
+    const floorTok = modes?.plan ? Math.max(baseTok, 2500) : baseTok;
+    const maxTok = tokenBoost > 1 ? Math.min(Math.round(floorTok * tokenBoost), REPAIR_BOOST_CAP) : floorTok;
     // Multi-model routing (v0.56.0): classify THIS step (pre-call facts
     // only) and let the effort policy lead the chain. The chain opt rides
     // only when the permutation genuinely differs from the base order — a
@@ -487,40 +496,88 @@ export function createChat({
           salvaged = true;
         }
       }
-      // One protocol-repair retry (v0.2 heritage) for free-model sneezes.
+      // Protocol-repair ladder (v0.2 heritage, v0.63.0 extension). Two
+      // distinct failures wear the same broken-JSON mask:
+      //   • a formatting sneeze (prose, sloppy strings) — one cheap ask at
+      //     the same budget fixes it (the historical contract, still first);
+      //   • a reply the relay CUT OFF on the output token limit (v0.62 live
+      //     test: a 4.4KB fs_write payload died twice — the old ask re-sent
+      //     at the SAME budget, so the model wrote the same big payload and
+      //     was cut at the same byte, and the turn died with it, stalling
+      //     the todo at whatever step it reached). A cut-off is NOT a
+      //     formatting problem: the ask must CHANGE (split the payload,
+      //     fs_write + fs_append) and the budget must RISE.
+      // Diagnosis: the gateway's finish_reason='length' witness when the
+      // wire reports it, else the shape heuristic (unbalanced tool-call JSON
+      // that ran off the end of the input). Cost bound: at most TWO repair
+      // calls per step; the second gear exists only for the truncation path
+      // where the retry ask is genuinely different.
       if (!parsed.ok || typeof parsed.value !== 'object' || !parsed.value || !parsed.value.tool) {
-        debugLog(`chat step ${step}: protocol violation, requesting repair`);
-        messages.push({ role: 'assistant', content: truncate(res.text, 700) });
-        messages.push({
-          role: 'user',
-          content:
-            'PROTOCOL ERROR: your reply was not a single JSON object with a "tool" key. Reply again with EXACTLY ONE JSON object: {"tool":"<name>","args":{...}} or {"tool":"say","message":"..."}. No other text.',
-        });
+        const judge = (r) => {
+          let p = extractJson(r?.text);
+          if (!p.ok || typeof p.value !== 'object' || !p.value || !p.value.tool) {
+            const fixed = tryRepairJson(r?.text);
+            if (fixed && fixed.tool) p = { ok: true, value: fixed };
+          }
+          return p;
+        };
+        const wireCut = (r) => r?.truncated === true || looksTruncatedJson(r?.text);
+        const TRUNCATION_MSG =
+          'PROTOCOL ERROR: your reply was CUT OFF by the output token limit before the JSON closed — the payload did not fit in one reply. Do NOT rewrite the same big payload. Reply again with EXACTLY ONE complete JSON object and make it fit: call the same tool with a much smaller payload (for a large file: fs_write a short first part, then fs_append the rest in one or more follow-up calls), or do a smaller step. No other text.';
+        const GENERIC_MSG =
+          'PROTOCOL ERROR: your reply was not a single JSON object with a "tool" key. Reply again with EXACTLY ONE JSON object: {"tool":"<name>","args":{...}} or {"tool":"say","message":"..."}. No other text.';
+        const firstText = res.text;
+        const firstCut = wireCut(res);
+        debugLog(`chat step ${step}: protocol violation${firstCut ? ' (reply cut off by the token limit)' : ''}, requesting repair`);
+        let pairs = 0;
         let retry;
         try {
-          retry = await callModel(stepRouteCtx(step)); // same step, same route ctx — a repair is not a new step
+          messages.push({ role: 'assistant', content: truncate(res.text, 700) });
+          messages.push({ role: 'user', content: firstCut ? TRUNCATION_MSG : GENERIC_MSG });
+          pairs = 1;
+          // A diagnosed cut-off goes straight to the boosted gear: the same
+          // budget already produced this exact cut once.
+          retry = await callModel(stepRouteCtx(step), firstCut ? 2 : 1); // same step, same route ctx — a repair is not a new step
         } catch (e) {
           onEvent({ type: 'error', text: `brain offline: ${e.message}` });
           return { said: null, steps: step, error: true };
         }
-        parsed = extractJson(retry.text);
-        const retryBroken = !parsed.ok || typeof parsed.value !== 'object' || !parsed.value || !parsed.value.tool;
-        if (retryBroken) {
-          const fixed = tryRepairJson(retry.text);
-          if (fixed && fixed.tool) parsed = { ok: true, value: fixed };
+        parsed = judge(retry);
+        if (!parsed.ok || typeof parsed.value !== 'object' || !parsed.value || !parsed.value.tool) {
+          // Second gear — ONLY for a reply that is itself cut off (the first
+          // repair wrote another payload the relay ate). A generic sneeze
+          // that survived repair A stays a single-repair failure: the
+          // historical contract, and a third verbatim ask never helped.
+          if (wireCut(retry)) {
+            try {
+              res = retry;
+              messages.push({ role: 'assistant', content: truncate(res.text, 700) });
+              messages.push({ role: 'user', content: TRUNCATION_MSG });
+              pairs = 2;
+              retry = await callModel(stepRouteCtx(step), 2);
+            } catch (e) {
+              onEvent({ type: 'error', text: `brain offline: ${e.message}` });
+              return { said: null, steps: step, error: true };
+            }
+            parsed = judge(retry);
+          }
         }
         if (!parsed.ok || typeof parsed.value !== 'object' || !parsed.value || !parsed.value.tool) {
-          messages.splice(-2);
-          // Both raws matter for debugging: the first reply shows what the
-          // model originally tried, the retry shows what finally failed.
+          messages.splice(-2 * pairs);
+          // Both raws matter for debugging: the original attempt and the
+          // last retry. A diagnosed cut-off is NAMED as one — the model DID
+          // format a tool call; the output budget ate it (v0.62 lesson: the
+          // old message blamed formatting and taught nothing).
           onEvent({
             type: 'error',
-            text: `I could not format my own reply (protocol violation). First: ${truncate(res.text, 140)} Retry: ${truncate(retry.text, 140)}`,
+            text: firstCut || wireCut(retry)
+              ? `I could not format my own reply (protocol violation — the reply was cut off by the output token limit, even at a doubled budget; split large payloads with fs_write + fs_append or raise /effort). First: ${truncate(firstText, 140)} Retry: ${truncate(retry.text, 140)}`
+              : `I could not format my own reply (protocol violation). First: ${truncate(firstText, 140)} Retry: ${truncate(retry.text, 140)}`,
           });
           return { said: null, steps: step, error: true };
         }
         res = retry;
-        messages.splice(-2); // drop the violation exchange, keep clean history
+        messages.splice(-2 * pairs); // drop the violation exchange(s), keep clean history
       }
 
       const { tool, args = {} } = parsed.value;

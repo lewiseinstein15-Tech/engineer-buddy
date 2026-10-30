@@ -7,7 +7,7 @@
 // sometimes sneeze prose), per-tool call caps, and per-call maxTokens.
 // v0.56: an optional `route` hook (multi-model routing) — fn(stepCtx) =>
 // chain|null; a truthy chain rides that ONE router.chat as opts.chain.
-import { extractJson, debugLog, truncate } from '../util.js';
+import { extractJson, tryRepairJson, looksTruncatedJson, debugLog, truncate } from '../util.js';
 
 export function describeTools(tools) {
   return tools
@@ -84,28 +84,65 @@ export async function runAgent({ router, tools, systemPrompt, messages, maxSteps
       return { finished: false, aborted: true, steps, history };
     }
     const chainOpt = chainOptFor(i, lastToolName);
-    let { text, model, gateway, latencyMs } = await router.chat(history, { maxTokens, ...chainOpt });
+    const first = await router.chat(history, { maxTokens, ...chainOpt });
+    let { text, model, gateway, latencyMs } = first;
     let parsed = extractJson(text);
     let repaired = false;
 
-    // One self-repair retry: tell the model the protocol and ask again.
+    // Protocol-repair ladder (v0.2 heritage, v0.63.0 extension) — mirrors
+    // chat.js. A formatting sneeze gets one cheap ask at the same budget; a
+    // reply CUT OFF by the output token limit (the wire's finish_reason or
+    // the unbalanced shape) gets the split-payload teaching at a doubled
+    // budget — the same budget produced the same cut once already. Cost
+    // bound: at most two repair calls per step.
     if (!parsed.ok || typeof parsed.value !== 'object' || parsed.value === null || !parsed.value.tool) {
-      debugLog(`agent step ${i}: protocol violation, requesting repair`);
+      const judge = (r) => {
+        let p = extractJson(r?.text);
+        if (!p.ok || typeof p.value !== 'object' || p.value === null || !p.value.tool) {
+          const fixed = tryRepairJson(r?.text);
+          if (fixed && fixed.tool) p = { ok: true, value: fixed };
+        }
+        return p;
+      };
+      const wireCut = (r) => r?.truncated === true || looksTruncatedJson(r?.text);
+      const TRUNCATION_MSG =
+        'PROTOCOL ERROR: your reply was CUT OFF by the output token limit before the JSON closed — the payload did not fit in one reply. Do NOT rewrite the same big payload. Respond again with EXACTLY ONE complete JSON object and make it fit: call the same tool with a much smaller payload (for a large file: fs_write a short first part, then fs_append the rest in one or more follow-up calls), or do a smaller step. No other text.';
+      const GENERIC_MSG =
+        'PROTOCOL ERROR: your reply was not a single JSON object with a "tool" key. Respond again with EXACTLY ONE JSON object: {"tool":"<name>","args":{...}} or {"tool":"finish","result":...}. No other text.';
+      const firstText = text;
+      const firstCut = wireCut(first);
+      debugLog(`agent step ${i}: protocol violation${firstCut ? ' (reply cut off by the token limit)' : ''}, requesting repair`);
       history.push({ role: 'assistant', content: truncate(text, 700) });
-      history.push({
-        role: 'user',
-        content:
-          'PROTOCOL ERROR: your reply was not a single JSON object with a "tool" key. Respond again with EXACTLY ONE JSON object: {"tool":"<name>","args":{...}} or {"tool":"finish","result":...}. No other text.',
-      });
-      const retry = await router.chat(history, { maxTokens, ...chainOpt });
-      parsed = extractJson(retry.text);
+      history.push({ role: 'user', content: firstCut ? TRUNCATION_MSG : GENERIC_MSG });
+      const boostTok = Math.min(maxTokens * 2, 6000);
+      let retry = await router.chat(history, { maxTokens: firstCut ? boostTok : maxTokens, ...chainOpt });
+      parsed = judge(retry);
+      let pairs = 1;
       if (!parsed.ok || typeof parsed.value !== 'object' || parsed.value === null || !parsed.value.tool) {
-        noteStep({ step: i, error: 'protocol violation (after repair)', raw: truncate(text, 300), model: retry.model, gateway: retry.gateway, latencyMs });
+        if (wireCut(retry)) {
+          // Second gear — only the truncation path earns a third ask.
+          history.push({ role: 'assistant', content: truncate(retry.text, 700) });
+          history.push({ role: 'user', content: TRUNCATION_MSG });
+          pairs = 2;
+          retry = await router.chat(history, { maxTokens: boostTok, ...chainOpt });
+          parsed = judge(retry);
+        }
+      }
+      if (!parsed.ok || typeof parsed.value !== 'object' || parsed.value === null || !parsed.value.tool) {
+        history.splice(-2 * pairs);
+        noteStep({
+          step: i,
+          error: firstCut || wireCut(retry) ? 'protocol violation (reply cut off by the output token limit, after repair)' : 'protocol violation (after repair)',
+          raw: truncate(firstText, 300),
+          model: retry.model,
+          gateway: retry.gateway,
+          latencyMs,
+        });
         break;
       }
       repaired = true;
       ({ text, model, gateway, latencyMs } = retry);
-      history.splice(-2); // drop the violation exchange, keep clean history
+      history.splice(-2 * pairs); // drop the violation exchange(s), keep clean history
     }
 
     const meta = { model, gateway, latencyMs };
