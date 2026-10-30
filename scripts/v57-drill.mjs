@@ -181,15 +181,26 @@ function cap(title, body) {
 
 // ── frame 7: the REAL CLI doctor, live ───────────────────────────────────────
 {
-  const r = spawnSync('node', [path.join(REPO, 'src', 'index.js'), 'doctor'], {
-    encoding: 'utf8', timeout: 120000,
+  // The doctor is NETWORKED (live gateway probes) — a slow gateway must not
+  // fail the leg: generous timeout + ONE honest retry, and the retry is
+  // declared in the frame either way.
+  let r = spawnSync('node', [path.join(REPO, 'src', 'index.js'), 'doctor'], {
+    encoding: 'utf8', timeout: 300000,
     env: { ...process.env, NO_COLOR: '1' },
   });
+  let retried = false;
+  if (r.status === null || r.error) {
+    retried = true;
+    r = spawnSync('node', [path.join(REPO, 'src', 'index.js'), 'doctor'], {
+      encoding: 'utf8', timeout: 300000,
+      env: { ...process.env, NO_COLOR: '1' },
+    });
+  }
   const report = r.stderr || ''; // the doctor REPORTS on stderr (house logging discipline: stdout stays clean for data)
   const alive = report.split('\n').find((l) => /gateways alive/.test(l))?.trim() || '(summary line not found)';
   cap(
     'FRAME 7 — the REAL CLI doctor, live (keyless chain health)',
-    `$ node src/index.js doctor   → exit ${r.status}   (the report rides stderr — stdout stays clean for data)\n\n` +
+    `$ node src/index.js doctor   → exit ${r.status}${retried ? " (after one honest retry — the first attempt timed out on a slow gateway)" : ""}   (the report rides stderr — stdout stays clean for data)\n\n` +
     report.trimEnd().split('\n').map((l) => `  ${l}`).join('\n').slice(0, 2400) +
     `\n\n  summary: ${alive}\n\n` +
     `The doctor is informational by contract: a degraded chain is reported,\n` +
