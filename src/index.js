@@ -417,37 +417,6 @@ async function cmdChat(argv, { oneShot = false } = {}) {
     return out.ok ? 0 : 2;
   }
 
-  // --retrace (v0.40.0): time-travel debugging — rebuild a saved session's
-  // file timeline deterministically, optionally swapping ONE step's args.
-  // Dry run by default; --apply writes the what-if state (checkpoints first).
-  if (values.retrace) {
-    const needle = positionals[0] || null;
-    const file = needle ? findSession(root, needle) : latestSession(root);
-    if (!file) {
-      console.error(`buddy: nothing to retrace — ${needle ? `no session matches "${needle}"` : 'no saved sessions'} in ${root}`);
-      return 2;
-    }
-    const { runRetrace } = await import('./tools/timetravel.js');
-    let set = null;
-    if (values.set) {
-      try { set = JSON.parse(values.set); } catch {
-        console.error('buddy: --set must be a JSON object, e.g. --set \'{"find":"draft","replace":"what-if"}\'');
-        return 2;
-      }
-    }
-    const out = runRetrace({
-      root,
-      file,
-      from: Number(values.from) || 1,
-      until: values.until ? Number(values.until) : null,
-      swap: values.swap != null ? Number(values.swap) : null,
-      set,
-      apply: Boolean(values.apply),
-    });
-    console.log(out.report);
-    return out.ok ? 0 : 2;
-  }
-
   // --worktree (v0.36.0): isolate this run in its own git worktree — a fresh
   // checkout of HEAD on a buddy/<slug> branch under .buddy/worktrees/. The
   // user's dirty tree stays theirs; the run's edits, stages, and commits land
@@ -1244,7 +1213,7 @@ async function cmdRunAuto(argv) {
     const mark = it.status === 'done' ? '✔' : it.status === 'in_progress' ? '~' : '✘';
     console.error(`  ${mark} #${it.id} ${truncate(String(it.text), 72)}${it.notes ? `  (${it.notes})` : ''}`);
   }
-  console.error(`  done ${s.done} · blocked ${s.blocked} · remaining ${s.remaining} · verify: ${s.verifyCmd ?? 'none'}`);
+  console.error(`  done ${s.done} (${s.verifiedByLoop} verified by this loop) · blocked ${s.blocked} · remaining ${s.remaining} · verify: ${s.verifyCmd ?? 'none'}`);
   console.error(`  facts : .buddy/events.jsonl (orchestrator*) · plan: .buddy/todo.json`);
   return s.blocked === 0 && s.remaining === 0 ? 0 : 1;
 }
