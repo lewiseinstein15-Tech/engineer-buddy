@@ -511,7 +511,7 @@ describe('buildGhTool + repl wiring', () => {
     for (const w of ['pr_create', 'pr_comment', 'pr_review']) assert.equal(t.riskyWhen({ op: w }), true, `${w} must be gated`);
     assert.equal(t.render({ op: 'pr_comments', pr: 7 }), 'gh pr_comments #7');
     assert.equal(t.render({ op: 'ci_runs', branch: 'main' }), 'gh ci_runs main');
-    assert.deepEqual(Object.keys(GH_OPS).sort(), ['ci_runs', 'pr_comment', 'pr_comments', 'pr_create', 'pr_list', 'pr_review', 'pr_view']);
+    assert.deepEqual(Object.keys(GH_OPS).sort(), ['ci_runs', 'pr_comment', 'pr_comments', 'pr_create', 'pr_diff', 'pr_list', 'pr_reply', 'pr_review', 'pr_sync', 'pr_view']); // v0.61.0: + pr_sync/pr_diff/pr_reply
   });
 
   test('repl tripwires: /ci + /pr-comments registered, busy-safe, attach wired', () => {

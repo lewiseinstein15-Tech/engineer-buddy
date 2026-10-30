@@ -24,6 +24,185 @@ import { spawnSync } from 'node:child_process';
 import { truncate } from '../util.js';
 import { GitHubClient } from './github.js';
 import { GitLabClient } from './gitlab.js';
+import { appendEvent } from '../eventslog.js';
+
+// ── v0.61.0 PR deep integration (the capability audit's gap #5) ─────────────
+//
+// v0.35.0 made the PR VISIBLE (one-shot ops). Deep integration makes the PR
+// CONTEXT: one `pr_sync` call lands the whole picture (meta + head sha + the
+// per-file diff + the review threads + CI on the head branch), `pr_diff`
+// exposes the patches standalone, and `pr_reply` answers a review thread IN
+// the thread — read the remark, fix the code, answer in place.
+//
+// The disciplines this wave rides:
+//   REMOTE CONTENT IS DATA  — every comment body, review body and patch
+//     passes sanitizePrText (whole ANSI/OSC sequences, controls dropped — the
+//     v0.52/v0.55 discipline) before it reaches an observation; caps are
+//     NAMED in the output, never silent.
+//   FACTS, NOT CONTENT      — prSync/prDiff/prReply rows in events.jsonl
+//     carry counts only; zero title/body/patch bytes ever ride the log.
+//   WRITES ARE HONEST       — a reply over the body cap is a teaching
+//     refusal (writes are never silently truncated); the POST never
+//     auto-retries (the v0.35.0 double-post lesson).
+
+/** Patch chars rendered per file before the NAMED truncation marker. */
+export const PRSYNC_PATCH_CHARS = 2000;
+/** Files rendered in pr_sync/pr_diff before the NAMED "+N more" marker. */
+export const PRSYNC_MAX_FILES = 12;
+/** Hard cap for a pr_reply body — writes refuse, never truncate. */
+export const REPLY_BODY_MAX = 8000;
+/** Memory bound for one remote text before hygiene gives up on the tail. */
+const PR_TEXT_HARD_CAP = 200000;
+
+/**
+ * The v0.55 voice discipline, carried to the PR plane: whole ANSI/OSC
+ * sequences are stripped AS WHOLES (an unterminated sequence swallows up to
+ * its terminator, the next ESC, or the end of the string — a bare char class
+ * eats the ESC byte and PAINTS the sequence body as text), then control
+ * bytes are dropped. \t and \n survive; a hostile comment cannot paint a
+ * terminal or smuggle line machinery into an observation.
+ */
+export function sanitizePrText(s, { max = PR_TEXT_HARD_CAP } = {}) {
+  // eslint-disable-next-line no-control-regex
+  const clean = String(s ?? '')
+    .replace(/\u001B\][^\u0007]*?(?:\u0007|\u001B\\|(?=\u001B)|$)/g, '')
+    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\u001B\[[0-?]*[ -/]*$/g, '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, ''); // keep \t (\u0009) and \n (\u000A)
+  return clean.length > max ? clean.slice(0, max) : clean;
+}
+
+/** Mergeable state as the provider reports it — data, never a guess. */
+export function mergeableText(raw, provider) {
+  if (provider === 'gitlab') {
+    const st = raw && raw.merge_status ? String(raw.merge_status) : '';
+    return st ? `mergeable:${st === 'can_be_merged' ? 'true' : st === 'cannot_be_merged' ? 'false' : st}` : 'mergeable:unknown';
+  }
+  const m = raw ? raw.mergeable : undefined;
+  if (m === true) return 'mergeable:true';
+  if (m === false) return 'mergeable:false';
+  return 'mergeable:unknown (the forge is still computing — re-sync later)';
+}
+
+/**
+ * Per-file diff rows: sanitize each filename and patch, keep the numeric
+ * facts, and hand the render layer raw-enough material to cap with NAMED
+ * markers. Junk entries become honest nulls and are dropped.
+ */
+export function prFileRows(rawFiles) {
+  return (Array.isArray(rawFiles) ? rawFiles : [])
+    .map((f) => {
+      if (!f || typeof f !== 'object') return null;
+      const patch = f.patch == null ? '' : sanitizePrText(String(f.patch));
+      return {
+        filename: sanitizePrText(String(f.filename || ''), { max: 400 }),
+        status: String(f.status || 'modified'),
+        additions: Number.isFinite(Number(f.additions)) ? Number(f.additions) : 0,
+        deletions: Number.isFinite(Number(f.deletions)) ? Number(f.deletions) : 0,
+        patch,
+      };
+    })
+    .filter(Boolean);
+}
+
+const STATUS_GLYPH = { added: 'A', removed: 'D', renamed: 'R', modified: 'M', changed: 'M' };
+
+/**
+ * Render the per-file diff view with NAMED caps. Returns { lines, shown,
+ * total, additions, deletions, capped } — the caller embeds it in the
+ * observation; the numbers ride the prSync/prDiff fact row.
+ */
+export function formatPrFiles(files, { maxFiles = PRSYNC_MAX_FILES, patchChars = PRSYNC_PATCH_CHARS } = {}) {
+  const all = Array.isArray(files) ? files : [];
+  const shown = all.slice(0, maxFiles);
+  const lines = shown.map((f) => {
+    const glyph = STATUS_GLYPH[f.status] || 'M';
+    const head = `  ${glyph} ${f.filename} +${f.additions}/−${f.deletions}`;
+    if (!f.patch) return `${head}\n    (no patch data — binary or too large for the forge's patch view)`;
+    const body = f.patch.length > patchChars
+      ? `${f.patch.slice(0, patchChars)}\n    (patch truncated at ${patchChars} chars — read the file for the rest)`
+      : f.patch;
+    return `${head}\n${body.split('\n').map((l) => `    ${l}`).join('\n')}`;
+  });
+  if (all.length > maxFiles) {
+    lines.push(`  (+${all.length - maxFiles} more files — capped at ${maxFiles} for this view; names ride pr_view/pr_sync's forge page)`);
+  }
+  return {
+    lines,
+    shown: shown.length,
+    total: all.length,
+    additions: all.reduce((a, f) => a + f.additions, 0),
+    deletions: all.reduce((a, f) => a + f.deletions, 0),
+    capped: all.length > maxFiles,
+  };
+}
+
+const countAll = (items) => items.reduce((a, c) => a + 1 + countAll(c.replies || []), 0);
+
+/**
+ * The one-call PR picture (pure — every input is provider-normalized).
+ * Everything the agent needs to act on a review, one bounded observation:
+ * meta + head sha + mergeable + per-file diff + review threads + CI rows.
+ */
+export function formatPrSync({ row, sha, mergeable, provider, repo, files, threads, general, bodies, checks }, opts = {}) {
+  const out = [];
+  out.push(`#${row.number}${row.draft ? ' [draft]' : ''} ${row.title}`);
+  out.push(`  ${row.branch} → ${row.base} · by ${row.author} · updated ${ago(row.at)}${row.url ? ` · ${row.url}` : ''}`);
+  out.push(`  head ${sha ? sha.slice(0, 7) : '?'} · ${mergeable}`);
+  const diffShape = files !== null;
+  if (diffShape) {
+    const v = formatPrFiles(files, opts);
+    out.push(`  files: ${v.total} · +${v.additions}/−${v.deletions} (${v.shown} shown${v.capped ? ', capped' : ''})`);
+  } else {
+    out.push('  files: not fetched (GitLab diffs API not wired this wave — GitHub PRs carry the full diff view)');
+  }
+  if (checks?.length) {
+    for (const c of checks.slice(0, 3)) {
+      out.push(`  CI ${STATE_GLYPH[c.state] || '?'} ${c.name} · ${c.state} · ${ago(c.at)}${c.url ? ` · ${c.url}` : ''}`);
+    }
+  } else {
+    out.push(`  CI on ${row.branch}: no runs found`);
+  }
+  if (diffShape && files?.length) {
+    out.push('');
+    out.push('FILES:');
+    out.push(...formatPrFiles(files, opts).lines);
+  }
+  if (threads?.length || general?.length) {
+    const nInline = (threads || []).reduce((a, g) => a + countAll(g.items), 0);
+    out.push('');
+    out.push(`REVIEW THREADS (${nInline} inline comment${nInline === 1 ? '' : 's'} in ${(threads || []).length} thread${(threads || []).length === 1 ? '' : 's'}, ${general?.length || 0} general):`);
+    for (const g of threads || []) {
+      out.push(`  ${g.file}`);
+      for (const c of g.items) {
+        out.push(`    #${c.id} @${c.author}${c.line ? ` (L${c.line})` : ''}: ${truncate(sanitizePrText(c.body).replace(/\s+/g, ' ').trim(), 300)}`);
+        for (const r of c.replies || []) {
+          out.push(`      └ #${r.id} @${r.author}: ${truncate(sanitizePrText(r.body).replace(/\s+/g, ' ').trim(), 240)}`);
+        }
+      }
+    }
+    for (const c of general || []) {
+      out.push(`    #${c.id} @${c.author} (general): ${truncate(sanitizePrText(c.body).replace(/\s+/g, ' ').trim(), 300)}`);
+    }
+  } else {
+    out.push('');
+    out.push('REVIEW THREADS: none yet');
+  }
+  if (bodies?.length) {
+    const withText = bodies.filter((b) => b && (b.body || '').trim());
+    if (withText.length) {
+      out.push('REVIEW BODIES:');
+      for (const b of withText) {
+        out.push(`  @${b.user?.login || '?'} · ${b.state || 'COMMENTED'}: ${truncate(sanitizePrText(String(b.body)).replace(/\s+/g, ' ').trim(), 240)}`);
+      }
+    }
+  }
+  if (provider === 'gitlab') {
+    out.push('  (GitLab sync: meta + threads + CI — the diff view is a named non-goal this wave)');
+  }
+  return out.join('\n');
+}
 
 // ── Remote parsing (pure) ────────────────────────────────────────────────────
 
@@ -73,6 +252,8 @@ export function embeddedToken(url) {
 // ── Provider resolution ──────────────────────────────────────────────────────
 
 export const GH_OPS = {
+  pr_sync: { desc: 'ONE call, the whole PR picture: meta + head sha + per-file diff + review threads + CI on the head branch (the deep-integration read)', write: false },
+  pr_diff: { desc: 'the PR/MR per-file patches standalone (named caps)', write: false },
   pr_view: { desc: 'one PR/MR: title, branches, state, author, body head', write: false },
   pr_list: { desc: 'open PRs/MRs, newest first (optional branch filter)', write: false },
   pr_comments: { desc: 'inline review comments of a PR/MR, grouped by file, replies folded', write: false },
@@ -80,6 +261,7 @@ export const GH_OPS = {
   pr_create: { desc: 'open a PR/MR: title + branch (head) + base', write: true },
   pr_comment: { desc: 'post a general comment on a PR/MR', write: true },
   pr_review: { desc: 'submit a review: event APPROVE|REQUEST_CHANGES|COMMENT + inline comments', write: true },
+  pr_reply: { desc: 'reply INSIDE a review thread (GitHub: in_reply_to the comment id) — answer a remark in place', write: true },
 };
 
 const GITHUB_TOKEN_KEYS = ['BUDDY_GITHUB_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN'];
@@ -106,7 +288,7 @@ function firstToken(env, keys) {
  * the origin URL (the user's own git auth — many https remotes carry a PAT).
  * The raw remote URL NEVER appears in any message — sanitizeRemote() only.
  */
-export function resolveGh({ root, env = process.env, getRemote = defaultGetRemote } = {}) {
+export function resolveGh({ root, env = process.env, getRemote = defaultGetRemote, httpMs } = {}) {
   const r = getRemote(root);
   if (!r || !r.ok) return { error: `no origin remote (${r?.err || 'git remote get-url origin failed'}) — the gh tool drives GitHub/GitLab for THIS repository` };
   const remoteUrl = r.out || '';
@@ -128,8 +310,8 @@ export function resolveGh({ root, env = process.env, getRemote = defaultGetRemot
   const token = firstToken(env, keys) || embeddedToken(remoteUrl);
   const apiBase = provider === 'github' ? ghApi || 'https://api.github.com' : glApi || 'https://gitlab.com/api/v4';
   const client = provider === 'github'
-    ? new GitHubClient({ token, repo: parsed.repo, apiBase })
-    : new GitLabClient({ token, repo: parsed.repo, apiBase });
+    ? new GitHubClient({ token, repo: parsed.repo, apiBase, ...(httpMs ? { httpMs } : {}) })
+    : new GitLabClient({ token, repo: parsed.repo, apiBase, ...(httpMs ? { httpMs } : {}) });
   return { provider, host: parsed.host, owner: parsed.owner, repo: parsed.repo, token, apiBase, client };
 }
 
@@ -369,7 +551,10 @@ export async function ghPrForBranch(g, branch) {
   return prs?.[0] || null;
 }
 
-/** Everything /pr-comments needs: pr rows + grouped comments (+ review bodies). */
+/** Everything /pr-comments needs: pr rows + grouped comments (+ review bodies).
+ * Remote bodies pass sanitizePrText here — the shared boundary also serves the
+ * gh tool's pr_comments op, so the hygiene holds on BOTH surfaces.
+ */
 export async function ghPrComments(g, { pr, branch } = {}) {
   let pull = null;
   let number = Number(pr) || 0;
@@ -386,8 +571,9 @@ export async function ghPrComments(g, { pr, branch } = {}) {
   } else {
     [rawComments, bodies] = await Promise.all([g.client.listReviewComments(number), g.client.listReviews(number)]);
   }
-  const org = organizeComments(rawComments, g.provider);
-  return { pr: number, row, ...org, bodies };
+  const clean = (list) => (list || []).map((c) => (c && typeof c === 'object' ? { ...c, body: sanitizePrText(c.body) } : c));
+  const org = organizeComments(clean(rawComments), g.provider);
+  return { pr: number, row, ...org, bodies: clean(bodies) };
 }
 
 // ── The op dispatcher (never throws — observation strings) ───────────────────
@@ -397,14 +583,64 @@ const REVIEW_EVENTS = new Set(['APPROVE', 'REQUEST_CHANGES', 'COMMENT']);
 export async function ghOp(root, op, args = {}, ctx = {}) {
   const spec = GH_OPS[op];
   if (!spec) {
-    return `ERROR: unknown gh op "${op}" — ops: ${Object.keys(GH_OPS).join(', ')}. Reads: pr_view, pr_list, pr_comments, ci_runs. Writes (approval-gated): pr_create, pr_comment, pr_review.`;
+    return `ERROR: unknown gh op "${op}" — ops: ${Object.keys(GH_OPS).join(', ')}. Reads: pr_sync (the whole picture in one call), pr_diff, pr_view, pr_list, pr_comments, ci_runs. Writes (approval-gated): pr_create, pr_comment, pr_reply, pr_review.`;
   }
-  const g = resolveGh({ root, env: ctx.env, getRemote: ctx.getRemote });
+  const g = resolveGh({ root, env: ctx.env, getRemote: ctx.getRemote, httpMs: ctx.httpMs });
   if (g.error) return `ERROR: ${g.error}`;
   const { provider, client, owner, repo } = g;
+  // FACTS, NOT CONTENT: prSync/prDiff/prReply rows carry counts only — zero
+  // title/body/patch bytes ride the events log (appendEvent is best-effort by
+  // construction and can never break an op).
+  const emit = (ev) => {
+    if (ctx.eventsRoot) appendEvent(ctx.eventsRoot, { provider, ...ev });
+  };
 
   try {
     switch (op) {
+      case 'pr_sync': {
+        const n = Number(args.pr) || 0;
+        const branch = args.branch ? String(args.branch) : '';
+        if (!n && !branch) return 'ERROR: pr_sync needs {"pr": <number>} (or {"branch": "…"} to sync the branch\'s open PR)';
+        let pull;
+        if (n) pull = provider === 'gitlab' ? await client.getMr(n) : await client.getPull(n);
+        else {
+          pull = await ghPrForBranch(g, branch);
+          if (!pull) return `ERROR: no open PR/MR from branch "${branch}" — pass a number: {"op":"pr_sync","pr":7}`;
+        }
+        if (!pull || typeof pull !== 'object') return `ERROR: the forge returned no usable JSON for PR ${n || branch} (an HTML page or an empty body?) — is BUDDY_GITHUB_API pointed at the right base?`;
+        const number = provider === 'gitlab' ? (pull.iid ?? pull.number) : pull.number;
+        const row = prRow(pull, provider);
+        const sha = provider === 'gitlab' ? String(pull.sha || '') : String(pull.head?.sha || '');
+        let rawComments, rawBodies = [];
+        if (provider === 'gitlab') {
+          rawComments = await client.listMrNotes(number);
+        } else {
+          [rawComments, rawBodies] = await Promise.all([client.listReviewComments(number), client.listReviews(number)]);
+        }
+        const clean = (list) => (list || []).map((c) => (c && typeof c === 'object' ? { ...c, body: sanitizePrText(c.body) } : c));
+        const org = organizeComments(clean(rawComments), provider);
+        let rawFiles = null;
+        if (provider === 'github') rawFiles = prFileRows(await client.getFiles(number));
+        const checks = (await ghCiRows(g, { branch: row.branch })).slice(0, 3);
+        const v = rawFiles ? formatPrFiles(rawFiles) : null;
+        emit({
+          type: 'prSync', ok: true, pr: number, files: rawFiles ? rawFiles.length : null,
+          filesShown: v ? v.shown : null, capped: v ? v.capped : false,
+          threads: (org.groups || []).length,
+          comments: (org.groups || []).reduce((a, gp) => a + countAll(gp.items), 0) + (org.general || []).length,
+          checks: checks.length,
+        });
+        return formatPrSync({ row, sha, mergeable: mergeableText(pull, provider), provider, repo, files: rawFiles, threads: org.groups, general: org.general, bodies: clean(rawBodies), checks });
+      }
+      case 'pr_diff': {
+        const n = Number(args.pr) || 0;
+        if (!n) return 'ERROR: pr_diff needs {"pr": <number>}';
+        if (provider === 'gitlab') return 'ERROR: pr_diff is GitHub-only this wave — the GitLab diffs API is not wired; pr_view/pr_comments/ci_runs still work';
+        const rawFiles = prFileRows(await client.getFiles(n));
+        const v = formatPrFiles(rawFiles);
+        emit({ type: 'prDiff', ok: true, pr: n, files: rawFiles.length, filesShown: v.shown, capped: v.capped });
+        return [`PR #${n} diff — ${v.shown}/${v.total} files, +${v.additions}/−${v.deletions}${v.capped ? ` (capped at ${PRSYNC_MAX_FILES} files)` : ''}`, ...v.lines].join('\n');
+      }
       case 'pr_view': {
         const n = Number(args.pr);
         if (!n) return 'ERROR: pr_view needs {"pr": <number>}';
@@ -481,6 +717,20 @@ export async function ghOp(root, op, args = {}, ctx = {}) {
         await client.createReview(n, { body, event, comments: inline });
         return `review ${event} submitted on ${providerName(provider)} PR #${n} (${inline.length} inline comment${inline.length === 1 ? '' : 's'}${body ? `, ${body.length}-char body` : ''})`;
       }
+      case 'pr_reply': {
+        const n = Number(args.pr);
+        const tid = Number(args.inReplyTo);
+        if (!Number.isInteger(n) || n <= 0) return 'ERROR: pr_reply needs {"pr": <number>} — the PR the thread lives on';
+        if (!Number.isInteger(tid) || tid <= 0) return 'ERROR: pr_reply needs {"inReplyTo": <comment id>} — the id of the review comment being answered (pr_sync/pr_comments print it as #id)';
+        const body = typeof args.body === 'string' ? args.body : '';
+        if (!body.trim()) return 'ERROR: pr_reply needs a non-empty "body" — say what was done about the remark';
+        if (body.length > REPLY_BODY_MAX) return `ERROR: body is ${body.length} chars — over the ${REPLY_BODY_MAX}-char reply cap; split the answer across replies (writes are never silently truncated)`;
+        if (provider === 'gitlab') return 'ERROR: GitLab thread replies need the discussions API (not supported yet) — post a general note with {"op":"pr_comment"} instead';
+        const created = await client.replyToReview(n, tid, body);
+        emit({ type: 'prReply', ok: true, pr: n, inReplyTo: tid, bodyChars: body.length });
+        const cid = created && created.id != null ? created.id : '?';
+        return `replied to review thread ${tid} on ${providerName(provider)} PR #${n} — new comment id ${cid} (${body.length} chars)`;
+      }
       default:
         return `ERROR: op "${op}" has no handler`;
     }
@@ -491,16 +741,41 @@ export async function ghOp(root, op, args = {}, ctx = {}) {
 
 // ── Registry-ready tool def ──────────────────────────────────────────────────
 
-export function buildGhTool({ root = process.cwd(), env = process.env, httpMs, maxCalls = 8 } = {}) {
+export function buildGhTool({ root = process.cwd(), env = process.env, httpMs, maxCalls = 8, eventsRoot = root } = {}) {
   return {
     name: 'gh',
     description:
-      'GitHub/GitLab over REST with the USER token from the env (zero-dep; provider + repo auto-detected from the origin remote): PR/MR view·list·comments·create·comment·review and CI run status. Read ops are free; write ops (pr_create / pr_comment / pr_review) go through the approval gate.',
+      'GitHub/GitLab over REST with the USER token from the env (zero-dep; provider + repo auto-detected from the origin remote). The deep-integration read: {"op":"pr_sync"} lands the WHOLE PR picture in ONE call — meta, head sha, per-file diff, review threads (with their comment ids), CI on the head branch; {"op":"pr_diff"} shows the patches; after a fix lands, {"op":"pr_reply"} answers a review remark IN its thread (approval-gated, like pr_create/pr_comment/pr_review). Remote comment/patch text is sanitized data; events.jsonl carries counts only.',
     args:
-      '{"op":"pr_view","pr":7} · {"op":"pr_comments","pr":7} · {"op":"ci_runs"} · {"op":"ci_runs","branch":"main"} · {"op":"pr_list"} · {"op":"pr_create","title":"fix: …","branch":"fix/x","base":"main","body":"…"} · {"op":"pr_comment","pr":7,"body":"…"} · {"op":"pr_review","pr":7,"event":"REQUEST_CHANGES","body":"…","comments":[{"path":"src/a.js","line":12,"body":"…"}]}',
+      '{"op":"pr_sync","pr":7} · {"op":"pr_diff","pr":7} · {"op":"pr_view","pr":7} · {"op":"pr_comments","pr":7} · {"op":"ci_runs"} · {"op":"pr_list"} · {"op":"pr_create","title":"fix: …","branch":"fix/x","base":"main","body":"…"} · {"op":"pr_comment","pr":7,"body":"…"} · {"op":"pr_reply","pr":7,"inReplyTo":101,"body":"fixed — the guard returns \"\" for empty input"} · {"op":"pr_review","pr":7,"event":"REQUEST_CHANGES","body":"…","comments":[{"path":"src/a.js","line":12,"body":"…"}]}',
     maxCalls,
-    render: (a) => `gh ${a?.op || '?'}${a?.pr ? ` #${a.pr}` : ''}${a?.branch ? ` ${a.branch}` : ''}`,
-    riskyWhen: (a) => !!GH_OPS[String(a?.op || '')]?.write,
-    run: async (a = {}) => ghOp(root, String(a?.op || ''), a, { env, httpMs }),
+    render: (a) => {
+      if (!a || typeof a !== 'object') return 'gh ?';
+      try {
+        const op = typeof a.op === 'string' ? a.op : '?';
+        const pr = a.pr != null && Number.isFinite(Number(a.pr)) ? ` #${a.pr}` : '';
+        const branch = typeof a.branch === 'string' && a.branch ? ` ${a.branch}` : '';
+        return `gh ${op}${pr}${branch}`;
+      } catch {
+        return 'gh ?'; // a hostile getter can never break the loop's narration
+      }
+    },
+    riskyWhen: (a) => {
+      if (!a || typeof a !== 'object') return false;
+      try {
+        return !!GH_OPS[typeof a.op === 'string' ? a.op : '']?.write;
+      } catch {
+        return false; // unreadable args are never silently RISKY
+      }
+    },
+    run: async (a = {}) => {
+      let op = '';
+      try {
+        op = a && typeof a.op === 'string' ? a.op : String(a?.op ?? '');
+      } catch (e) {
+        return `ERROR: the gh args are hostile (reading op threw: ${truncate(e.message, 120)})`;
+      }
+      return ghOp(root, op, a, { env, httpMs, eventsRoot });
+    },
   };
 }

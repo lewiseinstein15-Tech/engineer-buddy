@@ -150,6 +150,19 @@ export class GitHubClient {
     }
   }
 
+  /**
+   * Reply INSIDE an existing review-comment thread (v0.61.0 PR deep
+   * integration): POST /pulls/{n}/comments/{id}/replies — the GitHub shape
+   * for answering a reviewer in place. A WRITE: _req never auto-retries it
+   * (the v0.35.0 double-post lesson covers this path automatically).
+   */
+  replyToReview(number, commentId, body) {
+    return this._req(`/repos/${this.repo}/pulls/${number}/comments/${Number(commentId)}/replies`, {
+      method: 'POST',
+      body: { body: String(body ?? '') },
+    });
+  }
+
   async createComment(number, body) {
     return this._req(`/repos/${this.repo}/issues/${number}/comments`, { method: 'POST', body: { body } });
   }
