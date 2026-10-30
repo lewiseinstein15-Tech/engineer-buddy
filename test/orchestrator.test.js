@@ -351,3 +351,34 @@ describe('runAutonomous', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 });
+
+describe('runAutonomous — the v0.58 drill-take pin', () => {
+  test('the model completes the work INSIDE the planning turn: 0 loop turns, the plan is still honestly done (caught on camera, 2026-10-30)', async () => {
+    const root = tmpRoot();
+    const turns = [];
+    const out = await runAutonomous({
+      root,
+      task: 'remove the duplicate block',
+      maxTurns: 4,
+      verifyCmd: 'npm test',
+      runOneTurn: async ({ phase, turn }) => {
+        turns.push({ phase, turn });
+        if (phase === 'plan') {
+          // the over-achieving model: plans AND finishes, marking the item
+          // done through the todo tool before the loop ever spins
+          writeTodoFile(root, items([['1', 'done']]));
+        }
+        return { ok: true, said: 'Done. Removed it; 1375 tests pass.' };
+      },
+      runVerifyCmd: async () => ({ ok: true, exitCode: 0 }),
+      onEvent: () => {},
+    });
+    assert.deepEqual(turns, [{ phase: 'plan', turn: 0 }]); // the loop never spun — no idle burns
+    assert.equal(out.summary.turns, 0);
+    assert.equal(out.summary.done, 1); // the PLAN's truth, not the loop's vanity
+    assert.equal(out.summary.verifiedByLoop, 0); // honest: this loop verified nothing itself
+    assert.equal(out.summary.blocked, 0);
+    assert.equal(out.summary.remaining, 0);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+});

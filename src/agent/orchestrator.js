@@ -244,11 +244,17 @@ export async function runAutonomous({
   }
 
   // ── 3. SUMMARY — bounded facts, the ship report ──────────────────────────
+  // done counts the PLAN's truth (any item with status done — including one
+  // the model completed inside the planning turn, which the v0.58 drill take
+  // caught on camera: the loop ran 0 turns, the plan was still fully done);
+  // verifiedByLoop counts only the items THIS loop personally drove through
+  // the verify gate. The two numbers together are the honest story.
   const summary = {
     plannedBy,
     planned: items.length,
     turns: turn,
-    done: done.length,
+    done: items.filter((it) => it && it.status === 'done').length,
+    verifiedByLoop: done.length,
     blocked: blocked.length,
     remaining: items.filter((it) => it && it.status === 'pending').length,
     verifyCmd: cmd,
