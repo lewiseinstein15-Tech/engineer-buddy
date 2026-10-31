@@ -139,7 +139,10 @@ test('plan mode: burning the fs_search cap points at exit_plan', async () => {
   const { tools, harness } = makeBuddy(root, modes);
   const same = '{"tool":"fs_search","args":{"needle":"todo"}}';
   const router = fakeRouter([same, same, same, same, same, same, same]);
-  const chat = createChat({ router, tools, harness, modes });
+  // v0.64.1: the 6-call default cap is REMOVED (Infinity) — an honest research
+  // turn reads as many files as it needs. The cap MESSAGE contract is still
+  // pinned here by RE-ARMING the cap explicitly, as chat.toolCallCap does.
+  const chat = createChat({ router, tools, harness, modes, toolCallCap: 6 });
   await chat.turn('research');
   const obs = chat.messages.filter((m) => m.content.startsWith('TOOL OBSERVATION')).map((m) => m.content);
   assert.equal(obs.length, 7, 'six searches run, the 7th hits the cap');

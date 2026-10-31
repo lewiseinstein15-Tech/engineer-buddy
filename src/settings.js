@@ -71,3 +71,27 @@ export function getChatSetting(root, key, fallback = null, opts = {}) {
   const v = view?.chat?.[key];
   return v === undefined ? fallback : v;
 }
+
+/**
+ * chat.toolCallCap — per-turn cap for tools that declare NO maxCalls of their
+ * own. v0.64.1 default: REMOVED (Infinity) — the old `?? 6` strangled honest
+ * research turns (the live-probe session burned 6 fs_reads and died mid-task).
+ * A tool's DECLARED maxCalls (task's stampede guard, planmode's 3, gitwrite's
+ * 8) always wins regardless of this knob. Rules mirror chat.workspaceWatch:
+ *   absent / null / '' / false / 0 / 'off' / 'false' → Infinity (cap removed);
+ *   positive integer (number or numeric string, ≤ 100000)            → that cap;
+ *   everything else (true, 'abc', 7.5, -1, objects, 1e21)            → NAMED junk,
+ *   the default (unlimited) holds — a junk value can never silently cap a turn.
+ */
+export function resolveToolCallCap(v) {
+  if (v === undefined || v === null || v === '' || v === false) return { cap: Infinity, note: null };
+  if (v === true) {
+    return { cap: Infinity, note: 'chat.toolCallCap: true means nothing — a cap needs a NUMBER; the default (unlimited) holds' };
+  }
+  if (v === 0 || v === '0' || v === 'off' || v === 'false') return { cap: Infinity, note: null };
+  const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v.trim()) : NaN;
+  if (Number.isInteger(n) && n > 0 && n <= 100000) return { cap: n, note: null };
+  let shown;
+  try { shown = typeof v === 'object' ? JSON.stringify(v) : String(v); } catch { shown = '[unprintable]'; }
+  return { cap: Infinity, note: `chat.toolCallCap: junk value (${shown}) ignored — the default (unlimited) holds` };
+}

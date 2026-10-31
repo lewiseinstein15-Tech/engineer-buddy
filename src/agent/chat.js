@@ -117,6 +117,7 @@ export function createChat({
   onStream = null, // (fragment: string) => void — raw gateway deltas as they arrive (TUI thought line); null = buffered chat
   whyContract = false, // v0.46: hard-bounce why-less decision calls (opt-in; default teaches in-band — see the WHY CONTRACT block)
   routing = null, // v0.56 multi-model routing: { mode:'auto'|'off', tiers:{name:'strong'|'general'|'fast'} } — tiers are the OPERATOR's declaration (buddy.config.json); undeclared = inert
+  toolCallCap = Infinity, // v0.64.1: per-tool per-turn cap for tools that declare NO maxCalls of their own. Infinity (the default) = REMOVED — a research turn reads as many files as the task needs; the live probe burned 6 fs_reads and died. A tool's DECLARED maxCalls (task's stampede guard, planmode's 3, gitwrite's 8) always wins; chat.toolCallCap in .buddy/settings.json re-arms a global cap.
   onEvent = () => {},
 }) {
   const byName = new Map(tools.map((t) => [t.name, t]));
@@ -618,7 +619,12 @@ export function createChat({
       } else if (!impl) {
         observation = `ERROR: unknown tool "${tool}". Available: ${[...byName.keys()].join(', ')}`;
       } else {
-        const cap = impl.maxCalls ?? 6;
+        // Per-tool per-turn cap: a tool's DECLARED maxCalls always wins; the
+        // global default is Infinity — the 6-call default is REMOVED (v0.64.1).
+        // The old `?? 6` strangled honest research turns (the live probe hit
+        // 6/6 on fs_read and died mid-task); runaway loops stay bounded by the
+        // step budget, the identical-repeat guard, and declared caps.
+        const cap = impl.maxCalls ?? toolCallCap;
         const used = callCounts.get(tool) || 0;
         if (used >= cap) {
           observation = `ERROR: tool "${tool}" already used ${used}/${cap} times this turn. Work differently${modes?.plan ? ', say, or call exit_plan with the plan you have' : ' or say'}.`;

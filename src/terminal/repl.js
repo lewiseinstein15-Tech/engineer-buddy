@@ -45,7 +45,7 @@ import { detectTerminal, setupSteps, NO_SETUP } from './termkeys.js';
 import { SEM, renderDoneRibbon } from './theme.js';
 import { BG, createBgTurn, bgFinish, bgBufferEvent, resolveBgId, parseBgArgs, renderBgList, renderBgView, renderBgNote } from './tasks.js';
 import { makeThoughtExtractor } from './streamthought.js';
-import { getChatSetting, setChatSetting, loadSettingsView } from '../settings.js';
+import { getChatSetting, setChatSetting, loadSettingsView, resolveToolCallCap } from '../settings.js';
 import { normalizeTier, normalizeRoutingMode } from '../brain/effort.js';
 import { voiceDirPath, readVoiceConfig, voiceStatusText, probeRecorders, startRecording, finalizeTornWav, parseWav, transcribeWav } from '../voice.js';
 import { listOutputStyles, loadOutputStyle } from '../harness/outputstyles.js';
@@ -346,9 +346,14 @@ export async function createBuddySession({ root = process.cwd(), router, yolo = 
   const hooks = new HookRunner({ root });
   // Rules engine (v0.19.0): user → project settings.json under permissions.
   const { perms, warnings: permissionWarnings } = loadPermissions(root);
+  // chat.toolCallCap (v0.64.1): the per-tool 6-call default is REMOVED — absent
+  // → unlimited. A junk value is NAMED here at session start and the default
+  // holds; a positive integer re-arms a global cap for tools that declare none.
+  const toolCap = resolveToolCallCap(getChatSetting(root, 'toolCallCap'));
+  if (toolCap.note) console.error(c.dim(`  ↳ ${toolCap.note}`));
   // todoState is shared: the todo tool writes it (local.js), compaction reads
   // it (todo v2 plan anchor) — one object, one truth.
-  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, todoState, hooks, permissions: perms, yolo, root, onEvent, repoMap, effort, streaming, onStream, routing, whyContract: process.env.BUDDY_WHY_CONTRACT === '1' || getChatSetting(root, 'whyContract', false) === true });
+  const session = createChat({ router, tools, harness, skills, charBudget, approval, modes, todoState, hooks, permissions: perms, yolo, root, onEvent, repoMap, effort, streaming, onStream, routing, toolCallCap: toolCap.cap, whyContract: process.env.BUDDY_WHY_CONTRACT === '1' || getChatSetting(root, 'whyContract', false) === true });
   if (resumeFrom) {
     for (const m of resumeMessages(loadSession(resumeFrom))) session.messages.push(m);
   }
