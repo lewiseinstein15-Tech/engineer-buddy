@@ -49,6 +49,7 @@ function usage() {
 
 Local coding agent (Buddy Code — like Claude Code, in your terminal):
   engineer-buddy                        interactive session in the current directory
+  engineer-buddy --version              print the version and exit (-v works too)
   engineer-buddy -p "task"              one-shot autonomous task (add --safe to deny writes)
   engineer-buddy run-auto "task"        run-until-done (v0.58.0): plan once (todo v2), then
                                         pick the next ready item → ONE focused turn → verify
@@ -366,9 +367,14 @@ async function cmdChat(argv, { oneShot = false } = {}) {
       resume: { type: 'string' },
       o: { type: 'string' },
       'output-format': { type: 'string' },
+      version: { type: 'boolean', default: false },
     },
     allowPositionals: true,
   });
+  // --version LATE in a chat vector (e.g. `buddy -p "x" --version`) prints and exits
+  // BEFORE loadConfig/buildRouter — a version probe needs neither config nor network,
+  // and the strict parser must never see the option as an unknown-flag crash.
+  if (values.version) { console.log(VERSION); return 0; }
   const cfg = loadConfig({ file: values.config });
   const router = buildRouter(cfg);
   let root = values.dir ? path.resolve(values.dir) : process.cwd();
@@ -1282,6 +1288,12 @@ async function cmdRunAuto(argv) {
 async function main() {
   const [cmd, ...argv] = process.argv.slice(2);
   try {
+    // --version / -v answer before ANY dispatch: the flags-first route below would
+    // otherwise feed '--version' to cmdChat's STRICT parseArgs, which never knew the
+    // option — `buddy --version` died with ERR_PARSE_ARGS_UNKNOWN_OPTION instead of
+    // printing the version (the crash the live session caught). Bare semver on stdout,
+    // machine-parseable — the banner on stderr is for humans, this is for scripts.
+    if (cmd === '--version' || cmd === '-v') { console.log(VERSION); return 0; }
     if (cmd === undefined || cmd === 'chat') {
       await cmdChat(argv); // returns immediately by design — the REPL owns the process from here
       return 0;            // quitting happens in the REPL's own close handler ("bye" + exit 0)
