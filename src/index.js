@@ -1328,6 +1328,20 @@ async function main() {
     usage();
     process.exit(2);
   } catch (e) {
+    // A strict parser choked on the flag vector — a TEACHING refusal, never a stack.
+    // The user typo'd a flag (or forgot a value); a raw TypeError through Node's
+    // internals teaches nothing. Name the flag, point at -h, exit 2. One catch site
+    // covers EVERY subcommand parser (chat, watch, run-auto, …) — they all bubble here.
+    if (e && typeof e.code === 'string' && e.code.startsWith('ERR_PARSE_ARGS_')) {
+      const unknown = /Unknown option '([^']+)'/.exec(e.message || '');
+      const missing = /^Option '([^' <]+)/.exec(e.message || '');
+      warn(unknown
+        ? `unknown flag '${unknown[1]}' — 'buddy -h' lists the commands; a dash-leading VALUE goes after '--'`
+        : missing
+          ? `flag '${missing[1]}' needs a value — place it right after the flag; 'buddy -h' lists the commands`
+          : `bad flag vector — 'buddy -h' lists the commands`);
+      process.exit(2);
+    }
     warn(e instanceof BuddyError ? `${e.code}: ${e.message}` : e.stack || e.message);
     process.exit(e instanceof BuddyError && e.code === 'ALL_GATEWAYS_FAILED' ? 0 : 2);
   }
