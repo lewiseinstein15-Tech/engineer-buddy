@@ -45,7 +45,7 @@ import { detectTerminal, setupSteps, NO_SETUP } from './termkeys.js';
 import { SEM, renderDoneRibbon } from './theme.js';
 import { BG, createBgTurn, bgFinish, bgBufferEvent, resolveBgId, parseBgArgs, renderBgList, renderBgView, renderBgNote } from './tasks.js';
 import { makeThoughtExtractor } from './streamthought.js';
-import { getChatSetting, setChatSetting, loadSettingsView, resolveToolCallCap } from '../settings.js';
+import { getChatSetting, setChatSetting, loadSettingsView, resolveToolCallCap, resolveTurnBudget } from '../settings.js';
 import { normalizeTier, normalizeRoutingMode } from '../brain/effort.js';
 import { voiceDirPath, readVoiceConfig, voiceStatusText, probeRecorders, startRecording, finalizeTornWav, parseWav, transcribeWav } from '../voice.js';
 import { listOutputStyles, loadOutputStyle } from '../harness/outputstyles.js';
@@ -144,18 +144,27 @@ export const SLASH_DESCRIPTIONS = {
   exit: 'Leave',
 };
 
-/** /effort — presets per level. Exported for tests + the /effort surface. */
+/** /effort — presets per level. Exported for tests + the /effort surface.
+ *  v0.64.1: the ladder is RAISED (8/14/24 → 12/30/48) — the live commit task
+ *  died twice at 14 steps with "I paused mid-task" while still writing the
+ *  first commit message. A long task (test → commit → docs → push → CI →
+ *  tag) is 20-40 honest steps. chat.maxSteps in .buddy/settings.json
+ *  overrides a preset entirely (0 removes the budget) — see resolveTurnBudget. */
 export const EFFORT_PRESETS = {
-  low: { level: 'low', maxSteps: 8, maxTokens: 900 },
-  medium: { level: 'medium', maxSteps: 14, maxTokens: 1500 },
-  high: { level: 'high', maxSteps: 24, maxTokens: 2200 },
+  low: { level: 'low', maxSteps: 12, maxTokens: 900 },
+  medium: { level: 'medium', maxSteps: 30, maxTokens: 1500 },
+  high: { level: 'high', maxSteps: 48, maxTokens: 2200 },
 };
 
-/** Apply an effort preset to a live session's chat.effort (pure side-effect on the ref). */
-export function applyEffort(chat, level) {
+/** Apply an effort preset to a live session's chat.effort (pure side-effect on the ref).
+ *  budgetOverride (v0.64.1) — the chat.maxSteps declaration; it beats every
+ *  preset, so /effort switches the reply dial without resurrecting the old
+ *  step budget the operator explicitly set. */
+export function applyEffort(chat, level, budgetOverride = null) {
   const p = EFFORT_PRESETS[String(level || '').toLowerCase()];
   if (!p) return false;
   Object.assign(chat.effort, p);
+  if (budgetOverride !== null) chat.effort.maxSteps = budgetOverride;
   return true;
 }
 
@@ -478,8 +487,12 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
   // Effort (v0.25.0) applies headless too — v0.56.0: the persisted level owns
   // the loop budget AND the routing bias. One dial everywhere: the REPL, the
   // sub-agents and the CI one-shot now read the same chat.effort setting.
+  // v0.64.1: chat.maxSteps (when declared) beats the preset ladder headless
+  // too — a CI task gets the same budget the REPL promised.
   const persistedEffort = getChatSetting(root, 'effort', 'medium');
+  const turnBudget = resolveTurnBudget(getChatSetting(root, 'maxSteps'));
   const effortRef = EFFORT_PRESETS[persistedEffort] ? { ...EFFORT_PRESETS[persistedEffort] } : null;
+  if (effortRef && turnBudget.budget !== null) effortRef.maxSteps = turnBudget.budget;
   const { chat, hooks } = await createBuddySession({
     root,
     router,
@@ -751,7 +764,13 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   // v0.56: the effort ref is hoisted HERE so the session, the routing policy
   // and /effort all share ONE object — a level change retunes routing live.
   const persistedEffort = getChatSetting(root, 'effort', 'medium');
-  const effortRef = { level: EFFORT_PRESETS[persistedEffort]?.level || 'medium', maxSteps: EFFORT_PRESETS[persistedEffort]?.maxSteps || 14, maxTokens: EFFORT_PRESETS[persistedEffort]?.maxTokens || 1500 };
+  // chat.maxSteps (v0.64.1): an explicit step budget beats the preset ladder;
+  // 0/'off' removes the budget entirely (the turn ends when the model ends).
+  // Junk is NAMED here and the preset holds — a typo can never silently
+  // shrink or grow the budget.
+  const turnBudget = resolveTurnBudget(getChatSetting(root, 'maxSteps'));
+  if (turnBudget.note) console.error(c.dim(`  ↳ ${turnBudget.note}`));
+  const effortRef = { level: EFFORT_PRESETS[persistedEffort]?.level || 'medium', maxSteps: turnBudget.budget ?? (EFFORT_PRESETS[persistedEffort]?.maxSteps || 14), maxTokens: EFFORT_PRESETS[persistedEffort]?.maxTokens || 1500 };
   const routingCfg = buildRoutingConfig(config, root, effortRef); // one declaration, shared by loop + sub-agents + /effort + /gateways
   let healedNote = false;
   const routingMemAtStart = loadRoutingMemory(root);
@@ -1249,13 +1268,13 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           const tierDesc = Object.entries(routingCfg.tiers).filter(([, t]) => t !== 'general');
           say(
             `\n  effort: ${c.bold(e.level)} — ${e.maxSteps} steps/task · ~${e.maxTokens} tok replies\n` +
-              `  ${c.dim('low = quick chores (8 steps, tight replies) · medium = default · high = hard tasks (24 steps, more room)')}\n` +
+              `  ${c.dim('low = quick chores (12 steps, tight replies) · medium = default (30 steps) · high = hard tasks (48 steps, more room)')}\n` +
               `  ${c.dim(`routing: ${routingCfg.mode} — ${e.level === 'high' ? 'every step leads with the strong tier' : e.level === 'low' ? 'every step leads with the fast tier' : 'planning steps lead strong, chores lead fast'}`)}${tierDesc.length ? ` ${c.dim(`(tiers: ${tierDesc.map(([n, t]) => `${n}=${t}`).join(', ')})`)}` : c.dim(' (no tiers declared — routing inert; set gateways.<name>.tier in buddy.config.json)')}\n` +
               `  ${c.dim('set it: /effort low | /effort medium | /effort high')}\n`
           );
           break;
         }
-        if (!applyEffort(chat, args)) {
+        if (!applyEffort(chat, args, turnBudget.budget)) {
           say(`\n  unknown effort "${args}" — choose: low · medium · high\n`);
           break;
         }
@@ -1436,7 +1455,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         say(
           `\n${renderTable(rows, { headers: ['alive', 'server', 'tools', 'info'] })}` +
             (toolRows.length ? `\n${renderTable(toolRows, { headers: ['tool', 'description'] })}\n` : '\n') +
-            c.dim('  first use of each tool asks for approval — answer "a" to always allow it this session\n')
+            c.dim('  first use of each risky tool asks for approval — answer "a" to always allow it this session (bash: always = this exact command)\n')
         );
         break;
       }

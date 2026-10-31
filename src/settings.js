@@ -95,3 +95,32 @@ export function resolveToolCallCap(v) {
   try { shown = typeof v === 'object' ? JSON.stringify(v) : String(v); } catch { shown = '[unprintable]'; }
   return { cap: Infinity, note: `chat.toolCallCap: junk value (${shown}) ignored — the default (unlimited) holds` };
 }
+
+/**
+ * chat.maxSteps — the per-turn STEP budget override (v0.64.1). The effort
+ * presets (low 12 / medium 30 / high 48) stay the default ladder; this knob
+ * beats them when declared, so a long task (commit → test → docs → push →
+ * CI → tag) stops dying at 14 steps with "I paused mid-task". Rules mirror
+ * chat.toolCallCap, with one honest difference: ABSENT means the preset
+ * ladder stands (a budget is the loop's forced wrap-up — removing it must
+ * be a declaration, not a default):
+ *   absent / null / ''                                    → null (preset stands);
+ *   0 / '0' / 'off' / 'false' / false                      → Infinity (budget
+ *     REMOVED — the turn ends when the model ends; the identical-repeat
+ *     guard and the shell blocklist are then the only bounds. Declare it.)
+ *   positive integer 2..1000 (number or numeric string)    → that budget;
+ *   everything else (true, 'abc', 7.5, 1, -1, objects)     → NAMED junk, the
+ *     preset holds — a typo can never silently shrink or grow the budget.
+ */
+export function resolveTurnBudget(v) {
+  if (v === undefined || v === null || v === '') return { budget: null, note: null };
+  if (v === false || v === 0 || v === '0' || v === 'off' || v === 'false') return { budget: Infinity, note: null };
+  if (v === true) {
+    return { budget: null, note: 'chat.maxSteps: true means nothing — a budget needs a NUMBER (0 removes it); the effort preset holds' };
+  }
+  const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v.trim()) : NaN;
+  if (Number.isInteger(n) && n >= 2 && n <= 1000) return { budget: n, note: null };
+  let shown;
+  try { shown = typeof v === 'object' ? JSON.stringify(v) : String(v); } catch { shown = '[unprintable]'; }
+  return { budget: null, note: `chat.maxSteps: junk value (${shown}) ignored — the effort preset holds` };
+}

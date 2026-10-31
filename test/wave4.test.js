@@ -130,10 +130,19 @@ test('effort: maxTokens follows the level (plan floor still wins)', async () => 
 test('effort presets: applyEffort mutates the live ref; unknown levels rejected', () => {
   const fake = { effort: { level: 'medium', maxSteps: 14, maxTokens: 1500 } };
   assert.equal(applyEffort(fake, 'high'), true);
-  assert.deepEqual({ ...fake.effort }, { level: 'high', maxSteps: 24, maxTokens: 2200 });
+  assert.deepEqual({ ...fake.effort }, { level: 'high', maxSteps: 48, maxTokens: 2200 });
   assert.equal(applyEffort(fake, 'turbo'), false);
   assert.equal(fake.effort.level, 'high'); // unchanged by the failed apply
-  assert.deepEqual(EFFORT_PRESETS.low, { level: 'low', maxSteps: 8, maxTokens: 900 });
+  assert.deepEqual(EFFORT_PRESETS.low, { level: 'low', maxSteps: 12, maxTokens: 900 });
+  // v0.64.1: a chat.maxSteps declaration beats every preset — /effort keeps
+  // honoring the operator's budget instead of resurrecting the preset's.
+  const pinned = { effort: { level: 'medium', maxSteps: 30, maxTokens: 1500 } };
+  assert.equal(applyEffort(pinned, 'high', 60), true);
+  assert.equal(pinned.effort.maxSteps, 60);
+  assert.equal(pinned.effort.level, 'high');
+  const off = { effort: { level: 'medium', maxSteps: 30, maxTokens: 1500 } };
+  assert.equal(applyEffort(off, 'low', Infinity), true);
+  assert.equal(off.effort.maxSteps, Infinity, 'budget removed stays removed across /effort');
 });
 
 test('palette: stats/effort/events registered with descriptions', () => {

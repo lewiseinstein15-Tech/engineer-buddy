@@ -272,6 +272,32 @@ test('runSubagent: risky tool inside sub-agent goes through the approval gate', 
   assert.equal(report, 'worked around the denial');
 });
 
+test('runSubagent: a riskyWhen tool gates PER CALL — the safe shape runs silent', async () => {
+  const decisions = [];
+  const approval = async (q) => {
+    decisions.push(q.args?.command);
+    return 'always';
+  };
+  const router = mockRouter([
+    { tool: 'bash', args: { command: 'npm test' } }, // safe shape — no gate
+    { tool: 'bash', args: { command: 'rm seed.txt' } }, // dangerous — gates
+    { tool: 'finish', result: 'tested then cleaned' },
+  ]);
+  const dynTools = [
+    { name: 'bash', risky: true, riskyWhen: (a) => String(a?.command || '').startsWith('rm'), run: async (a) => `ran ${a.command}` },
+  ];
+  const report = await runSubagent({
+    router,
+    agent: { name: 'g', tools: ['bash'], systemPrompt: 'p', maxSteps: 6 },
+    parentTools: dynTools,
+    task: 't',
+    approval,
+    alwaysApproved: new Set(),
+  });
+  assert.deepEqual(decisions, ['rm seed.txt'], 'npm test ran silent; rm asked');
+  assert.equal(report, 'tested then cleaned');
+});
+
 test('runSubagent: "always" decision is remembered across runs in the session', async () => {
   const alwaysApproved = new Set();
   let asks = 0;

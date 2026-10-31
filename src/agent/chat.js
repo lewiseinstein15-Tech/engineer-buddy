@@ -686,13 +686,21 @@ export function createChat({
             // Rules engine (v0.19.0): deny refuses outright, allow skips the
             // gate, ask falls through to the interactive approval.
             const verdict = evaluatePermission(permissions, tool, args, { yolo });
+            // v0.64.1: a tool whose risk DEPENDS on its args (riskyWhen — bash,
+            // db's write mode, http mutations) remembers "always" per CALL
+            // SHAPE: the "a" that approved `rm a.txt` must never pre-approve
+            // `rm b.txt` (a tool-level key would silence every future command
+            // once bash's gate is per-command). Static-risky tools keep the
+            // tool-level key — "always" on fs_append still means the tool.
+            const dynamicRisk = typeof impl.riskyWhen === 'function';
+            const alwaysKey = dynamicRisk ? `${tool}·${truncate(JSON.stringify(args ?? {}), 200)}` : null;
             if (verdict === 'deny') {
               const rule = matchingRule(permissions, tool, args, 'deny');
               observation = `REFUSED by a permissions rule (${rule}) — this is policy from .buddy/settings.json, not a judgment call. Pick a different approach or ask the user to change the rules.`;
               denied = true;
-            } else if ((typeof impl.riskyWhen === 'function' ? !!impl.riskyWhen(args) : !!impl.risky) && approval && !alwaysApproved.has(tool) && verdict === 'ask') {
+            } else if ((dynamicRisk ? !!impl.riskyWhen(args) : !!impl.risky) && approval && !alwaysApproved.has(tool) && !(alwaysKey && alwaysApproved.has(alwaysKey)) && verdict === 'ask') {
               const decision = await approval({ tool, args, summary: impl.render ? impl.render(args) : truncate(JSON.stringify(args), 200), preview });
-              if (decision === 'always') alwaysApproved.add(tool);
+              if (decision === 'always') alwaysApproved.add(alwaysKey || tool);
               denied = decision === 'no';
             }
             const runT0 = Date.now();
@@ -758,7 +766,7 @@ export function createChat({
       type: 'error',
       text: modes?.plan
         ? `Turn budget reached (${stepLimit} steps) with no plan approved. Plan mode is still ON — say "continue" and I will call exit_plan with the plan.`
-        : `Turn budget reached (${stepLimit} steps). I paused mid-task — say "continue" to keep going.`,
+        : `Turn budget reached (${stepLimit} steps). I paused mid-task — say "continue" to keep going, or set chat.maxSteps in .buddy/settings.json to raise it (0 = no budget).`,
     });
     return { said: null, steps: stepLimit, error: false };
   }

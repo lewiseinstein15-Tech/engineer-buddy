@@ -2,7 +2,9 @@
 //
 // Policy layering (Harness² guardrail discipline):
 //   hard block  — non-negotiable, never runs (destructive shell, secret reads)
-//   soft gate   — risky tools (writes, bash) go through an approval callback
+//   soft gate   — risky tools (writes, bash) go through an approval callback —
+//                 v0.64.1: bash gates PER COMMAND (riskyWhen) — reads, tests
+//                 and builds run silent; only the destructive shapes ask
 //   budget      — per-turn call caps live in agent/chat.js
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -134,6 +136,43 @@ export function blockedBashReason(cmd) {
 }
 
 const GIT_READ_RE = /^git (status|diff|log|branch|show|remote|tag)( .*)?$/;
+
+// ── Bash danger tiers (v0.64.1) ──────────────────────────────────────────────
+// The approval gate used to fire on EVERY bash call — which trained the
+// operator to rubber-stamp `git status` and `npm test` (the live commit task
+// died of a thousand approve round-trips). Now bash declares riskyWhen: the
+// gate fires only on the destructive shapes that actually reach execution.
+// The worse ones are ALREADY refused by blockedBashReason above (rm -rf,
+// dd/mkfs/shutdown, git push/reset/clean, sudo, network, pipes) — asking a
+// human to approve a command the shell guard will refuse anyway is a wasted
+// round-trip, so they stay off this list. Two tiers remain:
+//   DELETE  — rm, rmdir, shred, unlink, del, rd: files and directories vanish
+//   DISCARD — git checkout -- <paths>, git restore: uncommitted work destroyed
+//             (only `checkout -- .` was already blocked; `-- <path>` still runs)
+// `git push` needs no tier here: bash cannot push at all (the guard refuses,
+// the teaching routes to git_write, whose gate asks on EVERY mutating op —
+// push included). A plain interpreter (`node x.js`) can still do anything —
+// this list is a tripwire for the obvious destructive shapes, not a sandbox;
+// the sandbox is the sandbox. Static `risky: true` STAYS on the bash tool:
+// the why-contract keeps treating every command as a decision and the
+// sub-agent filter (subagents.js) keeps wrapping bash. riskyWhen wins at
+// the GATE, per call.
+const BASH_DANGER = [
+  // rm WITHOUT the -r/-f family: those are refused outright by the guard
+  // (blockedBashReason), so asking a human for them is approving air. Plain
+  // `rm file` still runs and still deletes — that is the tier.
+  [/(^|\s)rm(?!\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+)(\s|$)/, 'deletes files'],
+  [/(^|\s)(rmdir|shred|unlink|del|rd)(\s|$)/, 'deletes files or directories'],
+  [/(^|\s)git\s+checkout\s+--(\s|$)/, 'discards uncommitted changes'],
+  [/(^|\s)git\s+restore(\s|$)/, 'discards uncommitted changes'],
+];
+
+/** Is this bash command one of the destructive shapes that still ask? */
+export function isDangerousBash(cmd) {
+  const s = String(cmd ?? '').trim().replace(/\s+/g, ' ');
+  if (!s) return false;
+  return BASH_DANGER.some(([re]) => re.test(s));
+}
 
 /** Run one allowlist-checked simple command. Never throws.
  * opts.signal — AbortSignal: kills the child and resolves with interrupted:true.
@@ -913,7 +952,7 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
       name: 'bash',
       get description() {
         const base =
-          'Run ONE simple command (no pipes/redirects/chains/sudo/network; git is read-only here — commit/merge/rebase via the git_write tool). Use for tests, builds, version checks, read-only git (status/diff/log/branch/show).';
+          'Run ONE simple command (no pipes/redirects/chains/sudo/network; git is read-only here — commit/merge/rebase via the git_write tool). Use for tests, builds, version checks, read-only git (status/diff/log/branch/show). Reads, tests and builds run without approval; destructive commands (rm, git checkout --/restore) pause for the user.';
         // Live getter: /sandbox toggles mid-session and the next system-prompt
         // build already tells the model the boundary changed.
         return sandbox && sandbox.enabled
@@ -921,7 +960,13 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
           : base;
       },
       args: '{"command":"npm test"}',
+      // v0.64.1: the GATE is per command (riskyWhen) — reads/tests/builds run
+      // silent, only rm-family and work-discarding git ask. `risky: true`
+      // STAYS for the why-contract (every command is a decision) and the
+      // sub-agent tool filter; riskyWhen wins at the gate (chat.js +
+      // subagents.js both prefer it when present). See BASH_DANGER above.
       risky: true,
+      riskyWhen: (a) => isDangerousBash(a?.command),
       render: (a) => `bash ${a?.command}`,
       run: async ({ command }, ctx = {}) => fmtResult(await runBash(command, { cwd: scope.root, timeoutMs: bashTimeoutMs, signal: ctx.signal, sandbox: sandbox ? sandbox.spawnOverrides() : null })),
     },

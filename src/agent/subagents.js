@@ -302,21 +302,29 @@ export async function runSubagent({ router, agent, parentTools, task, maxTokens 
     }
 
     // Approval gate for risky tools, mirroring the main loop's gate ("always"
-    // is remembered per session, shared across sub-agent runs).
+    // is remembered per session, shared across sub-agent runs). v0.64.1: the
+    // mirror is EXACT — a riskyWhen tool gates per call (a sub-agent's
+    // `npm test` runs silent, its `rm` still asks) and "always" is remembered
+    // per call shape; a tool-level 'bash' entry from a static-risky approval
+    // would otherwise blanket-silence every future main-loop command (the set
+    // is shared with chat.js's gate, which checks both key shapes).
     const gatedTools = approval
       ? tools.map((t) => {
-          if (!t.risky) return t;
+          if (!(t.risky || typeof t.riskyWhen === 'function')) return t;
           return {
             ...t,
             run: async (args, ctx) => {
-              if (alwaysApproved?.has(t.name)) return t.run(args, ctx);
+              const risky = typeof t.riskyWhen === 'function' ? !!t.riskyWhen(args) : !!t.risky;
+              if (!risky) return t.run(args, ctx);
+              const alwaysKey = typeof t.riskyWhen === 'function' ? `${t.name}·${truncate(JSON.stringify(args ?? {}), 200)}` : null;
+              if (alwaysApproved?.has(t.name) || (alwaysKey && alwaysApproved?.has(alwaysKey))) return t.run(args, ctx);
               const decision = await approval({
                 tool: t.name,
                 args,
                 summary: `${t.name} via ${agent.name} — ${truncate(typeof args === 'string' ? args : JSON.stringify(args ?? {}), 140)}`,
                 preview: t.preview ? (() => { try { return t.preview(args); } catch { return null; } })() : null,
               });
-              if (decision === 'always') alwaysApproved?.add(t.name);
+              if (decision === 'always') alwaysApproved?.add(alwaysKey || t.name);
               if (decision === 'no') return 'DENIED by the user: the action did NOT run. Work without it or finish.';
               return t.run(args, ctx);
             },
