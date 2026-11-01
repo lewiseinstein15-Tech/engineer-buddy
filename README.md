@@ -6,6 +6,18 @@
 
 **Buddy Code** — a Claude Code-style coding agent in your terminal (chat, explore, edit, run, verify, **search the web**) — **plus five GitHub skills** (autonomous PR review, issue → fix PR, dependency auditing, issue triage, release notes).
 
+## See it (v0.64.1, real output — captured, not mocked)
+
+![the version flag answers before dispatch](docs/screenshots/version.png)
+
+![an unknown flag is taught, never dumped](docs/screenshots/badflag.png)
+
+![the approval gate fires only on danger tiers — reads and tests run silent, the blocklist refuses the worst](docs/screenshots/gate.png)
+
+![the full suite, green on the release commit](docs/screenshots/tests.png)
+
+Every card above is the verbatim stdout of the command shown (reproduce them yourself: `node src/index.js --version`, `node src/index.js --nonsense`, `node scripts/gate-demo.mjs`, `npm test`). The gate card prints the REAL verdict functions the bash tool consults — `isDangerousBash()` (the `riskyWhen`) and `blockedBashReason()` — not a re-enactment.
+
 ## Claims → proof (run it yourself)
 
 README claims score zero unless they can be demonstrated on demand — so every
