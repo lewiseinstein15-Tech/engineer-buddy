@@ -488,7 +488,14 @@ test('CLI: goals add/list/next/dry/history/enable/disable/remove end-to-end; ref
   assert.match(r.stderr, /every 30m/);
   r = run(['goal', 'add', 'Cron Goal', '--cron', '*/15 * * * *', '--prompt', 'tick']); // singular alias
   assert.equal(r.status, 0, `alias add failed: ${r.stderr}`);
-  r = run(['goals', 'add', 'One Shot', '--at', '2026-11-01 09:30', '--prompt', 'once']);
+  // a HARDCODED --at goes due when the calendar catches up — '2026-11-01
+  // 09:30' shipped evergreen and went DUE that very morning (goals run then
+  // honestly exited 0 and the suite went red). Build the one-shot ~2 days
+  // ahead of the wall clock so "nothing due" holds every day it runs.
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const d = new Date(Date.now() + 2 * 24 * 3600 * 1000);
+  const atStr = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  r = run(['goals', 'add', 'One Shot', '--at', atStr, '--prompt', 'once']);
   assert.equal(r.status, 0);
   r = run(['goals', 'list']);
   assert.equal(r.status, 0);
