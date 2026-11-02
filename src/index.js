@@ -19,6 +19,7 @@
 // non-blocking citizen and must never break CI), 2 = usage/config error.
 import { loadConfig } from './config.js';
 import { buildRouter } from './brain/index.js';
+import { runDoctorChecks, renderDoctorChecks } from './doctor.js';
 import { GitHubClient } from './tools/github.js';
 import { LocalRepo } from './tools/repo.js';
 import { runPrReview } from './skills/pr-reviewer.js';
@@ -329,6 +330,19 @@ async function cmdDoctor(argv) {
   console.error('└────────────────┴───────┴────────┴──────────────────────────────────────────┘');
   const aliveCount = rows.filter((r) => r.ok).length;
   console.error(`\n${aliveCount}/${rows.length} gateways alive. Chain never fails while ≥1 is up.`);
+  // Workspace half of the doctor (v0.66.0): the brain can be perfect and the
+  // turn still dies — an untracked file colliding with an incoming commit, a
+  // config JSON a hand-edit corrupted, a stash pile nobody remembers. Every
+  // check is local and names its fix.
+  try {
+    const checks = await runDoctorChecks(process.cwd(), {
+      ollamaEnabled: Boolean(cfg.gateways?.ollama?.enabled),
+      ollamaUrl: cfg.gateways?.ollama?.baseUrl,
+    });
+    console.error(`\nEngineer Buddy doctor — workspace checks:\n${renderDoctorChecks(checks)}`);
+  } catch (e) {
+    console.error(`\n[doctor] workspace checks skipped (${e.message})`);
+  }
   return aliveCount > 0 ? 0 : 1;
 }
 
