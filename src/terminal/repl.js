@@ -75,7 +75,7 @@ export function fmtTok(n) {
 // ── Slash commands (pure, testable) ──────────────────────────────────────────
 
 export const SLASH_COMMANDS = [
-  'help', 'new', 'clear', 'screen', 'compact', 'context', 'map', 'model', 'gateways', 'cost', 'stats', 'effort', 'events', 'stream',
+  'help', 'new', 'clear', 'screen', 'compact', 'context', 'map', 'model', 'gateways', 'cost', 'stats', 'effort', 'events', 'stream', 'retry',
   'permissions', 'todo', 'tools', 'agents', 'skills', 'mcp', 'tasks', 'plan', 'plans', 'rewind', 'diff', 'hooks', 'docs', 'rename', 'branch', 'fork', 'share', 'verbosity', 'theme', 'output-style', 'statusline', 'why', 'compare', 'memory', 'experience', 'learn', 'review',
   'init', 'export', 'sessions', 'resume', 'status', 'yolo', 'sandbox', 'plugin', 'quit', 'exit', 'add-dir', 'report', 'copy', 'terminal-setup', 'vim', 'ci', 'pr-comments', 'channels', 'dictate', 'voice',
 ];
@@ -665,6 +665,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   let busy = false;
   let aborter = null;
   let msgQueue = []; // messages typed while a turn runs (Claude Code queueing)
+  let lastPrompt = null; // /retry: the last real user prompt, re-runnable as-is (v0.66.0)
   // Workspace watcher (v0.60.0 — the capability audit's gap #4): what moved
   // in the workspace BETWEEN turns surfaces as a bounded data fence at the
   // next turn start. The OS watch is PAUSED for the whole duration of a
@@ -1160,6 +1161,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
               ['/permissions', 'show session approvals · /permissions reset'],
               ['/add-dir <path>', 'mount another directory as "<alias>/path" for monorepos (/add-dir lists)'],
               ['/report <name>', 'run a named API reporter (.buddy/reporters/) — result attaches to the next task'],
+              ['/retry', 'resubmit the last prompt verbatim — the move when a turn died mid-flight'],
               ['/review [staged]', 'Buddy reviews your uncommitted diff'],
               ['/yolo', 'toggle auto-approval (careful)'],
               ['/sandbox', 'on | off — bash network-off + restricted HOME · /sandbox profile for docker/podman'],
@@ -1187,6 +1189,19 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         todoState.latest = null;
         say('\n  (conversation reset — memory and experience persist)\n');
         break;
+      case 'retry': {
+        // /retry (v0.66.0, Hermes parity): resubmit the last prompt verbatim —
+        // the ECC move when a turn died mid-flight (brain offline, a bad model
+        // day on the relay). The RAW prompt is re-run: attachments are not
+        // re-consumed, /report data is not re-fetched, nothing double-applies.
+        if (!lastPrompt) {
+          say('\n  nothing to retry — no prompt has run this session yet\n');
+          break;
+        }
+        say(`\n  ${c.cyan('↻ retrying')} ${c.dim(`— resubmitting verbatim: "${truncate(lastPrompt, 80)}"`)}`);
+        await runTask(lastPrompt);
+        break;
+      }
       case 'compact': {
         const s = busySpinner('compacting context');
         try {
@@ -2826,6 +2841,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
       return;
     }
     busy = true;
+    lastPrompt = inputText; // /retry (v0.66.0): the RAW prompt, re-runnable even if the turn dies
     let current = { text: effective };
     try {
       while (current) {
