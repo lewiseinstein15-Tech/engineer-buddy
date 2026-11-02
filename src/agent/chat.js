@@ -725,6 +725,11 @@ export function createChat({
             // tool-level key — "always" on fs_append still means the tool.
             const dynamicRisk = typeof impl.riskyWhen === 'function';
             const alwaysKey = dynamicRisk ? `${tool}·${truncate(JSON.stringify(args ?? {}), 200)}` : null;
+            // v0.67: WHO denied matters — 'no' is the user, 'no-headless' is
+            // the unattended default (defaultApproval); each gets its own
+            // guidance so the model is never told to "ask the user" when
+            // nobody is at the wheel.
+            let denial = null;
             if (verdict === 'deny') {
               const rule = matchingRule(permissions, tool, args, 'deny');
               observation = `REFUSED by a permissions rule (${rule}) — this is policy from .buddy/settings.json, not a judgment call. Pick a different approach or ask the user to change the rules.`;
@@ -732,13 +737,16 @@ export function createChat({
             } else if ((dynamicRisk ? !!impl.riskyWhen(args) : !!impl.risky) && approval && !alwaysApproved.has(tool) && !(alwaysKey && alwaysApproved.has(alwaysKey)) && verdict === 'ask') {
               const decision = await approval({ tool, args, summary: impl.render ? impl.render(args) : truncate(JSON.stringify(args), 200), preview });
               if (decision === 'always') alwaysApproved.add(alwaysKey || tool);
-              denied = decision === 'no';
+              denied = decision === 'no' || decision === 'no-headless';
+              denial = decision === 'no-headless'
+                ? 'DENIED: the action did NOT run — this unattended run does not auto-approve risky steps. The operator can allow them with --yolo, or grant a rules allow in .buddy/settings.json.'
+                : 'DENIED by the user: the action did NOT run. Ask the user how to proceed or pick another approach.';
             }
             const runT0 = Date.now();
             observation = denied
               ? verdict === 'deny'
                 ? observation // the rules-engine refusal already says WHY (which rule)
-                : 'DENIED by the user: the action did NOT run. Ask the user how to proceed or pick another approach.'
+                : denial
               : await impl.run(args, { signal }).catch((e) => `ERROR: ${e.message}`);
             durationMs = Date.now() - runT0;
             // Loading a skill with allowed-tools arms the restriction for the

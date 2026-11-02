@@ -325,6 +325,9 @@ export async function runSubagent({ router, agent, parentTools, task, maxTokens 
                 preview: t.preview ? (() => { try { return t.preview(args); } catch { return null; } })() : null,
               });
               if (decision === 'always') alwaysApproved?.add(alwaysKey || t.name);
+              // v0.67: the unattended default ('no-headless') must deny here
+              // too — falling through would silently run the risky tool.
+              if (decision === 'no-headless') return 'DENIED: the action did NOT run — this unattended run does not auto-approve risky steps. Work without it or finish.';
               if (decision === 'no') return 'DENIED by the user: the action did NOT run. Work without it or finish.';
               return t.run(args, ctx);
             },

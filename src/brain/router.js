@@ -9,7 +9,7 @@
 //      breaker state respected) until maxRoundTrips is exhausted
 //   4. Full attempt telemetry so reviews can cite which brain answered.
 
-import { BuddyError, RateLimitError, debugLog, sleep } from '../util.js';
+import { BuddyError, RateLimitError, debugLog } from '../util.js';
 import { estimateTokens } from './usage.js';
 
 const GATEWAY_FACTORIES = {};
@@ -212,17 +212,13 @@ export class GatewayRouter {
             error: isRate ? `rate-limited (${Math.round((e.retryAfterMs || 0) / 1000)}s)` : (e.message || String(e)),
           });
           debugLog(`router: ${name} failed → ${attempts[attempts.length - 1].error}`);
-          if (isRate && round < this.maxRoundTrips) {
-            const next = loopOrder.find((n) => n !== name && !this._isOpen(n) && (ignoreLimits || fits(n)));
-            if (!next) {
-              // Everyone else is parked too — wait for the shortest park time.
-              const waitMs = Math.min(...this.order.map((n) => Math.max(0, this.state.get(n).openUntil - Date.now())).filter((v) => v > 0), 30000);
-              if (waitMs > 0) {
-                debugLog(`router: all circuits open, waiting ${Math.ceil(waitMs / 1000)}s`);
-                await sleep(waitMs);
-              }
-            }
-          }
+          // v0.67 hardening: no in-call sleeps. When every other gateway is
+          // parked too, the old code froze the turn for up to 30s waiting for
+          // the shortest Retry-After — invisible to the operator, and fatal
+          // for unattended runs holding a lock or a slot. Fail fast instead:
+          // the ALL_GATEWAYS_FAILED error below already names every parked
+          // gateway with its retry-in secs; /retry (or the next cron tick,
+          // for a goal) is the scheduled retry.
         }
       }
     }
@@ -275,7 +271,7 @@ export class GatewayRouter {
         0,
         ...loopOrder.map((n) => Math.ceil((this.state.get(n).openUntil - Date.now()) / 1000))
       );
-      hint = ` — wait ~${Math.max(waitSecs, 5)}s for the rate limit to lift, then say "continue"`;
+      hint = ` — wait ~${Math.max(waitSecs, 5)}s for the rate limit to lift, then /retry (or say "continue")`;
     }
     throw new BuddyError(`all gateways failed after ${this.maxRoundTrips} round-trips — ${summary}${hint}`, {
       code: 'ALL_GATEWAYS_FAILED',

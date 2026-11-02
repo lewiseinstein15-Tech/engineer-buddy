@@ -260,6 +260,25 @@ export function applyHarnessProposal(root, proposal) {
 /** Glob patterns the agent's own file tools may never touch (self-edit firewall). */
 export const AGENT_DENY_GLOBS = [
   `${HARNESS_DIR}/**`,
+  // The control plane (v0.67 hardening): anything that changes what the agent
+  // is ALLOWED to do, or what it will load next session, must not be writable
+  // by the agent itself — one approved fs_write would otherwise grant durable
+  // privilege (an allow rule, an MCP server that auto-spawns, a persona, a
+  // slash command, a goal that later runs unattended, planted "lessons" that
+  // ride every future recall). The human edits these; the agent uses the
+  // dedicated tools or asks.
+  '.buddy/settings.json',
+  '.buddy/mcp.json',
+  '.buddy/agents/**',
+  '.buddy/commands/**',
+  '.buddy/goals.json',
+  '.buddy/goals/**',
+  '.buddy/experience/**',
+  '.buddy/todo.json',
+  '.buddy/routing.json',
+  // Append-only trails: the agent must not be able to rewrite its own record.
+  '.buddy/audit.jsonl',
+  '.buddy/events.jsonl',
   '**/.git/**',
   '**/.env*',
   '**/*.pem',

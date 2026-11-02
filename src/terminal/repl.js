@@ -387,10 +387,19 @@ export async function createBuddySession({ root = process.cwd(), router, yolo = 
   return { chat: session, tools, todoState, mcp, shells, skills, hooks, userToolWarnings, permissions: perms, permissionWarnings, scope, extraRoots, reporters, sandbox, plugins: installedPlugins, pluginWarnings };
 }
 
-function defaultApproval(busy) {
-  // Headless/one-shot policy: autonomous on risky tools (they are still
-  // hard-blocked by policy), unless --safe.
-  return busy.safe ? () => 'no' : () => 'yes';
+export function defaultApproval(busy = {}) {
+  // Headless/one-shot policy (v0.67 hardening): autonomy must be EARNED.
+  //   --yolo   auto-approve risky tools — the explicit operator opt-in, also
+  //            what `buddy goals add --yolo` records per goal ("gates off —
+  //            operator choice"); goals now actually pass it to the child.
+  //   --safe   deny everything risky (unchanged)
+  //   default  deny risky tools. Deny (not ask) because nobody is watching a
+  //            scheduled run; deny (not yes) because an unattended prompt is
+  //            exactly where a planted instruction does the most damage.
+  //            runOneShot prints a stderr banner pointing at --yolo.
+  // 'no-headless' (not plain 'no') so chat.js can tell the model the truth:
+  // nobody refused — the run is unattended and risky steps need --yolo.
+  return busy.yolo && !busy.safe ? () => 'yes' : () => 'no-headless';
 }
 
 // ── Event rendering (shared by REPL and one-shot) ────────────────────────────
@@ -498,6 +507,10 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
   // text mode renders human output; json suppresses it entirely; stream-json
   // replaces it with JSONL events (the machine-readable transcript).
   const render = jsonModes ? () => {} : makeRenderer({ quiet });
+  // v0.67 hardening: the headless default denies risky tools. Say so ONCE on
+  // stderr (json/stream-json modes stay machine-pure) so a run that starts
+  // failing its gates has the fix in the first line of its logs.
+  if (!jsonModes && !safe && !yolo) console.error('[buddy] headless default: risky tools are DENIED this run — pass --yolo to allow them (operator choice); --safe is stricter');
   const repoMapProvider = config.chat?.repoMap === false ? null : createRepoMapProvider(root, { maxChars: config.chat?.repoMapChars || 2800 });
   // Structured event log (v0.25.0): CI one-shots write the same JSONL trail
   // as the REPL — a cascade failure in Actions gets the same debugging story.
@@ -515,7 +528,7 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
     root,
     router,
     yolo,
-    approval: defaultApproval({ safe }),
+    approval: defaultApproval({ safe, yolo }),
     charBudget: config.chat?.charBudget,
     resumeFrom,
     effort: effortRef,

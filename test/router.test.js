@@ -130,7 +130,7 @@ test('router: rate-limited final error carries a wait hint', async () => {
   assert.ok(err, 'expected the chain to fail');
   assert.equal(err.code, 'ALL_GATEWAYS_FAILED');
   assert.match(err.message, /a: rate-limited \(\d+s\)/);
-  assert.match(err.message, /wait ~\d+s for the rate limit to lift, then say "continue"/);
+  assert.match(err.message, /wait ~\d+s for the rate limit to lift, then \/retry \(or say "continue"\)/);
 });
 
 test('router: no wait hint when nothing is rate-limited', async () => {

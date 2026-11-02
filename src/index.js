@@ -51,7 +51,7 @@ function usage() {
 Local coding agent (Buddy Code — like Claude Code, in your terminal):
   engineer-buddy                        interactive session in the current directory
   engineer-buddy --version              print the version and exit (-v works too)
-  engineer-buddy -p "task"              one-shot autonomous task (add --safe to deny writes)
+  engineer-buddy -p "task"              one-shot task (risky tools denied; --yolo allows, --safe is stricter)
   engineer-buddy -p "task" --add-dir /abs/path
                                         mount an external directory for this session —
                                         repeatable; address files as "<alias>/relative/path"

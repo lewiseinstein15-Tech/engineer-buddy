@@ -699,7 +699,11 @@ export function summarizeChildRun(r) {
  *  process isolation means a crashed goal can never take the tick down. */
 export function runPromptDefault({ goal, root, timeoutMs = 600000 } = {}) {
   return import('./benchmark.js')
-    .then(({ runOneShot }) => runOneShot(['-p', goal.prompt, '--dir', String(root)], { cwd: String(root), timeoutMs }))
+    // v0.67 hardening: headless children deny risky tools by default. The
+    // goal's recorded yolo choice is what flips them on — `goals add --yolo`
+    // was already documented as "gates off — operator choice"; before this,
+    // the flag was metadata only and the child auto-approved implicitly.
+    .then(({ runOneShot }) => runOneShot(['-p', goal.prompt, '--dir', String(root), ...(goal?.yolo ? ['--yolo'] : [])], { cwd: String(root), timeoutMs }))
     .then((r) => summarizeChildRun(r))
     .catch((e) => ({
       status: 'error',

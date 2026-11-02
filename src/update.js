@@ -13,6 +13,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { appendEvent } from './eventslog.js';
 
 const require = createRequire(import.meta.url);
 const CURRENT_VERSION = require('../package.json').version;
@@ -76,7 +77,21 @@ export function planUpdate({ currentVersion, run, cwd, force = false }) {
   if (status.ok && status.stdout.trim() && !force) {
     return { action: 'refuse', tag, reason: 'working tree has uncommitted changes — commit or stash first (or run with --force)', currentVersion };
   }
-  return { action: 'checkout', tag, currentVersion, dirty: Boolean(status.ok && status.stdout.trim()) };
+  // v0.67 hardening: an update may only move FORWARD. The tag name alone was
+  // never an integrity statement — resolve the tag to a commit and require it
+  // to be a descendant of the current checkout, so a rewritten/rogue tag or a
+  // rollback is refused (force overrides; a shallow clone may need it too,
+  // since ancestry needs the shared history).
+  const shaRes = run(['rev-parse', `${tag}^{commit}`], cwd);
+  if (!shaRes.ok) {
+    return { action: 'error', reason: `cannot resolve ${tag} to a commit: ${(shaRes.stderr || '').trim().slice(0, 200)}`, currentVersion };
+  }
+  const sha = shaRes.stdout.trim();
+  const ancestor = run(['merge-base', '--is-ancestor', 'HEAD', sha], cwd);
+  if (!ancestor.ok && !force) {
+    return { action: 'refuse', tag, reason: `${tag} (${sha.slice(0, 12)}) is not ahead of the current checkout — refusing a rollback or rewritten history (run with --force to override)`, currentVersion };
+  }
+  return { action: 'checkout', tag, sha, currentVersion, dirty: Boolean(status.ok && status.stdout.trim()) };
 }
 
 /**
@@ -113,7 +128,17 @@ export async function cmdUpdate(argv = [], { cwd = process.cwd(), out = console.
     out(`  ✗ checkout ${plan.tag} failed: ${(co.stderr || '').trim().slice(0, 200)}`);
     return 1;
   }
-  out(`  ✓ updated: v${plan.currentVersion} → ${plan.tag}`);
+  // v0.67 hardening: verify the checkout — what is on disk must now BE the
+  // commit the plan validated, and the update lands in the events log as a
+  // durable fact (from → to → sha) next to the rest of the audit trail.
+  const head = run(['rev-parse', 'HEAD'], cwd);
+  const headSha = head.ok ? head.stdout.trim() : '';
+  if (plan.sha && headSha && headSha !== plan.sha) {
+    out(`  ✗ checkout verification failed: HEAD ${headSha.slice(0, 12)} ≠ ${plan.tag} ${plan.sha.slice(0, 12)} — check \`git status\` before doing anything else`);
+    return 1;
+  }
+  out(`  ✓ updated: v${plan.currentVersion} → ${plan.tag}${headSha ? ` (${headSha.slice(0, 12)})` : ''}`);
   out(`  ${'·'} restart buddy to run the new version (npm test to verify)`);
+  appendEvent(cwd, { type: 'update', from: `v${CURRENT_VERSION}`, to: plan.tag, sha: headSha || plan.sha || null });
   return 0;
 }
