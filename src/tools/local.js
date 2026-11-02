@@ -791,13 +791,31 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
     {
       name: 'fs_read',
       get description() {
-        return 'Read a file (capped). Read before editing anything. Paths may address /add-dir roots as "<alias>/relative/path".';
+        return 'Read a file (capped). Read before editing anything. Big file? Pass offset (1-based line) and limit (lines) to page through it. Paths may address /add-dir roots as "<alias>/relative/path".';
       },
-      args: '{"path":"src/file.js"}',
-      render: (a) => `fs_read ${a?.path}`,
-      run: async ({ path: p }) => {
-        const r = scope.read(p);
-        return `FILE ${p}${r.truncated ? ' (truncated)' : ''}:\n${r.content}`;
+      args: '{"path":"src/file.js","offset":1,"limit":400}',
+      render: (a) => `fs_read ${a?.path}${a?.offset ? ` @${a.offset}` : ''}`,
+      run: async ({ path: p, offset, limit } = {}) => {
+        const hasPage = offset != null || limit != null;
+        if (!hasPage) {
+          const r = scope.read(p);
+          return `FILE ${p}${r.truncated ? ' (truncated)' : ''}:\n${r.content}`;
+        }
+        // Line paging (v0.65): big files must not die at the 30k char cap —
+        // page like Claude Code's Read: offset is 1-BASED, limit caps lines.
+        const off = Math.max(1, Math.round(Number(offset) || 1));
+        const lim = Math.min(2000, Math.max(1, Math.round(Number(limit) || 400)));
+        const r = scope.read(p, 200_000);
+        if (!r || !r.content) return `ERROR: cannot read ${p}`;
+        const lines = r.content.split('\n');
+        if (lines.length > 1 && lines.at(-1) === '') lines.pop(); // trailing \n is not a line
+        const total = lines.length;
+        if (off > total) return `FILE ${p}: has ${total} line${total === 1 ? '' : 's'} — offset ${off} is past the end`;
+        const slice = lines.slice(off - 1, off - 1 + lim);
+        const last = off - 1 + slice.length;
+        const more = last < total ? ` — MORE LINES EXIST: continue with offset ${last + 1}` : '';
+        const capNote = r.truncated ? ' (read cap hit — later lines unseen)' : '';
+        return `FILE ${p} [lines ${off}-${last} of ${total}]${capNote}:\n${slice.join('\n')}${more}`;
       },
     },
     {
@@ -911,6 +929,23 @@ export function buildLocalTools({ scope, bashTimeoutMs = 180000, todoState = { l
       args: '{"path":"src/file.js","find":"exact existing snippet","replace":"new snippet","replace_all":false}',
       risky: true,
       render: (a) => `fs_replace ${a?.path}${a?.replace_all ? ' (all)' : ''}`,
+      preview: (a) => previewReplace(scope, a?.path, a?.find, a?.replace),
+      run: async ({ path: p, find, replace, replace_all = false }) => {
+        if (typeof find !== 'string' || !find) return 'ERROR: find required';
+        const r = scope.replace(p, find, String(replace ?? ''), { replace_all: Boolean(replace_all) });
+        const diag = await postEditNotes(r.path);
+        return `OK replaced ${r.count > 1 ? `${r.count} occurrences` : 'snippet'} in ${r.path}${diag}`;
+      },
+    },
+    {
+      name: 'fs_edit',
+      // v0.65 alias: models with Claude-Code muscle memory call fs_edit and
+      // used to eat an "unknown tool" round-trip. Same contract as fs_replace.
+      description:
+        'Replace an exact snippet in a file — alias of fs_replace (same args: path, find, replace, replace_all). Must match exactly once unless replace_all:true.',
+      args: '{"path":"src/file.js","find":"exact existing snippet","replace":"new snippet","replace_all":false}',
+      risky: true,
+      render: (a) => `fs_edit ${a?.path}${a?.replace_all ? ' (all)' : ''}`,
       preview: (a) => previewReplace(scope, a?.path, a?.find, a?.replace),
       run: async ({ path: p, find, replace, replace_all = false }) => {
         if (typeof find !== 'string' || !find) return 'ERROR: find required';
