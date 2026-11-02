@@ -315,7 +315,7 @@ export class LocalScope {
     const { repo, rest } = this._rootFor(rel);
     const abs = path.resolve(repo.root, rest || '.');
     if (abs !== repo.root && !abs.startsWith(repo.root + path.sep)) {
-      throw new BuddyError(`path escapes root: ${rel}`, { code: 'PATH_ESCAPE' });
+      throw new BuddyError(`path escapes root: ${rel} — only the workspace root${this.extra.size ? ' and mounted extra roots' : ''} are editable. Recover: clone/copy the repo into the workspace, or rerun buddy with --add-dir <abs-path>, or mount it in .buddy/settings.json under permissions.additionalDirectories`, { code: 'PATH_ESCAPE' });
     }
     return abs;
   }
@@ -324,7 +324,7 @@ export class LocalScope {
    *  secrets and policy-denied files stay protected inside extra roots). */
   _guard(rel) {
     const p = String(rel || '');
-    if (!p || p.startsWith('/') || p.includes('..')) throw new BuddyError(`unsafe path "${p}"`, { code: 'UNSAFE_PATH' });
+    if (!p || p.startsWith('/') || p.includes('..')) throw new BuddyError(`unsafe path "${p}" — paths must be workspace-relative (no leading /, no ..). For a repo outside this workspace: clone it into the workspace, or rerun buddy with --add-dir <abs-path>, or mount it in .buddy/settings.json under permissions.additionalDirectories, then address it as "<alias>/relative/path"`, { code: 'UNSAFE_PATH' });
     const { rest } = this._rootFor(p);
     if (isSecretPath(rest) || isSecretPath(p)) throw new BuddyError(`refusing to touch likely secrets: ${p}`, { code: 'SECRET_PATH' });
     if (isAgentDeniedPath(rest) || isAgentDeniedPath(p)) throw new BuddyError(`path is protected by policy: ${p}`, { code: 'DENIED_PATH' });
