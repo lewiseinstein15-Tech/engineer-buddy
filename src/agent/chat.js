@@ -51,6 +51,18 @@ const REPEAT_HINT_TOOLS = new Set(['fs_search', 'fs_read', 'fs_list', 'web_searc
 // a backstop. Exported for tests and the /context surface.
 export const AUTO_COMPACT_AT = 0.8;
 
+// Context-overflow fingerprint (v0.65): every relay names the disease
+// differently — "maximum context length", "prompt is too long", "request too
+// large", "reduce the length". One classifier so the loop's fallback never
+// depends on a gateway's prose. Exported for tests.
+export function isContextOverflow(e) {
+  const s = String((e && (e.code || '')) + ' ' + ((e && e.message) || e)).toLowerCase();
+  return (
+    /maximum context|context length|context window|token limit|too many tokens|prompt is too long|input length|reduce the length|request too large|payload too large|exceeds the (maximum|context)/.test(s) ||
+    (/context/.test(s) && /exceed|overflow|too (big|long|large)/.test(s))
+  );
+}
+
 export function buildSystemPrompt({ harness, tools, skills = [], planMode = false, repoMap = '' }) {
   // Plan mode swaps the visible tool list right here: only research tools +
   // exit_plan stay; normal mode hides exit_plan so the model never sees a
@@ -410,6 +422,7 @@ export function createChat({
     const callCounts = new Map();
     const lastArgs = new Map(); // research-repeat guard: tool -> JSON of last args
     let said = null;
+    let contextRetried = false; // context-window fallback: ONE compact+retry per turn
     // Skills v2: a user-invoked skill with allowed-tools arms the restriction
     // immediately; model-loaded skills arm it when the skill tool succeeds.
     let skillRestriction = null;
@@ -460,8 +473,26 @@ export function createChat({
       try {
         res = await callModel(stepRouteCtx(step));
       } catch (e) {
-        onEvent({ type: 'error', text: `brain offline: ${e.message}` });
-        return { said: null, steps: step - 1, error: true };
+        // Context-window fallback (v0.65): a full history can still overflow
+        // the ROUTED model's window even under proactive compaction — a big
+        // attachment, a huge tool observation, a gateway whose ctxLimit is
+        // smaller than the estimate. A plain retry would reship the SAME
+        // history, so the honest fallback is: compact hard NOW and ask again
+        // ONCE per turn. Still overflowing → report offline (bounded, no loop).
+        if (isContextOverflow(e) && !contextRetried) {
+          contextRetried = true;
+          onEvent({ type: 'error', text: `context overflow (${truncate(String(e.message || e), 140)}) — compacting and retrying once` });
+          await maybeCompact(true);
+          try {
+            res = await callModel(stepRouteCtx(step));
+          } catch (e2) {
+            onEvent({ type: 'error', text: `brain offline after context retry: ${e2.message}` });
+            return { said: null, steps: step - 1, error: true };
+          }
+        } else {
+          onEvent({ type: 'error', text: `brain offline: ${e.message}` });
+          return { said: null, steps: step - 1, error: true };
+        }
       }
 
       let salvaged = false;
