@@ -17,6 +17,7 @@ import { createRequire } from 'node:module';
 import { createChat } from '../agent/chat.js';
 import { loadAgents } from '../agent/subagents.js';
 import { LocalScope, buildLocalTools, runBash } from '../tools/local.js';
+import { buildComputerTool } from '../tools/computer.js';
 import { retraceRecord } from '../tools/timetravel.js';
 import { makeSandboxContext, parseSandboxArgs, renderSandboxStatus, dockerProfile } from '../tools/sandbox.js';
 import { loadUserTools } from '../tools/usertools.js';
@@ -242,11 +243,25 @@ export function formatDiffReport({ status = '', stat = '', diff = '', gitFailed 
 
 // ── Session factory ──────────────────────────────────────────────────────────
 
-export async function makeScopeAndTools({ root, router = null, onEvent = () => {}, approval = null, modes = null, onPlanApproved = () => {}, routing = null } = {}) {
+export async function makeScopeAndTools({ root, router = null, onEvent = () => {}, approval = null, modes = null, onPlanApproved = () => {}, routing = null, extraDirs = [] } = {}) {
   // Multi-root workspace (v0.26.0): permissions.additionalDirectories from
   // user + project settings become alias-addressable roots ("alias/path").
   const extraRoots = buildExtraRoots(root);
   const scope = new LocalScope(root, extraRoots);
+  // --add-dir (v0.65): CLI mounts join the settings mounts — same alias
+  // rules, same cap, same "<alias>/path" addressing. Session-only by design:
+  // a task-scoped mount must not leak into the next session (use /add-dir or
+  // settings.json for a persistent one). A bad path warns and continues —
+  // a typo in a flag must never block the session.
+  for (const d of extraDirs) {
+    const abs = path.isAbsolute(d) ? d : path.resolve(root, d);
+    try {
+      const alias = pickAlias(aliasFor(abs), new Set(scope.extra.keys()), root);
+      scope.addRoot(alias, abs);
+    } catch (e) {
+      try { onEvent({ type: 'error', text: `--add-dir ${d}: ${e.message}` }); } catch { /* never break startup */ }
+    }
+  }
   const todoState = { latest: null };
   const shells = new BackgroundShells({ cwd: root });
   // Plugins (v0.39.0 §3): one-folder bundles discovered from .buddy/plugins/
@@ -284,6 +299,9 @@ export async function makeScopeAndTools({ root, router = null, onEvent = () => {
     }
   })();
   const base = [...buildLocalTools({ scope, todoState, sandbox, lspEnabled: lspInfo.on, lspServers: lspInfo.servers }), ...buildWebTools(), buildHttpTool({ reporters }), ...buildBackgroundTools({ shells })];
+  // Computer use (v0.65): the desktop OS as an actable surface — screenshot,
+  // click, type, key. risky:true → every action rides the approval gate.
+  const computerTool = buildComputerTool({ scope });
   // gh tool (v0.35.0): GitHub/GitLab over REST with the user's env token —
   // PR/MR ops + CI status; provider auto-detected from the origin remote.
   const ghTool = buildGhTool({ root });
@@ -319,7 +337,7 @@ export async function makeScopeAndTools({ root, router = null, onEvent = () => {
   const { tools: userTools, warnings: userToolWarnings } = loadUserTools(root, {
     extraNames: new Set([...base, ghTool, taskTool, skillTool, ...mcpTools, ...(exitPlanTool ? [exitPlanTool] : [])].map((t) => t.name)),
   });
-  const tools = [...base, ghTool, taskTool, skillTool, ...(exitPlanTool ? [exitPlanTool] : []), ...mcpTools, ...userTools];
+  const tools = [...base, computerTool, ghTool, taskTool, skillTool, ...(exitPlanTool ? [exitPlanTool] : []), ...mcpTools, ...userTools];
   return { scope, tools, todoState, mcp, shells, skills, userToolWarnings, extraRoots, reporters, sandbox, plugins: installedPlugins, pluginWarnings, lsp: lspInfo };
 }
 
@@ -346,8 +364,8 @@ function makeHarness(root, recencyTexts = null) {
 }
 
 /** Create a chat session bound to a workspace root. */
-export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {}, repoMap = null, effort = null, streaming = null, onStream = null, routing = null } = {}) {
-  const { tools, todoState, mcp, shells, skills, userToolWarnings, scope, extraRoots, reporters, sandbox, plugins: installedPlugins, pluginWarnings, lsp: lspInfo } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved, routing });
+export async function createBuddySession({ root = process.cwd(), router, yolo = false, approval = null, charBudget, resumeFrom = null, modes = null, onPlanApproved = () => {}, onEvent = () => {}, repoMap = null, effort = null, streaming = null, onStream = null, routing = null, extraDirs = [] } = {}) {
+  const { tools, todoState, mcp, shells, skills, userToolWarnings, scope, extraRoots, reporters, sandbox, plugins: installedPlugins, pluginWarnings, lsp: lspInfo } = await makeScopeAndTools({ root, router, onEvent, approval, modes, onPlanApproved, routing, extraDirs });
   const recencyLessonTexts = recentLessons(root); // read ONCE — same list the harness block and the task-level recall exclude-set see
   const harness = makeHarness(root, recencyLessonTexts).hctx;
   // Hooks: the deterministic guarantee layer (.buddy/settings.json). One
@@ -473,7 +491,7 @@ export function appendMemoryNote(root, note) {
 
 // ── Headless one-shot ────────────────────────────────────────────────────────
 
-export async function runOneShot({ router, root = process.cwd(), task, safe = false, yolo = false, quiet = false, config = {}, outputFormat = 'text', resumeFrom = null } = {}) {
+export async function runOneShot({ router, root = process.cwd(), task, safe = false, yolo = false, quiet = false, config = {}, outputFormat = 'text', resumeFrom = null, extraDirs = [] } = {}) {
   const events = [];
   const fmt = ['text', 'json', 'stream-json'].includes(outputFormat) ? outputFormat : 'text';
   const jsonModes = fmt === 'json' || fmt === 'stream-json';
@@ -503,6 +521,7 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
     effort: effortRef,
     routing: buildRoutingConfig(config, root, effortRef),
     repoMap: repoMapProvider,
+    extraDirs,
     onEvent: (ev) => {
       events.push(ev);
       render(ev);
@@ -605,7 +624,7 @@ export function printPluginStatus(plugins, warnings = []) {
 
 // ── Interactive REPL ─────────────────────────────────────────────────────────
 
-export async function startRepl({ router, root = process.cwd(), config = {}, yolo: yoloFlag = false, resumeFrom = null, record = null, onExit = null } = {}) {
+export async function startRepl({ router, root = process.cwd(), config = {}, yolo: yoloFlag = false, resumeFrom = null, record = null, onExit = null, extraDirs = [] } = {}) {
   if (!process.stdin.isTTY) {
     console.error('buddy: interactive mode needs a TTY. Use one-shot mode instead:  buddy -p "task"');
     return 2;
@@ -785,6 +804,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
     routing: routingCfg,
     streaming: streamRef,
     onStream: onStreamDelta,
+    extraDirs,
     repoMap: config.chat?.repoMap === false ? null : createRepoMapProvider(root, { maxChars: config.chat?.repoMapChars || 2800 }),
     onPlanApproved: ({ saved }) => {
       console.log(`\n  ${c.green('✓ plan approved')} — exited plan mode${saved ? c.gray(` · saved to ${path.relative(root, saved)}`) : ''}\n`);

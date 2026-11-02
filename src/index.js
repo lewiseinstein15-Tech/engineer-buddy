@@ -51,6 +51,13 @@ Local coding agent (Buddy Code — like Claude Code, in your terminal):
   engineer-buddy                        interactive session in the current directory
   engineer-buddy --version              print the version and exit (-v works too)
   engineer-buddy -p "task"              one-shot autonomous task (add --safe to deny writes)
+  engineer-buddy -p "task" --add-dir /abs/path
+                                        mount an external directory for this session —
+                                        repeatable; address files as "<alias>/relative/path"
+                                        (alias defaults to the folder name). Same powers as
+                                        .buddy/settings.json permissions.additionalDirectories,
+                                        but per-run: nothing persists. Work on a sibling repo
+                                        without cloning it in.
   engineer-buddy run-auto "task"        run-until-done (v0.58.0): plan once (todo v2), then
                                         pick the next ready item → ONE focused turn → verify
                                         (npm test, or --verify-cmd) → mark done/blocked → repeat,
@@ -349,6 +356,7 @@ async function cmdChat(argv, { oneShot = false } = {}) {
       p: { type: 'string' },
       safe: { type: 'boolean', default: false },
       yolo: { type: 'boolean', default: false },
+      'add-dir': { type: 'string', multiple: true },
       record: { type: 'string' },
       quiet: { type: 'boolean', default: false },
       config: { type: 'string' },
@@ -375,6 +383,9 @@ async function cmdChat(argv, { oneShot = false } = {}) {
   // BEFORE loadConfig/buildRouter — a version probe needs neither config nor network,
   // and the strict parser must never see the option as an unknown-flag crash.
   if (values.version) { console.log(VERSION); return 0; }
+  // --add-dir (v0.65): repeatable; each occurrence mounts one external directory
+  // for this session. Absolute or workspace-relative — resolved against the root.
+  const addDirs = (values['add-dir'] || []).map((d) => path.resolve(d));
   const cfg = loadConfig({ file: values.config });
   const router = buildRouter(cfg);
   let root = values.dir ? path.resolve(values.dir) : process.cwd();
@@ -494,6 +505,7 @@ async function cmdChat(argv, { oneShot = false } = {}) {
       config: cfg,
       outputFormat: fmt,
       resumeFrom: resumeFile,
+      extraDirs: addDirs,
     });
     // v0.36.0 review catch: the kept-note used to print only on the
     // interactive path (via the onExit hook) — a --worktree one-shot run
@@ -515,7 +527,7 @@ async function cmdChat(argv, { oneShot = false } = {}) {
   // startRepl is dead. The worktree kept-note rides the onExit hook instead
   // (called by the close handler before the exit, still inside the terminal).
   const exitNote = worktreeNote ? () => printWorktreeNote(worktreeNote) : null;
-  const exitCode = (await startRepl({ router, root, config: cfg, yolo: Boolean(values.yolo), resumeFrom: resumeFile, record: values.record || null, onExit: exitNote })) ?? 0;
+  const exitCode = (await startRepl({ router, root, config: cfg, yolo: Boolean(values.yolo), resumeFrom: resumeFile, record: values.record || null, onExit: exitNote, extraDirs: addDirs })) ?? 0;
   return exitCode;
 }
 
