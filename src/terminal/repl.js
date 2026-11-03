@@ -27,6 +27,7 @@ import { BackgroundShells, buildBackgroundTools } from '../tools/background.js';
 import { buildSkillTool } from '../tools/skill.js';
 import { fetchDocs } from '../tools/docs.js';
 import { loadPermissions, evaluatePermission } from '../permissions.js';
+import { loadRunToken } from '../serve/runtoken.js';
 import { loadSkills } from '../skills/loader.js';
 import { buildExitPlanTool, listPlans, PLANS_DIR } from '../tools/planmode.js';
 import { listCheckpoints, restoreCheckpoint } from '../agent/checkpoints.js';
@@ -515,6 +516,23 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
   // Structured event log (v0.25.0): CI one-shots write the same JSONL trail
   // as the REPL — a cascade failure in Actions gets the same debugging story.
   const eventsLogOn = config.chat?.eventsLog !== false;
+  // v0.68.0 wave 4 (serve rebuild): a goals-fired child may carry a single-use
+  // run token — the operator's per-goal allowlist, consumed on first read so
+  // a replayed or inherited token is worthless. Settings-level deny rules
+  // still win (the gate evaluates denies before this approval is consulted),
+  // --safe stays stricter than any token, and the wave-0 firewall is beyond
+  // all of it: a token widens the approval layer, never the policy layer.
+  const runToken = loadRunToken(root);
+  if (!jsonModes && runToken) {
+    console.error(runToken.ok
+      ? `[buddy] goal allowlist active — ${runToken.allow.length} rule(s)${runToken.goalId ? ` from ${runToken.goalId}` : ''} (single-use token consumed)`
+      : `[buddy] run token present but refused: ${runToken.reason} — this run stays default-deny`);
+  }
+  if (eventsLogOn) appendEvent(root, { type: 'runToken', ok: Boolean(runToken?.ok), goalId: runToken?.goalId ?? null, rules: runToken?.ok ? runToken.allow.length : 0 });
+  const baseApproval = defaultApproval({ safe, yolo });
+  const approval = runToken?.ok && !safe
+    ? (call) => (evaluatePermission({ allow: runToken.allow, deny: [] }, call.tool, call.args) === 'allow' ? 'yes' : baseApproval(call))
+    : baseApproval;
   // Effort (v0.25.0) applies headless too — v0.56.0: the persisted level owns
   // the loop budget AND the routing bias. One dial everywhere: the REPL, the
   // sub-agents and the CI one-shot now read the same chat.effort setting.
@@ -528,7 +546,7 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
     root,
     router,
     yolo,
-    approval: defaultApproval({ safe, yolo }),
+    approval,
     charBudget: config.chat?.charBudget,
     resumeFrom,
     effort: effortRef,

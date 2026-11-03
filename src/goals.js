@@ -68,6 +68,25 @@ const isoOrNull = (v) => {
 
 const rndId = () => 'g-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
 
+/** An allow rule or a notify target, or null. Fail-closed by construction:
+ *  a junk notify URL becomes null (no wire) and a junk allow rule is dropped
+ *  (the permission engine can never match it) — degradation only ever
+ *  TIGHTENS an unattended goal, never widens it. */
+export function parseNotifyOrNull(v) {
+  if (v == null || String(v).trim() === '') return null;
+  try {
+    const u = new URL(String(v));
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u.toString() : null;
+  } catch {
+    return null;
+  }
+}
+const ALLOW_RULE_SHAPE = /^[A-Za-z_][\w$]*(\((?:[^()\\]|\\.)*\))?$/s;
+const normalizeAllow = (v) => (Array.isArray(v) ? v : v == null ? [] : [v])
+  .map((r) => String(r ?? '').trim())
+  .filter((r) => r && r.length <= 200 && ALLOW_RULE_SHAPE.test(r))
+  .slice(0, 20);
+
 /** Hard length cap — a pure slice, no ellipsis: callers depend on the exact
  *  bound (rendered rows must stay one line and bounded). */
 const cap = (s, n) => {
@@ -304,6 +323,8 @@ export function normalizeGoal(raw) {
     createdAt: isoOrNull(raw.createdAt) ?? new Date().toISOString(),
     lastRun: isoOrNull(raw.lastRun),
     lastStatus: typeof raw.lastStatus === 'string' ? raw.lastStatus : null,
+    allow: normalizeAllow(raw.allow),
+    notify: parseNotifyOrNull(raw.notify),
     ...(holds
       ? { hold: 'junk definition — refused to schedule until fixed (buddy goals remove <id>, then set it again)' }
       // a hand-edited hold must SURVIVE the load — RED TEAM v0.49 finding #3:
@@ -399,6 +420,8 @@ function saveGoals(root, goals) {
       createdAt: g.createdAt,
       lastRun: g.lastRun ?? null,
       lastStatus: g.lastStatus ?? null,
+      allow: Array.isArray(g.allow) && g.allow.length ? g.allow : null,
+      notify: g.notify ?? null,
       ...(g.hold ? { hold: g.hold } : {}),
     })),
   }, null, 2) + '\n';
@@ -443,6 +466,42 @@ export function setGoalEnabled(root, prefix, enabled) {
   const g = findGoal(goals, prefix);
   saveGoals(root, goals.map((x) => (x.id === g.id ? { ...x, enabled: enabled === true } : x)));
   return { goal: { ...g, enabled: enabled === true }, problems };
+}
+
+/** editGoal — the operator's finger on the unattended plane (v0.68.0, wave 4):
+ *  the per-goal allowlist and the notify webhook. THROWS on junk (mutations
+ *  refuse, views degrade). The agent can never reach this: goals.json is
+ *  behind the wave-0 firewall, and `buddy goals edit` is not a tool — it is
+ *  a command only an operator or an explicitly allowlisted bash may run. */
+export function editGoal(root, prefix, { allow = null, clearAllow = false, notify, clearNotify = false } = {}) {
+  const { goals, problems } = loadStrict(root);
+  const g = findGoal(goals, prefix);
+  const next = { ...g };
+  if (clearAllow) next.allow = null;
+  else if (allow != null) {
+    const rules = (Array.isArray(allow) ? allow : [allow]).map((r) => String(r ?? '').trim()).filter(Boolean);
+    if (!rules.length) {
+      throw new Error('--allow needs at least one rule — e.g. --allow "Bash(git *)" (or --clear-allow to remove the list; an empty list would just be default-deny with extra steps)');
+    }
+    const bad = rules.filter((r) => r.length > 200 || !ALLOW_RULE_SHAPE.test(r));
+    if (bad.length) {
+      throw new Error(`invalid allow rule(s): ${bad.map((r) => oneLine(r, 40)).join('; ')} — rules are Tool(spec), e.g. "Bash(git *)", "fs_read(docs/**)"`);
+    }
+    if (rules.length > 20) throw new Error(`too many allow rules (${rules.length} > 20) — an allowlist is a scalpel, not a second settings file`);
+    next.allow = rules;
+  }
+  if (clearNotify) next.notify = null;
+  else if (notify != null && notify !== '') {
+    const parsed = parseNotifyOrNull(notify);
+    if (!parsed) throw new Error(`--notify must be an absolute http(s) URL (got "${oneLine(notify, 60)}")`);
+    const host = new URL(parsed).hostname;
+    if (host === '169.254.169.254' || host.endsWith('.169.254.169.254')) {
+      throw new Error('--notify refused — cloud metadata endpoints are never a notify target');
+    }
+    next.notify = parsed;
+  }
+  saveGoals(root, goals.map((x) => (x.id === g.id ? next : x)));
+  return { goal: next, problems };
 }
 
 function recordRun(root, id, { at, status }) {
@@ -532,6 +591,44 @@ export function nextWake(goals, nowMs = Date.now()) {
     .filter((d) => d != null)
     .map((d) => d.getTime());
   return ds.length ? Math.min(...ds) : null;
+}
+
+/** How many scheduled slots elapsed without a possible wake before the one
+ *  this tick fires (v0.68.0, wave 3 — the Hermes missed_runs rule: N skipped
+ *  slots collapse into ONE `missed ×N` ledger row and ONE run, never N
+ *  runs). Pure; bounded walk so a hostile cron pattern cannot spin. */
+export function missedSlotsFor(goal, nowMs = Date.now(), { maxWalk = 1000 } = {}) {
+  const s = goal?.schedule ?? null;
+  if (!s) return 0;
+  // A goal's FIRST fire never catches up: slots between registration and the
+  // first wake are registration lag (the operator has not wired the cron yet,
+  // or deliberately left it idle), not a failure to wake. The ledger speaks
+  // only when a goal that HAS fired before loses slots.
+  if (goal.lastRun == null) return 0;
+  const base = Date.parse(goal.lastRun);
+  if (!Number.isFinite(base) || base >= nowMs) return 0;
+  if (s.kind === 'every') {
+    const every = Number(s.minutes);
+    if (!Number.isInteger(every) || every < 1) return 0;
+    return Math.max(0, Math.min(maxWalk, Math.floor((nowMs - base) / (every * 60000))) - 1);
+  }
+  if (s.kind === 'cron') {
+    try {
+      let t = base;
+      let missed = 0;
+      for (;;) {
+        const next = nextCronFire(s.expr, t);
+        if (next > nowMs) break;
+        missed += 1;
+        t = next;
+        if (missed >= maxWalk) break;
+      }
+      return Math.max(0, missed - 1); // the newest slot is the one firing now
+    } catch {
+      return 0; // phantom pattern — never fires, nothing to catch up
+    }
+  }
+  return 0; // 'at' one-shots have no catch-up concept — they fire or they don't
 }
 
 // ── history (append-only JSONL; torn lines are skipped, never fatal) ────────
@@ -696,23 +793,82 @@ export function summarizeChildRun(r) {
 }
 
 /** Default per-goal runner: a FRESH child (`buddy -p <prompt>`) per wake —
- *  process isolation means a crashed goal can never take the tick down. */
+ *  process isolation means a crashed goal can never take the tick down.
+ *
+ *  v0.67 hardening: headless children deny risky tools by default; the
+ *  goal's recorded yolo choice flips them on (`goals add --yolo` — operator
+ *  choice, documented).
+ *  v0.68.0 waves 2+4: a goal with an allowlist fires its child with a
+ *  single-use run token (the operator's Tool(spec) rules, consumed on
+ *  first read); a goal with a notify URL leaves its outcome as an
+ *  obligation in the delivery ledger — persisted BEFORE any send, so a
+ *  crash can lose neither the fact nor the bounds. */
 export function runPromptDefault({ goal, root, timeoutMs = 600000 } = {}) {
-  return import('./benchmark.js')
-    // v0.67 hardening: headless children deny risky tools by default. The
-    // goal's recorded yolo choice is what flips them on — `goals add --yolo`
-    // was already documented as "gates off — operator choice"; before this,
-    // the flag was metadata only and the child auto-approved implicitly.
-    .then(({ runOneShot }) => runOneShot(['-p', goal.prompt, '--dir', String(root), ...(goal?.yolo ? ['--yolo'] : [])], { cwd: String(root), timeoutMs }))
-    .then((r) => summarizeChildRun(r))
-    .catch((e) => ({
-      status: 'error',
-      code: null,
-      signal: null,
-      steps: null,
-      said: null,
-      error: cap(String(e?.message || e), 200),
-    }));
+  const tokenPromise = import('./serve/runtoken.js').then((RT) => (
+    Array.isArray(goal?.allow) && goal.allow.length
+      ? RT.writeRunFile(root, { goalId: goal.id, allow: goal.allow })
+      : null
+  ));
+  return tokenPromise
+    .then((tok) => import('./benchmark.js').then(({ runOneShot }) => runOneShot(
+      ['-p', goal.prompt, '--dir', String(root), ...(goal?.yolo ? ['--yolo'] : [])],
+      {
+        cwd: String(root),
+        timeoutMs,
+        // the run token rides the env: the child consumes it (single-use)
+        // before the agent loop starts, then scrubs it for nested spawns
+        ...(tok ? { env: { BUDDY_RUN_FILE: tok.file, BUDDY_RUN_TOKEN: tok.token } } : {}),
+      },
+    )).then((r) => ({ r, tok })))
+    .then(({ r, tok }) => {
+      if (tok) { try { fs.unlinkSync(tok.file); } catch { /* the child consumed it — a stray is swept on the next fire */ } }
+      return summarizeChildRun(r);
+    })
+    .then((summary) => {
+      if (goal?.notify) notifyOutcome(root, goal, summary);
+      return summary;
+    })
+    .catch((e) => {
+      const summary = {
+        status: 'error',
+        code: null,
+        signal: null,
+        steps: null,
+        said: null,
+        error: cap(String(e?.message || e), 200),
+      };
+      if (goal?.notify) notifyOutcome(root, goal, summary); // a goal that died before its child ran still tells its target
+      return summary;
+    });
+}
+
+/** The wave-2 hook: goal outcome → delivery obligation. Never the prompt —
+ *  status + said + artifact paths only (promptChars discipline). Fire and
+ *  forget is honest here: enqueue is a file append; if IT fails the run row
+ *  still lands in history, and the failure is recorded on the summary. */
+function notifyOutcome(root, goal, summary) {
+  try {
+    import('./serve/delivery.js').then(({ enqueueDelivery }) => {
+      const r = enqueueDelivery(root, {
+        kind: 'webhook',
+        target: goal.notify,
+        summary: `goal ${oneLine(goal.name, 40)} → ${summary.status}`,
+        payload: {
+          type: 'buddy-goal-outcome',
+          goal: { id: goal.id, name: goal.name },
+          at: new Date().toISOString(),
+          status: summary.status,
+          said: summary.said ?? null,
+          error: summary.error ?? null,
+          steps: summary.steps ?? null,
+          durationMs: summary.durationMs ?? null,
+        },
+      });
+      summary.notify = r.ok ? { queued: r.id } : { error: r.error };
+    }).catch((e) => { summary.notify = { error: cap(String(e?.message || e), 120) }; });
+  } catch (e) {
+    summary.notify = { error: cap(String(e?.message || e), 120) };
+  }
 }
 
 /** One tick. NON-async on purpose: everything that must REFUSE (junk args,
@@ -810,6 +966,22 @@ export async function runDueGoals(rootOrOpts, maybeOpts = {}) {
           if (!hist.ok) row.historyError = hist.error;
           results.push(row);
           continue; // a SKIP does not advance runCount — the schedule owes nothing
+        }
+        // Wave 3 (serve rebuild): slots that elapsed without a possible wake
+        // collapse into ONE catch-up row in the same history ledger — the
+        // run itself happens once, and the gap is a visible fact, not a
+        // silent skip (the Hermes missed_runs rule).
+        const missed = missedSlotsFor(goal, now);
+        if (missed > 0) {
+          appendHistory(root, {
+            at: new Date().toISOString(),
+            id: goal.id,
+            name: goal.name,
+            status: 'CATCHUP',
+            reason: `${missed} scheduled slot(s) elapsed without a possible wake — collapsed into this run (one row, not ${missed + 1})`,
+            missed,
+          });
+          allProblems.push(`catch-up: ${oneLine(goal.name, 30)} — ${missed} missed slot(s) collapsed into this run`);
         }
         const timeoutMs = opts.fast === true
           ? FAST_TIMEOUT_MS

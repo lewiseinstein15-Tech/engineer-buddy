@@ -13,6 +13,7 @@ import { describeTools } from './agent.js';
 import { describeSkillCatalog } from '../skills/loader.js';
 import { PLAN_TOOLS, planModePrompt } from '../tools/planmode.js';
 import { evaluatePermission, matchingRule, auditTrail } from '../permissions.js';
+import { servePlaneRefusal } from '../harness/scaffold.js';
 import { estimateTokens } from '../brain/usage.js';
 import { classifyStep, routeForStep } from '../brain/effort.js';
 
@@ -716,7 +717,13 @@ export function createChat({
             }
             // Rules engine (v0.19.0): deny refuses outright, allow skips the
             // gate, ask falls through to the interactive approval.
-            const verdict = evaluatePermission(permissions, tool, args, { yolo });
+            // v0.68.0: the serve-plane floor sits ABOVE it — a command that
+            // touches .buddy/serve|index is refused before any rule, any
+            // approval, any run token (a token widens approvals, never policy;
+            // bash's arg-dependent risk would otherwise let a read-only `cat`
+            // reach the plane).
+            const planeRefusal = args && typeof args.command === 'string' ? servePlaneRefusal(args.command) : null;
+            const verdict = planeRefusal ? 'deny' : evaluatePermission(permissions, tool, args, { yolo });
             // v0.64.1: a tool whose risk DEPENDS on its args (riskyWhen — bash,
             // db's write mode, http mutations) remembers "always" per CALL
             // SHAPE: the "a" that approved `rm a.txt` must never pre-approve
@@ -731,8 +738,12 @@ export function createChat({
             // nobody is at the wheel.
             let denial = null;
             if (verdict === 'deny') {
-              const rule = matchingRule(permissions, tool, args, 'deny');
-              observation = `REFUSED by a permissions rule (${rule}) — this is policy from .buddy/settings.json, not a judgment call. Pick a different approach or ask the user to change the rules.`;
+              if (planeRefusal) {
+                observation = planeRefusal;
+              } else {
+                const rule = matchingRule(permissions, tool, args, 'deny');
+                observation = `REFUSED by a permissions rule (${rule}) — this is policy from .buddy/settings.json, not a judgment call. Pick a different approach or ask the user to change the rules.`;
+              }
               denied = true;
             } else if ((dynamicRisk ? !!impl.riskyWhen(args) : !!impl.risky) && approval && !alwaysApproved.has(tool) && !(alwaysKey && alwaysApproved.has(alwaysKey)) && verdict === 'ask') {
               const decision = await approval({ tool, args, summary: impl.render ? impl.render(args) : truncate(JSON.stringify(args), 200), preview });

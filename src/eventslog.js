@@ -157,6 +157,11 @@ export function projectEvent(ev) {
           .map((n) => n.slice(0, 20))
           .slice(0, 12),
       };
+    case 'runToken':
+      // v0.68.0 — a consumed single-use run token is an auditable fact: which
+      // goal, how many rules, whether it was honored. Never the rules
+      // themselves — settings.json owns those; the log keeps facts only.
+      return { ...base, ok: Boolean(ev.ok), goalId: ev.goalId ?? null, rules: Number(ev.rules) || 0 };
     case 'turn_end':
       return {
         ...base,

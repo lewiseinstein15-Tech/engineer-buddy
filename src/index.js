@@ -38,6 +38,8 @@ import { ensureHarness } from './harness/scaffold.js';
 import { createWorktree, worktreeSlug } from './tools/worktree.js';
 import { log, warn, setVerbose, truncate, BuddyError } from './util.js';
 import { parseArgs } from 'node:util';
+import { spawn } from 'node:child_process';
+import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 
@@ -112,7 +114,22 @@ GitHub skills (CI):
                                         wake is external (OS cron, Actions cron);
                                         store + history + artifacts record every
                                         run; --dry provably calls no runner; HELD
-                                        junk is reported, never scheduled
+                                        junk is reported, never scheduled;
+                                        'goals edit <id> --allow "Bash(git *)"
+                                        --notify <url>' grants an unattended
+                                        allowlist (single-use run token; settings
+                                        denies and the firewall still outrank it)
+                                        and queues each outcome as an obligation
+  engineer-buddy serve [start|stop|status|pause|resume|drain|sweep|targets|install|uninstall]
+                                        (v0.68.0) the resident service plane: a
+                                        lease-held daemon that flushes the delivery
+                                        ledger (persist-before-send, 3 attempts,
+                                        dead-target parking, at-most-once claims)
+                                        and ticks goals without OS cron; --detach
+                                        daemonizes into .buddy/serve/daemon.log;
+                                        control is a private socket; enqueue works
+                                        with no daemon at all — files are the
+                                        interface, the daemon is just the flusher
   engineer-buddy channel [list|add|remove|serve|drain|status]
                                         (alias: channels) push external events
                                         into a live session: webhook → inbox →
@@ -1032,6 +1049,200 @@ async function cmdChannel(argv) {
   }
 }
 
+// ── buddy serve (v0.68.0, the serve rebuild — docs/serve-rebuild-plan.md) ───
+
+/** Write the supervisor unit for the serve daemon. Exit-code semantics are
+ *  the point: 0 clean, 75 transient (Restart=on-failure retries it), 78
+ *  fatal (the restart guard tripped — a supervisor must NOT loop on 78). */
+function serveInstallUnit(root, { entry }) {
+  const node = process.execPath;
+  if (process.platform === 'linux') {
+    const dir = path.join(os.homedir(), '.config', 'systemd', 'user');
+    const file = path.join(dir, 'buddy-serve.service');
+    const body = [
+      '[Unit]',
+      'Description=Engineer Buddy serve (delivery ledger + goals ticker)',
+      'After=network-online.target',
+      '',
+      '[Service]',
+      `ExecStart=${node} ${entry} serve start --dir ${root}`,
+      'Restart=on-failure',
+      'RestartSec=15s',
+      '# 75 = transient (lease lost) — retried after RestartSec.',
+      '# 78 = the restart guard tripped — stays down until an operator acts.',
+      '',
+      '[Install]',
+      'WantedBy=default.target',
+      '',
+    ].join('\n');
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(file, body);
+      return { ok: true, text: `systemd user unit written: ${file}\n  enable: systemctl --user daemon-reload && systemctl --user enable --now buddy-serve.service\n  logs  : journalctl --user -u buddy-serve.service -f   ·   buddy serve status` };
+    } catch (e) {
+      return { ok: false, text: `could not write the unit (${e.message}) — run buddy serve start --detach under your own supervisor` };
+    }
+  }
+  if (process.platform === 'darwin') {
+    const dir = path.join(os.homedir(), 'Library', 'LaunchAgents');
+    const file = path.join(dir, 'com.engineer-buddy.serve.plist');
+    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    const body = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.engineer-buddy.serve</string>
+  <key>ProgramArguments</key><array>
+    <string>${esc(node)}</string><string>${esc(entry)}</string>
+    <string>serve</string><string>start</string><string>--dir</string><string>${esc(root)}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>15</integer>
+</dict></plist>
+`;
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(file, body);
+      return { ok: true, text: `launchd agent written: ${file}\n  load: launchctl load ${file}\n  logs : buddy serve status (stdout also lands in .buddy/serve/daemon.log)` };
+    } catch (e) {
+      return { ok: false, text: `could not write the agent (${e.message}) — run buddy serve start --detach under your own supervisor` };
+    }
+  }
+  return { ok: false, text: `no service installer for ${process.platform} — run \`buddy serve start --detach\` from your own supervisor (the exit codes are already supervisor-shaped: 0 clean · 75 transient · 78 fatal)` };
+}
+
+async function cmdServe(argv) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: {
+      dir: { type: 'string' },
+      detach: { type: 'boolean', default: false },
+      tick: { type: 'string' },
+      'no-goals': { type: 'boolean', default: false },
+      forget: { type: 'string' },
+    },
+    allowPositionals: true,
+  });
+  const root = values.dir ? path.resolve(values.dir) : process.cwd();
+  const sub = String(positionals[0] ?? 'status').toLowerCase();
+  const S = await import('./serve/daemon.js');
+  const C = await import('./serve/control.js');
+  const D = await import('./serve/delivery.js');
+  const L = await import('./serve/lease.js');
+  const P = await import('./serve/paths.js');
+  try {
+    if (sub === 'start') {
+      if (values.detach) {
+        // daemonize the zero-dep way: a detached child of THIS binary, output
+        // into the serve plane's own log, no shell, no pid files of ours.
+        fs.mkdirSync(P.servePath(root), { recursive: true });
+        const out = fs.openSync(P.daemonLogPath(root), 'a');
+        const entry = path.resolve(process.argv[1] || 'src/index.js');
+        const child = spawn(process.execPath, [entry, 'serve', 'start', '--dir', root], { detached: true, stdio: ['ignore', out, out] });
+        child.unref();
+        for (let i = 0; i < 12; i++) {
+          await new Promise((r) => setTimeout(r, 500));
+          const st = await C.controlRequest(root, 'status', { timeoutMs: 1000 });
+          if (st.ok) {
+            console.error(`[serve] daemon up — boot ${st.status.bootId}, pid ${st.status.pid} (log: ${P.daemonLogPath(root)})`);
+            return 0;
+          }
+        }
+        console.error(`[serve] the daemon did not answer within 6s — the log says why: ${P.daemonLogPath(root)}`);
+        return 1;
+      }
+      return await S.startDaemon(root, {
+        tickMs: (Number(values.tick) || 0) * 1000 || undefined,
+        goalsTicker: !values['no-goals'],
+      });
+    }
+    if (sub === 'stop') {
+      const r = await C.controlRequest(root, 'stop');
+      if (r.ok) { console.error('[serve] stop accepted — the daemon finishes its tick, releases the lease, exits 0'); return 0; }
+      console.error(`[serve] ${r.error}`);
+      return r.unreachable ? 1 : 2;
+    }
+    if (sub === 'pause' || sub === 'resume') {
+      const r = await C.controlRequest(root, sub);
+      if (r.ok) {
+        console.error(`[serve] ${sub}d — delivery and the goals ticker ${sub === 'pause' ? 'hold (the marker survives a restart)' : 'resume'}`);
+        return 0;
+      }
+      console.error(`[serve] ${r.error}`);
+      return 1;
+    }
+    if (sub === 'drain') {
+      const r = await C.controlRequest(root, 'drain');
+      if (r.ok) { console.error('[serve] drain requested — the current tick finishes, the lease releases, exit 0'); return 0; }
+      console.error(`[serve] ${r.error}`);
+      return 1;
+    }
+    if (sub === 'sweep') {
+      const r = D.sweepDelivery(root, { bootId: 'offline-sweep' });
+      console.error(`sweep: ${r.settledUnknown} claimed send(s) settled 'unknown' (at-most-once) · ledger ${r.compacted ? 'compacted' : 'left as-is'} · hygiene: ${r.torn} torn, ${r.giants} giant line(s)`);
+      return 0;
+    }
+    if (sub === 'targets') {
+      if (values.forget) {
+        const r = D.forgetDeadTarget(root, values.forget);
+        if (!r.ok) { console.error(`[serve] ${r.error}`); return 2; }
+        console.error(`[serve] target revived: ${r.forgotten} — the next obligation to it is attempted again`);
+        return 0;
+      }
+      const { targets, count } = D.loadDeadTargets(root);
+      if (!count) { console.error('no dead targets — every delivery destination is currently believed alive'); return 0; }
+      console.error(`dead targets (${count}) — attempted once, parked forever; revive with --forget <url>:`);
+      for (const [t, info] of Object.entries(targets)) console.error(`  ${t}\n    parked ${info.at} — ${info.reason}`);
+      return 0;
+    }
+    if (sub === 'install') {
+      const r = serveInstallUnit(root, { entry: path.resolve(process.argv[1] || 'src/index.js') });
+      console.error(r.text);
+      return r.ok ? 0 : 2;
+    }
+    if (sub === 'uninstall') {
+      const candidates = [
+        path.join(os.homedir(), '.config', 'systemd', 'user', 'buddy-serve.service'),
+        path.join(os.homedir(), 'Library', 'LaunchAgents', 'com.engineer-buddy.serve.plist'),
+      ];
+      let removed = 0;
+      for (const f of candidates) { try { fs.rmSync(f); removed += 1; console.error(`removed: ${f}`); } catch { /* not installed here */ } }
+      if (!removed) console.error('nothing to remove — no unit found for this platform');
+      if (removed) console.error('disable the running service first if it is loaded: systemctl --user disable --now buddy-serve.service');
+      return 0;
+    }
+    if (sub === 'status') {
+      const r = await C.controlRequest(root, 'status', { timeoutMs: 2000 });
+      if (r.ok) {
+        const s = r.status;
+        console.error(`[serve] daemon up — boot ${s.bootId} · pid ${s.pid} · ${s.host} · v${s.version} · up ${Math.max(0, Math.round(s.uptimeMs / 1000))}s`);
+        console.error(`  tick ${Math.round(s.tickMs / 1000)}s · goals ticker ${s.goalsTicker ? 'on' : 'off'} · ${s.paused ? 'PAUSED' : 'running'}${s.stopping ? ' · stopping' : ''}${s.restarts ? ` · ! ${s.restarts} unclean restart(s) in 10min` : ''}`);
+        const d = s.delivery ?? {};
+        console.error(`  obligations: ${d.total ?? 0} total — pending ${d.pending ?? 0} · claimed ${d.claimed ?? 0} · sent ${d.sent ?? 0} · failed ${d.failed ?? 0} · dead ${d.dead ?? 0} · unknown ${d.unknown ?? 0}${d.torn ? ` (ledger: ${d.torn} torn, ${d.giants} giant)` : ''}`);
+        if (s.lastTick?.at) console.error(`  last tick: ${s.lastTick.at}${s.lastTick.error ? ` — ${s.lastTick.error}` : ''}${s.lastTick.paused ? ' (paused)' : ''}`);
+        return 0;
+      }
+      // Unreachable — the file-level truth is still reportable. Enqueue worked
+      // without a daemon all along; the backlog is a visible fact, not a loss.
+      const lease = L.readLease(root);
+      const restartRows = P.readJsonl(P.restartsPath(root), { maxRows: 200 }).rows;
+      console.error('[serve] no daemon reachable — the plane holds its facts:');
+      console.error(`  lease  : ${lease && L.leaseAlive(lease) ? `held by pid ${lease.pid} (heartbeat ${lease.heartbeatAt}) — alive but the control socket is down?` : 'free (no live owner)'}`);
+      console.error('  backlog: ' + D.deliveryStatusText(root).split('\n').join('\n           '));
+      const n = S.countRecentRestarts(restartRows);
+      if (n) console.error(`  ! ${n} unclean restart(s) in the last 10 min${n >= S.RESTART_MAX ? ` — the boot guard refuses daemon starts until ${P.restartsPath(root)} is cleared` : ''}`);
+      if (fs.existsSync(P.pausedPath(root))) console.error('  paused (marker present)');
+      if (fs.existsSync(P.drainPath(root))) console.error(`  a drain was requested but nothing is running — remove ${P.drainPath(root)} or let the next boot consume it`);
+      return 1;
+    }
+    console.error(`buddy: unknown serve subcommand "${sub}" — known: start | stop | status | pause | resume | drain | sweep | targets | install | uninstall`);
+    return 2;
+  } catch (e) {
+    console.error(`buddy: serve failed honestly — ${e?.message || e}`);
+    return 2;
+  }
+}
+
 async function cmdGoals(argv) {
   const { values, positionals } = parseArgs({
     args: argv,
@@ -1049,6 +1260,10 @@ async function cmdGoals(argv) {
       id: { type: 'string' },
       dry: { type: 'boolean', default: false },
       'timeout-minutes': { type: 'string' },
+      allow: { type: 'string', multiple: true },
+      'clear-allow': { type: 'boolean', default: false },
+      notify: { type: 'string' },
+      'clear-notify': { type: 'boolean', default: false },
     },
     allowPositionals: true,
   });
@@ -1088,6 +1303,24 @@ async function cmdGoals(argv) {
     if (sub === 'remove' || sub === 'rm' || sub === 'del') {
       const { goal } = G.removeGoal(root, values.id ?? positionals[1]);
       console.error(`goal removed: ${goal.id} — ${line(goal.name, 40)}`);
+      return 0;
+    }
+    if (sub === 'edit') {
+      // v0.68.0 wave 4: the operator's finger on the unattended plane. The
+      // agent has no path to this — goals.json is firewall-protected and an
+      // unattended child's bash is denied by default, so the allowlist is
+      // reachable only by whoever could already edit the store by hand.
+      const { goal } = G.editGoal(root, values.id ?? positionals[1], {
+        allow: values.allow ?? null,
+        clearAllow: Boolean(values['clear-allow']),
+        notify: values.notify ?? null,
+        clearNotify: Boolean(values['clear-notify']),
+      });
+      console.error(`goal edited: ${goal.id} — ${line(goal.name, 40)}`);
+      console.error(`  allow : ${Array.isArray(goal.allow) && goal.allow.length ? goal.allow.join(' · ') : '(none — unattended runs stay default-deny)'}`);
+      console.error(`  notify: ${goal.notify ?? '(none)'}`);
+      console.error('  reminder: settings.json deny rules and the .buddy/serve firewall outrank every allow rule.');
+      try { appendEvent(root, { type: 'goalsEdit', id: goal.id, allowRules: Array.isArray(goal.allow) ? goal.allow.length : 0, notify: Boolean(goal.notify) }); } catch { /* best effort */ }
       return 0;
     }
     if (sub === 'history') {
@@ -1141,7 +1374,7 @@ async function cmdGoals(argv) {
       if (out.passed === 0) return 1; // nothing scored (all skipped / idle) — honest, but not a pass
       return 0;
     }
-    console.error(`buddy: unknown goal subcommand "${line(sub, 24)}" — known: list | set | enable | disable | remove | run | history | next`);
+    console.error(`buddy: unknown goal subcommand "${line(sub, 24)}" — known: list | set | edit | enable | disable | remove | run | history | next`);
     return 2;
   } catch (e) {
     console.error(`buddy: goals failed honestly — ${e?.message || e}`);
@@ -1343,6 +1576,7 @@ async function main() {
     if (cmd === 'benchmark') process.exit(await cmdBenchmark(argv));
     if (cmd === 'goals' || cmd === 'goal') process.exit(await cmdGoals(argv));
     if (cmd === 'channel' || cmd === 'channels') process.exit(await cmdChannel(argv));
+    if (cmd === 'serve') process.exit(await cmdServe(argv));
     if (cmd === 'lesson' || cmd === 'lessons') process.exit(await cmdLessons(argv));
     if (cmd === 'telemetry' || cmd === 'metrics') process.exit(await cmdTelemetry(argv));
     if (cmd === 'notebook' || cmd === 'nb') process.exit(await cmdNotebook(argv));

@@ -279,6 +279,13 @@ export const AGENT_DENY_GLOBS = [
   // Append-only trails: the agent must not be able to rewrite its own record.
   '.buddy/audit.jsonl',
   '.buddy/events.jsonl',
+  // The serve plane (v0.68.0, wave 0 of the serve rebuild) — protected BEFORE
+  // the daemon exists. The daemon's own state lives here: the lease, the
+  // delivery ledger (the record of what left the machine), dead targets, and
+  // single-use run tokens (a run token IS a permission grant). The agent may
+  // never read or steer any of it; the operator owns the process.
+  '.buddy/serve/**',
+  '.buddy/index/**',
   '**/.git/**',
   '**/.env*',
   '**/*.pem',
@@ -293,4 +300,22 @@ export const AGENT_DENY_GLOBS = [
 
 export function isAgentDeniedPath(rel) {
   return AGENT_DENY_GLOBS.some((g) => globMatches(g, String(rel || '')));
+}
+
+/** The serve-plane floor (v0.68.0): .buddy/serve/ and .buddy/index/ are not
+ *  the agent's business — not read-only, not under --yolo, not under a run
+ *  token. The fs tools refuse them via AGENT_DENY_GLOBS, but bash's risk is
+ *  arg-dependent (riskyWhen), so a read-only command like `cat
+ *  .buddy/serve/lease.json` would slip past every gate and read the plane —
+ *  including a run token, which IS a permission grant. This floor lives at
+ *  the chat gate, ABOVE the rules engine and the approval layer. Heuristic
+ *  by nature (a command-string scan — obfuscation is Hermes' acknowledged
+ *  regex limit too): defense-in-depth, the documented boundary stays the OS
+ *  user; this closes the honest `cat`. Returns the refusal text or null. */
+export function servePlaneRefusal(command) {
+  const s = String(command ?? '');
+  if (s.includes('.buddy/serve') || s.includes('.buddy/index')) {
+    return 'REFUSED by policy: .buddy/serve/ and .buddy/index/ are the service plane — the daemon, the delivery ledger, run tokens. The operator owns them; the agent never reads or writes them through any tool, even read-only bash, even under --yolo. Recover: ask the operator to run `buddy serve status`.';
+  }
+  return null;
 }
