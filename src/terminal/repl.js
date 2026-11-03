@@ -38,6 +38,7 @@ import { connectMcpServers, buildMcpTools, describeMcpServers, MCP_CONFIG_PATH }
 import { ensureHarness, loadHarness, harnessContext } from '../harness/scaffold.js';
 import { HARNESS_DIR } from '../harness/defaults.js';
 import { SessionRecorder, listSessions, loadSession, sessionInfo, resumeMessages, writeExport, latestSession, findSession, renameSession, forkSession, writeHtmlExport, importSession } from '../session.js';
+import { searchIndex as searchSessionsIndex, buildIndex as buildSessionsIndex } from '../sessionsidx.js';
 import { reflect, recentLessons, experiencePath } from '../learn.js';
 import { recallLessons, recallBlockText, lessonsIndexText, lessonsRecallText } from '../lessons.js';
 import { startWorkspaceWatcher, drainDriftForTurn, resolveWatchSetting } from '../watch/watcher.js';
@@ -137,7 +138,7 @@ export const SLASH_DESCRIPTIONS = {
   review: 'Review your uncommitted diff',
   init: 'Scaffold .buddy/harness/',
   export: 'Write the transcript to markdown',
-  sessions: 'List saved transcripts',
+  sessions: 'List saved transcripts · --search <terms> (indexed, no LLM) · --rebuild',
   resume: 'Resume a saved session',
   status: 'Session stats',
   yolo: 'Toggle auto-approval (careful)',
@@ -2390,6 +2391,32 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
         break;
       }
       case 'sessions': {
+        // Wave 5: /sessions --search <terms> — cursor-built index, no LLM in the loop.
+        const sm = String(args || '').match(/(?:--search|-s)\s+(\S.*)/);
+        if (sm) {
+          const res = searchSessionsIndex(root, sm[1].trim());
+          if (!res.hits.length) {
+            say(`\n  nothing matched — ${c.dim(`indexed ${res.tokens.length} term(s) in ${res.tookMs}ms — try fewer words, or /sessions`)}\n`);
+            break;
+          }
+          const rows = res.hits.slice(0, 12).map((h, i) => [
+            String(i),
+            truncate(h.first, 44),
+            `${h.turns}`,
+            `${h.score}`,
+            h.matched.slice(0, 4).join(' '),
+          ]);
+          say(
+            `\n${renderTable(rows, { headers: ['#', 'match', 'turns', 'score', 'terms'] })}` +
+              `\n${c.dim(`  ${res.hits.length} hit(s) · ${res.tookMs}ms · resume: /resume <name-prefix>`)}\n`
+          );
+          break;
+        }
+        if (/--rebuild/.test(args)) {
+          const built = buildSessionsIndex(root, { rebuild: true });
+          say(`\n  ${c.green('rebuilt')} — ${built.files} session(s) indexed from zero in ${built.tookMs}ms\n`);
+          break;
+        }
         const list = listSessions(root);
         if (!list.length) {
           say('\n  (none yet — sessions save automatically as you work)\n');
@@ -2399,7 +2426,7 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
           const info = sessionInfo(f);
           return [i === 0 ? c.bold('0') : String(i), truncate(info.firstUser, 44), `${info.turns}`, (info.mtime || '').slice(0, 16).replace('T', ' ')];
         });
-        say(`\n${renderTable(rows, { headers: ['#', 'first task', 'turns', 'saved'] })}\n${c.dim('  resume: /resume <n> or /resume <name-prefix>')}\n`);
+        say(`\n${renderTable(rows, { headers: ['#', 'first task', 'turns', 'saved'] })}\n${c.dim('  resume: /resume <n> or /resume <name-prefix> · search: /sessions --search <terms>')}\n`);
         break;
       }
       case 'resume': {
