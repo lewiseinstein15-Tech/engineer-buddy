@@ -30,3 +30,4 @@ success os=Linux sha=cdf2bef9a4bb813a05fce875f147d42e0c18aa0b at=2026-11-02T14:5
 cancelled os=Windows sha=cdf2bef9a4bb813a05fce875f147d42e0c18aa0b at=2026-11-02T20:45:10Z
 success os=Linux sha=5b8dbc95f0695e51bc0c22fcd3ce6ea4ebb004c5 at=2026-11-02T20:46:51Z
 cancelled os=Windows sha=5b8dbc95f0695e51bc0c22fcd3ce6ea4ebb004c5 at=2026-11-03T02:46:30Z
+cancelled os=Windows sha=b720444713e5ab7e39cf74c6a7b55f83b9af7c4a at=2026-11-05T20:39:29Z
