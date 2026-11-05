@@ -53,12 +53,44 @@ BUDDY_WORKSPACE=/path/to/your/project ./desktop/start.sh
 
 The engine is resolved from (in order): `ENGINEER_BUDDY_PATH`, an `engineer-buddy/` checkout sitting next to this folder, then the repo checkout this folder is part of.
 
+## Put it in your app launcher (own icon, own window)
+
+Three routes — none adds a dependency; pick one per OS:
+
+**Chrome / Edge "Install app" (PWA — any OS):** with the app open, click the install icon in the address bar (Chrome: `Install`; Edge: Apps → *Install this site as an app*). **Buddy Desktop** lands in the app launcher / Start menu with its own window and its own icon. The app ships `manifest.webmanifest`, the icon set, and a pass-through service worker — nothing is cached and no offline mode is faked: the app IS a local server.
+
+**Linux (`.desktop` entry):**
+
+```bash
+./desktop/install-launcher.sh        # from the repo checkout
+```
+
+GNOME Activities / the KDE menu / dock launchers now list **Buddy Desktop**. Launching it boots the server if it is not running and opens the UI in its own chromeless window (Chromium `--app` mode, `StartupWMClass=buddy-desktop` so the taskbar groups it). Remove it again with `./desktop/uninstall-launcher.sh`.
+
+**macOS (`.app` bundle):**
+
+```bash
+./desktop/install-launcher-mac.sh    # builds ~/Applications/Buddy Desktop.app
+```
+
+Buddy Desktop appears in Launchpad and Spotlight with its own icon (a committed `AppIcon.icns` — no code signing, so Gatekeeper asks once on first launch).
+
+**Windows (Start menu):** run `powershell -File desktop\install-launcher.ps1`. It creates the **Buddy Desktop** Start-menu shortcut (icon `app-icons\buddy.ico`) pointing at `buddy-desktop.cmd` — server booted if needed, then an Edge/Chrome `--app` window.
+
+The launchers use a Chromium-family browser for the chromeless window (any of Chrome / Chromium / Edge / Brave — Edge ships with Windows); without one they open a normal tab. The server itself never needs a browser.
+
 ## Files
 
 | File | Role |
 | --- | --- |
 | `server.mjs` | Local server (127.0.0.1:7822): spawns the real engine per task, forwards its `stream-json` over SSE, enriches it with `.buddy/events.jsonl` (`why`, gateway, model), parses `todo` plans, persists replayable sessions, serves workspace git state, GitHub account connect/commit/push, and brain-config endpoints |
 | `app.html` | The desktop UI — the conversation: thinking lines, collapsible tool cards, to-dos card, the rendered answer card, diff card, sessions/git/settings panels, files picker, inspector, composer |
+| `manifest.webmanifest` + `sw.js` | PWA identity: the metadata and icons behind the browser's "Install app" (own launcher entry, own window, own icon); the service worker is a pass-through — nothing cached, no fake offline |
+| `app-icons/` | The launcher icon set: rounded + maskable PNGs (512/192/32), apple-touch 180, Windows `buddy.ico`, macOS `AppIcon.icns` |
+| `launch.sh` | Boots the server if it is not running, then opens the UI in its own chromeless app window (Chromium `--app`, macOS `open`, plain-tab fallback) |
+| `install-launcher.sh` / `uninstall-launcher.sh` | Install / remove the Linux `.desktop` launcher entry (app launcher, own icon) |
+| `install-launcher-mac.sh` | Build `~/Applications/Buddy Desktop.app` (macOS Dock / Launchpad / Spotlight) |
+| `buddy-desktop.cmd` + `install-launcher.ps1` | Windows launcher + Start-menu shortcut |
 
 ## Modes
 

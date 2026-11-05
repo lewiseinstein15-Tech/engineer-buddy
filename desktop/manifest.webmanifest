@@ -1,0 +1,17 @@
+{
+  "name": "Buddy Desktop",
+  "short_name": "Buddy",
+  "description": "engineer-buddy — the keyless AI engineering agent, in a desktop window",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f4eee1",
+  "theme_color": "#e08528",
+  "lang": "en",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

@@ -222,6 +222,10 @@ body.nomotion .shimmer{display:none}
 .emptythread .big{font-size:34px}
 @media (max-width:1100px){.inspector{display:none}}
 </style>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="32x32" href="/icons/icon-32.png">
+<link rel="apple-touch-icon" href="/icons/icon-180.png">
+<meta name="theme-color" content="#e08528">
 </head>
 <body>
 <header>
@@ -880,7 +884,10 @@ $('#btnRun').addEventListener('click', startRun);
   loadBrain();
 })();
 </script>
-
-
+<script>
+/* PWA: lets the browser offer "Install app" — Buddy lands in the OS app
+   launcher with its own window and icon (see desktop/install-launcher.*). */
+if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/sw.js').catch(() => {}); }
+</script>
 </body>
 </html>

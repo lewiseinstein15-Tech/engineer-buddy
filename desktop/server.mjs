@@ -283,6 +283,18 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // static app assets (PWA + launcher icons) — basename only, no traversal
+  if (p === '/manifest.webmanifest' || p === '/sw.js' || p === '/favicon.ico' || p === '/favicon.png' || p.startsWith('/icons/')) {
+    const TYPES = { '.webmanifest': 'application/manifest+json; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.png': 'image/png', '.ico': 'image/x-icon' };
+    const f = p === '/favicon.ico' || p === '/favicon.png' ? 'icon-32.png' : p === '/manifest.webmanifest' ? 'manifest.webmanifest' : p === '/sw.js' ? 'sw.js' : path.basename(p);
+    const fp = path.join(__dirname, f === 'manifest.webmanifest' || f === 'sw.js' ? '.' : 'app-icons', f);
+    if (fs.existsSync(fp)) {
+      res.writeHead(200, { 'Content-Type': TYPES[path.extname(fp)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
+      fs.createReadStream(fp).pipe(res);
+      return;
+    }
+  }
+
   try {
     if (p === '/api/health') return j(res, 200, { ok: true, engine: ENGINE, version, workspace: WORKSPACE, chain: brainPreview(readBrain()) });
     if (p === '/api/brain' && req.method === 'GET') {

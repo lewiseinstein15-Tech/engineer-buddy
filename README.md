@@ -136,6 +136,8 @@ BUDDY_WORKSPACE=/path/to/your/project ./desktop/start.sh
 
 Full feature tour — sessions replay, provider/model settings, the git & GitHub panel: [desktop/README.md](desktop/README.md). A 90-second, one-take recording of a real run (question typed on camera → narrated run → every block opened one by one → the rendered answer): [desktop/demo/buddy-desktop-demo.mp4](desktop/demo/buddy-desktop-demo.mp4).
 
+It also installs like a real app: open it once and Chrome/Edge's **Install app** puts **Buddy Desktop** in your app launcher (own window, own icon) — or run the OS installer: `./desktop/install-launcher.sh` (Linux `.desktop` entry), `./desktop/install-launcher-mac.sh` (macOS `.app` bundle), `desktop/install-launcher.ps1` (Windows Start menu). Launching boots the local server if it is not running, then opens Buddy in its own chromeless window.
+
 ## Buddy Code — the terminal coding agent (v0.8)
 
 Like Claude Code, but keyless and $0. Run it in any repo:
