@@ -78,7 +78,9 @@ whole engine is the Node.js standard library.
 
 **Prerequisites (all platforms):** [Node.js](https://nodejs.org) **>= 20**
 (`node --version` to check) and `git` on PATH. No API keys, no accounts, no
-monthly cost — the brain chain is keyless by contract.
+monthly cost — the brain chain is keyless by contract. On Arch-based distros
+(Omarchy, plain Arch) the package is `nodejs`, not `node`:
+`sudo pacman -S --needed nodejs`.
 
 ### macOS / Linux
 
