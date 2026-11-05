@@ -5,17 +5,21 @@ import { fetchWithTimeout, BuddyError } from '../../util.js';
 import { extractUsage, gwCtxLimit } from '../usage.js';
 import { fetchStreaming, streamNDJSON } from '../sse.js';
 
-// Ollama's default num_ctx is small (4k) — match it so the router routes long
-// chats elsewhere first. Overridable via gateways.ollama.ctxLimit.
-const DEFAULT_CTX_LIMIT = 4096;
+// Ollama loads with num_ctx = ctxLimit (v0.69.3: we now pass it in the
+// request — previously the router promised the model a window ollama itself
+// never opened, and a ~7k research prompt died on the 4k default). 8192 so a
+// long research turn fits the offline last resort; overridable via
+// gateways.ollama.ctxLimit in buddy.config.json.
+const DEFAULT_CTX_LIMIT = 8192;
 
 const STREAM_IDLE_MS = 45000;
 
 export function createOllamaGateway(cfg, timeouts) {
   const models = Array.isArray(cfg.models) && cfg.models.length ? cfg.models : ['qwen2.5-coder:3b'];
+  const ctxLimit = gwCtxLimit(cfg, DEFAULT_CTX_LIMIT);
   return {
     name: 'ollama',
-    ctxLimit: gwCtxLimit(cfg, DEFAULT_CTX_LIMIT),
+    ctxLimit,
     async chat(messages, { maxTokens = 2048, temperature = 0.2, timeoutMs = timeouts.chatMs, model, onDelta = null } = {}) {
       const m = model || models[0];
       const wantsStream = typeof onDelta === 'function';
@@ -29,7 +33,7 @@ export function createOllamaGateway(cfg, timeouts) {
             model: m,
             messages,
             stream: wantsStream,
-            options: { temperature, num_predict: maxTokens },
+            options: { temperature, num_predict: maxTokens, num_ctx: ctxLimit },
           }),
         };
         if (wantsStream) {

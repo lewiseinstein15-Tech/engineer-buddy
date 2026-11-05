@@ -296,7 +296,13 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
-    if (p === '/api/health') return j(res, 200, { ok: true, engine: ENGINE, version, workspace: WORKSPACE, chain: brainPreview(readBrain()) });
+    if (p === '/api/health') {
+      // v0.69.3: re-read the engine version per health poll — the cached one
+      // kept saying "engine v0.69.1" after a git pull until the server itself
+      // was restarted, making the chip lie about what the next run will use.
+      try { version = JSON.parse(fs.readFileSync(path.join(ENGINE, 'package.json'), 'utf8')).version || version; } catch {}
+      return j(res, 200, { ok: true, engine: ENGINE, version, workspace: WORKSPACE, chain: brainPreview(readBrain()) });
+    }
     if (p === '/api/brain' && req.method === 'GET') {
       const b = readBrain();
       return j(res, 200, { defaults: DEFAULT_CHAIN, known: KNOWN, current: b, preview: brainPreview(b), customized: brainCustomized(b) });

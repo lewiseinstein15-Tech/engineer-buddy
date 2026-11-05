@@ -262,7 +262,12 @@ export class GatewayRouter {
     for (const a of [...attempts, ...skipped]) if (!seen.has(a.gateway)) seen.set(a.gateway, a);
     const summary = this.order
       .filter((n) => seen.has(n))
-      .map((n) => `${n}: ${seen.get(n).error}`)
+      // gateway errors already open with their own name ("pollinations: …") —
+      // don't double it into "pollinations: pollinations: …" (v0.69.3)
+      .map((n) => {
+        const err = String(seen.get(n).error);
+        return `${n}: ${err.startsWith(`${n}: `) ? err.slice(n.length + 2) : err}`;
+      })
       .join(' | ');
     const rateLimitedEntry = [...seen.values()].find((a) => /rate-limited/.test(a.error));
     let hint = '';
