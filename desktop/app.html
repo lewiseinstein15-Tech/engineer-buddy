@@ -1,0 +1,802 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>buddy — desktop</title>
+<style>
+:root{
+  --bg:#f4eee1; --paper:#faf6ec; --ink:#2b2620; --mut:#8a7f6d; --line:#e4dbc8; --line2:#d8cdb4;
+  --amber:#b97e14; --amberbg:#f7ecd4; --teal:#0f7f72; --tealbg:#ddf0ec; --purple:#7a5cc4; --purplebg:#ece5fa;
+  --olive:#5d6b2a; --olivebg:#ecefda; --blue:#2d63b8; --bluebg:#e0eafb; --red:#b3382e; --redbg:#f9e4e0;
+  --dark:#33291a; --darkink:#f3ecdc;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;font:15px/1.55 "Avenir Next","Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--ink)}
+code,pre,.mono{font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace}
+
+/* ---------- header ---------- */
+header{display:flex;align-items:center;gap:14px;padding:10px 18px;border-bottom:1px solid var(--line);background:var(--paper)}
+.logo{font-weight:800;font-size:17px;letter-spacing:-.2px;display:flex;align-items:center;gap:8px}
+.dot{width:9px;height:9px;border-radius:50%;background:#3f9d4e;box-shadow:0 0 0 3px #3f9d4e22}
+.dot.busy{background:var(--amber);animation:pulse 1.2s infinite}
+@keyframes pulse{50%{opacity:.45}}
+.chip{font-size:11.5px;padding:3px 10px;border:1px solid var(--line2);border-radius:99px;color:var(--mut);background:#fff9;white-space:nowrap}
+.chip b{color:var(--ink);font-weight:600}
+.chip.state-ok{color:#2f7d3c;border-color:#bfe0c4}
+.chip.state-busy{color:var(--amber);border-color:#ecd9a8}
+.chip.live{color:var(--blue);border-color:#bcd2f0;cursor:pointer}
+.spacer{flex:1}
+
+/* ---------- shell ---------- */
+.shell{display:grid;grid-template-columns:56px 1fr;grid-template-rows:1fr;height:calc(100% - 49px)}
+.rail{border-right:1px solid var(--line);background:var(--paper);display:flex;flex-direction:column;align-items:center;gap:8px;padding:12px 0}
+.rail button{width:38px;height:38px;border-radius:11px;border:1px solid var(--line2);background:#fff9;font-size:16px;color:var(--mut);cursor:pointer}
+.rail button:hover{color:var(--ink);border-color:#c9b98f}
+.rail button.on{background:var(--dark);color:var(--darkink);border-color:var(--dark)}
+.main{position:relative;overflow:hidden}
+.stage{position:absolute;inset:0;display:flex;justify-content:center}
+.thread{width:min(860px,94%);overflow-y:auto;padding:26px 10px 130px;scroll-behavior:smooth}
+.thread::-webkit-scrollbar{width:9px}.thread::-webkit-scrollbar-thumb{background:#d8cdb4;border-radius:9px}
+
+/* ---------- panels ---------- */
+.panel{position:absolute;top:14px;left:14px;bottom:14px;width:340px;background:var(--paper);border:1px solid var(--line2);border-radius:16px;box-shadow:0 18px 50px #00000026;display:flex;flex-direction:column;z-index:30;overflow:hidden}
+.panel .phead{display:flex;align-items:center;gap:10px;padding:13px 16px;border-bottom:1px solid var(--line);font-weight:700}
+.panel .phead .x{margin-left:auto;border:0;background:none;font-size:15px;color:var(--mut);cursor:pointer}
+.panel .pbody{overflow-y:auto;padding:14px 16px 20px}
+.sect{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--mut);margin:18px 0 8px}
+.sect:first-child{margin-top:2px}
+.row{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px dashed var(--line)}
+.row:last-child{border-bottom:0}
+.row .lbl{font-weight:600}
+.row .sub{font-size:12px;color:var(--mut)}
+.row .sw{margin-left:auto}
+.sw{position:relative;width:38px;height:22px;border-radius:99px;background:#d9cfb8;border:0;cursor:pointer;transition:.15s}
+.sw::after{content:"";position:absolute;top:2.5px;left:3px;width:17px;height:17px;border-radius:50%;background:#fff;transition:.15s}
+.sw.on{background:#3f9d4e}
+.sw.on::after{left:18px}
+.btn{border:1px solid var(--line2);background:#fff;border-radius:10px;padding:7px 13px;font-size:13px;font-weight:600;color:var(--ink);cursor:pointer}
+.btn:hover{border-color:#c9b98f}
+.btn.primary{background:var(--dark);color:var(--darkink);border-color:var(--dark)}
+.btn.danger{color:var(--red);border-color:#e5b7b0}
+.btn.small{padding:4px 9px;font-size:12px}
+input[type=text],input[type=password],textarea.tin{width:100%;border:1px solid var(--line2);border-radius:9px;padding:8px 10px;font:13px/1.4 inherit;background:#fffdf7;color:var(--ink)}
+input:focus,textarea.tin:focus{outline:none;border-color:#b49b62}
+.hint{font-size:12px;color:var(--mut);margin:6px 0 0}
+
+/* sessions */
+.newbtn{width:100%;justify-content:center;display:flex;gap:8px;margin-bottom:6px}
+.sess{border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin:9px 0;cursor:pointer;background:#fff9}
+.sess:hover{border-color:#c9b98f}
+.sess .t{font-size:13px;font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.sess .m{font-size:11.5px;color:var(--mut);margin-top:3px;font-family:ui-monospace,Menlo,monospace}
+.empty{color:var(--mut);font-size:13px;text-align:center;padding:24px 6px}
+
+/* provider rows */
+.pv{border:1px solid var(--line);border-radius:12px;padding:9px 11px;margin:8px 0;background:#fff9}
+.pv .row{border:0;padding:5px 0}
+.pv input[type=text]{margin-top:4px}
+.ord{display:flex;flex-direction:column;gap:1px}
+.ord button{border:0;background:none;color:var(--mut);cursor:pointer;font-size:10px;line-height:1;padding:2px 4px}
+.ord button:hover{color:var(--ink)}
+.tag-def{font-size:10px;color:var(--mut);border:1px solid var(--line2);padding:1px 7px;border-radius:99px}
+
+/* git */
+.ghcard{border:1px solid var(--line);border-radius:12px;padding:12px;margin:8px 0;background:#fff9}
+.ghok{display:flex;align-items:center;gap:10px}
+.ghok img{width:34px;height:34px;border-radius:50%}
+.gitout{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var(--dark);color:#d8e6c9;border-radius:9px;padding:9px 11px;margin-top:9px;white-space:pre-wrap;word-break:break-word;display:none}
+
+/* ---------- thread pieces ---------- */
+.msg{display:flex;justify-content:flex-end;margin:14px 0}
+.msg .bubble{background:var(--dark);color:var(--darkink);border-radius:16px 16px 4px 16px;padding:11px 15px;max-width:78%;white-space:pre-wrap;font-size:14.5px}
+.msg .attach{font-size:12px;color:var(--teal);text-align:right;margin-top:4px;font-family:ui-monospace,Menlo,monospace}
+.runflow{margin:16px 0 22px}
+.runflow::before{content:"";display:block;height:1px;background:var(--line);margin-bottom:14px}
+
+/* narration strip */
+.narr{display:flex;align-items:center;gap:9px;color:#a06012;font-size:13.5px;margin:2px 0 12px;min-height:22px}
+.narr .spark{display:inline-block;animation:breathe 1.6s ease-in-out infinite}
+@keyframes breathe{50%{transform:scale(1.35);opacity:.6}}
+.narr .dots::after{content:"";animation:dots 1.2s steps(4) infinite}
+@keyframes dots{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
+.narr .tt{color:var(--mut);font-size:11.5px;font-family:ui-monospace,Menlo,monospace;margin-left:2px}
+.narr.done{color:var(--mut);font-size:12.5px}
+.narr.done .spark{animation:none;color:#3f9d4e}
+.shimmer{height:3px;border-radius:3px;margin:0 0 12px;background:linear-gradient(90deg,#e8ddc2 25%,#c9a55b 50%,#e8ddc2 75%);background-size:200% 100%;animation:sh 1.4s linear infinite}
+@keyframes sh{to{background-position:-200% 0}}
+body.nomotion .shimmer,body.nomotion .narr .spark,body.nomotion .dots::after{animation:none}
+body.nomotion .shimmer{display:none}
+
+/* thinking line */
+.think{margin:4px 0}
+.think-head{display:flex;align-items:center;gap:7px;border:0;background:none;padding:3px 0;cursor:pointer;color:var(--mut);font-size:12.5px;font-weight:600}
+.think-head .chev{font-size:10px;transition:.15s;display:inline-block}
+.think.open .think-head .chev{transform:rotate(90deg)}
+.think-head .gw{font-weight:500;color:#b6ac99;font-size:11px}
+.think-body{display:none;border-left:2px solid var(--line2);margin:2px 0 4px 2px;padding:2px 0 2px 12px;color:#6f6553;font-size:13.5px;white-space:pre-wrap}
+.think.open .think-body{display:block}
+
+/* tool cards */
+.tcard{border:1px solid var(--line2);border-radius:12px;background:var(--paper);margin:9px 0;overflow:hidden}
+.thead{display:flex;align-items:center;gap:9px;width:100%;border:0;background:none;padding:8px 12px;cursor:pointer;text-align:left;font:inherit}
+.ticon{width:22px;height:22px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex:none}
+.k-bash .ticon,.k-git .ticon{background:var(--amberbg);color:var(--amber)}
+.k-read .ticon{background:var(--tealbg);color:var(--teal)}
+.k-write .ticon{background:var(--purplebg);color:var(--purple)}
+.k-web .ticon{background:var(--bluebg);color:var(--blue)}
+.tname{font-size:12px;font-weight:700;color:var(--mut);letter-spacing:.04em;flex:none}
+.targ{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+.tstate{flex:none;font-size:10.5px;font-weight:700;letter-spacing:.05em;padding:2px 8px;border-radius:99px}
+.tstate.ok{background:#e3efdd;color:#3f7d34}
+.tstate.err{background:var(--redbg);color:var(--red)}
+.tstate.run{background:var(--amberbg);color:var(--amber)}
+.chev{flex:none;color:#c0b49a;font-size:11px;transition:.15s}
+.tcard.open .chev,.tdcard.open .chev,.tcard.open .think-head .chev{transform:rotate(90deg)}
+.tbody{display:none;border-top:1px dashed var(--line);padding:9px 13px}
+.tcard.open .tbody{display:block}
+.tbody pre{margin:0;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;color:#4b4335;max-height:340px;overflow:auto}
+
+/* todos card */
+.tdcard{border:1px solid #cdd6a8;border-radius:12px;background:var(--olivebg);margin:9px 0;overflow:hidden}
+.tdcard .thead{color:var(--olive)}
+.tdcard .ticon{background:#fff;color:var(--olive);font-size:13px}
+.tdcount{font-size:11px;font-weight:700;color:#fff;background:#8a9a45;border-radius:99px;padding:1px 8px}
+.tditem{display:flex;gap:9px;padding:3.5px 0;font-size:13.5px;color:#3f4423}
+.tditem .box{flex:none;font-weight:700}
+.tditem.done{color:#7d8850;text-decoration:line-through}
+.tditem.active{font-weight:600}
+.tditem.active .box{color:var(--amber)}
+
+/* plain text reply */
+.say{margin:12px 0 4px;font-size:15px;color:var(--ink)}
+.say p{margin:.45em 0}
+.say h1,.say h2,.say h3{margin:.7em 0 .25em;line-height:1.3}
+.say h1{font-size:1.35em}.say h2{font-size:1.2em}.say h3{font-size:1.05em}
+.say ul,.say ol{margin:.4em 0;padding-left:1.5em}
+.say li{margin:.2em 0}
+.say code{background:#efe7d2;border:1px solid #e0d5b8;border-radius:5px;padding:.5px 5px;font-size:.86em}
+.say pre{background:#2e2a22;color:#e9e2d0;border-radius:11px;padding:12px 14px;overflow:auto;margin:.6em 0;position:relative;font-size:12.5px;line-height:1.55}
+.say pre code{background:none;border:0;padding:0;color:inherit;font-size:inherit}
+.say .copy{position:absolute;top:7px;right:8px;font-size:10.5px;border:1px solid #57503f;background:#3c362b;color:#cfc6b0;border-radius:6px;padding:2px 8px;cursor:pointer;opacity:0;transition:.15s}
+.say pre:hover .copy{opacity:1}
+.say a{color:var(--blue)}
+.say hr{border:0;border-top:1px solid var(--line2);margin:.9em 0}
+.say blockquote{border-left:3px solid var(--line2);margin:.5em 0;padding-left:12px;color:var(--mut)}
+
+/* diff card */
+.diffwrap{border:1px solid var(--line2);border-radius:12px;background:var(--paper);margin:12px 0;overflow:hidden}
+.diffwrap .thead .tname{color:var(--amber)}
+.diffwrap.open .tbody{display:block}
+.dhead{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:var(--mut);padding:7px 13px;background:#f3ecd9;border-bottom:1px dashed var(--line)}
+.dline{font-family:ui-monospace,Menlo,monospace;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;padding:1px 13px}
+.dline.add{background:#e8f2df;color:#39672c}
+.dline.del{background:#f9e6e2;color:#a03d31}
+.dline.hunk{color:#8a7f6d;background:#f3ecd9}
+
+/* inspector */
+.inspector{position:absolute;top:14px;right:14px;width:400px;max-height:calc(100% - 200px);background:#fffdf6;border:1px solid var(--line2);border-radius:14px;box-shadow:0 14px 40px #00000021;display:flex;flex-direction:column;z-index:20}
+.inspector .phead{padding:10px 14px;font-size:13px}
+.inspector .pbody{overflow:auto;padding:8px 12px 12px;font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
+.irow{display:flex;gap:8px;padding:4px 0;border-bottom:1px dashed #eee4cd;color:#5a5243}
+.irow .n{color:#b6ac99;flex:none;width:18px;text-align:right}
+.irow .k{color:var(--purple);font-weight:700;flex:none;width:64px}
+.irow .v{word-break:break-word;white-space:pre-wrap}
+.irow.err .k{color:var(--red)}
+
+/* composer */
+.composer{position:absolute;left:0;right:0;bottom:0;display:flex;justify-content:center;padding:0 10px 18px;background:linear-gradient(transparent,var(--bg) 30%)}
+.cbox{width:min(860px,94%);background:var(--paper);border:1px solid var(--line2);border-radius:18px;box-shadow:0 10px 34px #0000001c;padding:10px 12px}
+.crow{display:flex;align-items:flex-end;gap:9px}
+.ctext{flex:1;border:0;background:none;resize:none;font:14.5px/1.5 inherit;color:var(--ink);max-height:150px;padding:6px 2px}
+.ctext:focus{outline:none}
+.cbtn{border:1px solid var(--line2);background:#fff;border-radius:11px;height:36px;padding:0 12px;font-size:12.5px;font-weight:600;color:var(--mut);cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+.cbtn:hover{color:var(--ink);border-color:#c9b98f}
+.cbtn.run{background:var(--dark);color:var(--darkink);border-color:var(--dark);padding:0 20px}
+.cbtn.run:disabled{opacity:.45;cursor:default}
+.yolo{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--mut);cursor:pointer;user-select:none}
+.yolo input{accent-color:#b97e14;width:15px;height:15px}
+.fpop{position:absolute;bottom:76px;left:12px;width:290px;max-height:280px;overflow:auto;background:#fffdf6;border:1px solid var(--line2);border-radius:13px;box-shadow:0 14px 40px #00000026;padding:9px;z-index:25;display:none}
+.fpop label{display:flex;gap:8px;align-items:center;font-family:ui-monospace,Menlo,monospace;font-size:12px;padding:4px 6px;border-radius:7px;cursor:pointer}
+.fpop label:hover{background:var(--amberbg)}
+.attchips{display:flex;flex-wrap:wrap;gap:6px;padding:2px 2px 8px}
+.attchips span{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var(--tealbg);color:var(--teal);border-radius:99px;padding:2px 9px}
+.attchips b{cursor:pointer;margin-left:4px}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--dark);color:var(--darkink);border-radius:11px;padding:9px 18px;font-size:13px;z-index:99;display:none;box-shadow:0 10px 30px #00000040}
+.h1row{display:flex;align-items:baseline;gap:10px;margin:0 0 4px}
+.emptythread{color:var(--mut);text-align:center;margin-top:12vh}
+.emptythread .big{font-size:34px}
+@media (max-width:1100px){.inspector{display:none}}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo"><span class="dot" id="hdot"></span>buddy</div>
+  <div style="font-size:12px;color:var(--mut)">connected · <b id="hengine">engine</b></div>
+  <div class="chip" id="hbrain" title="brain failover chain — change it in ⚙ settings">brain <b>…</b></div>
+  <div class="chip" id="hstate">idle</div>
+  <div class="chip" id="hcount" style="display:none">stream <b>0</b> events</div>
+  <div class="chip live" id="hlive" style="display:none" title="you are viewing a replay">⟲ live</div>
+  <div class="spacer"></div>
+  <button class="cbtn" id="btnInspector" title="raw stream-json events">inspector</button>
+</header>
+
+<div class="shell">
+  <div class="rail">
+    <button id="btnSessions" title="sessions">⧉</button>
+    <button id="btnGit" title="git &amp; GitHub">⎇</button>
+    <button id="btnSettings" title="settings">⚙</button>
+  </div>
+  <div class="main">
+    <div class="stage"><div class="thread" id="thread">
+      <div class="emptythread" id="emptythread">
+        <div class="big">✦</div>
+        <p>Message buddy — it runs the real engineer-buddy engine on your workspace.<br>Try: “Use the todo tool to plan, then fix app.js to match the README spec, run node test.js to confirm.”</p>
+      </div>
+    </div></div>
+
+    <div class="inspector" id="inspector" style="display:none">
+      <div class="phead">stream <span style="color:var(--mut);font-weight:500" id="inspcount">0 events</span><button class="x" id="inspX">✕</button></div>
+      <div class="pbody" id="inspbody"></div>
+    </div>
+
+    <!-- sessions -->
+    <div class="panel" id="pSessions" style="display:none">
+      <div class="phead">⧉ sessions<button class="x" data-close>✕</button></div>
+      <div class="pbody">
+        <button class="btn primary newbtn" id="btnNewSession">＋ New session</button>
+        <div class="hint" style="margin-bottom:10px">Every finished run is persisted and replayable. New session clears the thread and starts fresh.</div>
+        <div id="sessList"></div>
+      </div>
+    </div>
+
+    <!-- git -->
+    <div class="panel" id="pGit" style="display:none">
+      <div class="phead">⎇ git &amp; GitHub<button class="x" data-close>✕</button></div>
+      <div class="pbody">
+        <div class="sect">GitHub account</div>
+        <div id="ghConnected" style="display:none">
+          <div class="ghcard ghok"><img id="ghAvatar" alt=""><div><div style="font-weight:700" id="ghLogin"></div><div class="sub">connected via personal access token — stored 0600 in .buddy-desktop/</div></div></div>
+          <button class="btn small danger" id="ghDisconnect">Disconnect</button>
+        </div>
+        <div id="ghForm">
+          <div class="row" style="flex-direction:column;align-items:stretch;gap:6px">
+            <input type="password" id="ghToken" placeholder="GitHub personal access token (repo scope)">
+            <div style="display:flex;gap:8px"><button class="btn primary small" id="ghConnect">Connect account</button></div>
+            <div class="hint">Token is verified against api.github.com/user and kept locally only. Push uses it over HTTPS; it is never logged.</div>
+          </div>
+        </div>
+        <div class="sect">Workspace repo</div>
+        <div id="gitRepo">…</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+          <button class="btn small" id="gitCommit">Commit all…</button>
+          <button class="btn small" id="gitPush">Push to GitHub</button>
+          <button class="btn small" id="gitCreate" style="display:none">Create repo &amp; push</button>
+          <button class="btn small" id="gitRefresh">Refresh</button>
+        </div>
+        <div class="gitout" id="gitOut"></div>
+      </div>
+    </div>
+
+    <!-- settings -->
+    <div class="panel" id="pSettings" style="display:none">
+      <div class="phead">⚙ settings<button class="x" data-close>✕</button></div>
+      <div class="pbody">
+        <div class="sect">General</div>
+        <div class="row"><div><div class="lbl">yolo by default</div><div class="sub">new runs start with risky tools unguarded — buddy's --yolo</div></div><button class="sw" data-set="yoloDefault"></button></div>
+        <div class="row"><div><div class="lbl">auto-scroll</div><div class="sub">keep the newest card in view while buddy works</div></div><button class="sw" data-set="autoScroll"></button></div>
+        <div class="row"><div><div class="lbl">inspector expanded</div><div class="sub">open the raw stream-json rows by default</div></div><button class="sw" data-set="inspectorOpen"></button></div>
+        <div class="row"><div><div class="lbl">motion</div><div class="sub">shimmer, spark and card animations</div></div><button class="sw" data-set="motion"></button></div>
+
+        <div class="sect">Providers &amp; models</div>
+        <div class="hint" style="margin:0 0 4px">The brain is a failover chain — it tries these in order. Defaults are the engine's own: <b id="defchain">kilo → llm7 → pollinations → duckai</b>. Change the order, disable gateways, pin a model, or point any OpenAI-compatible endpoint at the <b>kilo</b> slot. Applies from the next run.</div>
+        <div id="pvRows"></div>
+        <div class="pv" style="border-style:dashed">
+          <div class="row"><div><div class="lbl">Custom provider <span class="tag-def">overrides the kilo slot</span></div><div class="sub">any OpenAI-compatible endpoint · POST {base}/v1/chat/completions · Bearer auth</div></div><button class="sw" data-custom="enabled"></button></div>
+          <div id="customFields" style="display:none">
+            <input type="text" id="cuBase" placeholder="Base URL — e.g. https://openrouter.ai/api">
+            <input type="password" id="cuKey" placeholder="API key (optional — some endpoints need one)" style="margin-top:6px">
+            <input type="text" id="cuModel" placeholder="Model — e.g. deepseek/deepseek-chat-v3" style="margin-top:6px">
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <button class="btn primary small" id="brainSave">Save brain</button>
+          <button class="btn small" id="brainReset">Reset to engine defaults</button>
+        </div>
+        <div class="hint" id="brainPreview">chain: …</div>
+
+        <div class="sect">About</div>
+        <div class="row"><div class="lbl">engine</div><div class="sub" id="setEngine">…</div></div>
+        <div class="row"><div class="lbl">workspace</div><div class="sub" id="setWs">…</div></div>
+        <div class="row"><div class="lbl">sessions on disk</div><div class="sub" id="setSess">…</div></div>
+      </div>
+    </div>
+
+    <!-- files popover -->
+    <div class="fpop" id="fpop"><div id="fpopList"></div></div>
+
+    <div class="composer"><div class="cbox" style="position:relative">
+      <div class="attchips" id="attchips" style="display:none"></div>
+      <div class="crow">
+        <button class="cbtn" id="btnFiles" title="attach workspace files into the prompt">📎 files</button>
+        <textarea class="ctext" id="ctext" rows="1" placeholder='Message buddy — e.g. "Use the todo tool to plan, then fix app.js to match the README spec, run node test.js."'></textarea>
+        <label class="yolo" title="--yolo: buddy may run commands and edit files without asking"><input type="checkbox" id="yolo">yolo</label>
+        <button class="cbtn run" id="btnRun">run ⏎</button>
+      </div>
+    </div></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+'use strict';
+const $ = (s) => document.querySelector(s);
+const el = (t, c, h) => { const e = document.createElement(t); if (c) e.className = c; if (h !== undefined) e.innerHTML = h; return e; };
+const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ---------------- settings ---------------- */
+const DEFSETS = { yoloDefault: true, autoScroll: true, inspectorOpen: false, motion: true };
+let sets = { ...DEFSETS, ...JSON.parse(localStorage.getItem('buddy.sets') || '{}') };
+const saveSets = () => localStorage.setItem('buddy.sets', JSON.stringify(sets));
+function applySets() {
+  document.body.classList.toggle('nomotion', !sets.motion);
+  $('#yolo').checked = sets.yoloDefault;
+  $('#inspector').style.display = sets.inspectorOpen ? 'flex' : 'none';
+  document.querySelectorAll('[data-set]').forEach((b) => b.classList.toggle('on', !!sets[b.dataset.set]));
+}
+document.querySelectorAll('[data-set]').forEach((b) => b.addEventListener('click', () => { sets[b.dataset.set] = !sets[b.dataset.set]; saveSets(); applySets(); }));
+
+/* ---------------- markdown ---------------- */
+function md(src) {
+  const blocks = [];
+  let s = esc(src ?? '');
+  s = s.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+    blocks.push(`<pre><code>${code.replace(/\n$/, '')}</code><button class="copy">copy</button></pre>`);
+    return `\u0000B${blocks.length - 1}\u0000`;
+  });
+  s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  s = s.replace(/^### (.*)$/gm, '<h3>$1</h3>').replace(/^## (.*)$/gm, '<h2>$1</h2>').replace(/^# (.*)$/gm, '<h1>$1</h1>');
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/(^|\W)\*([^*\n]+)\*(?=\W|$)/g, '$1<i>$2</i>');
+  s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  s = s.replace(/^---+$/gm, '<hr>');
+  s = s.replace(/^(?:[-*] (.+(?:\n(?!\n|[-*] |\d\. |#))*)\n?)+/gm, (m) => '<ul>' + m.trim().split(/\n/).map((l) => `<li>${l.replace(/^[-*] /, '')}</li>`).join('') + '</ul>');
+  s = s.replace(/^(?:\d+\. (.+(?:\n(?!\n|[-*] |\d\. |#))*)\n?)+/gm, (m) => '<ol>' + m.trim().split(/\n/).map((l) => `<li>${l.replace(/^\d+\. /, '')}</li>`).join('') + '</ol>');
+  s = s.split(/\n{2,}/).map((p) => /^\s*<(h\d|ul|ol|pre|hr|bl)/.test(p) || p.includes('\u0000B') ? p : (p.trim() ? `<p>${p.replace(/\n/g, '<br>')}</p>` : '')).join('');
+  s = s.replace(/\u0000B(\d+)\u0000/g, (_, i) => blocks[+i]);
+  return s;
+}
+
+/* ---------------- toasts / header ---------------- */
+let toastT;
+function toast(m) { const t = $('#toast'); t.textContent = m; t.style.display = 'block'; clearTimeout(toastT); toastT = setTimeout(() => t.style.display = 'none', 2600); }
+
+let evCount = 0, working = false, tickTimer = null, replayMode = false;
+function setChip(state, txt) { const c = $('#hstate'); c.textContent = txt; c.className = 'chip' + (state === 'ok' ? ' state-ok' : state === 'busy' ? ' state-busy' : ''); }
+
+/* ---------------- inspector ---------------- */
+function inspRow(ev) {
+  evCount++;
+  $('#hcount').style.display = ''; $('#hcount').innerHTML = `stream <b>${evCount}</b> events`;
+  $('#inspcount').textContent = `${evCount} events`;
+  const keys = { ...ev }; delete keys.type;
+  const v = JSON.stringify(keys, (k, x) => typeof x === 'string' && x.length > 130 ? x.slice(0, 130) + '…' : x);
+  const row = el('div', 'irow' + (ev.type === 'stderr' || ev.type === 'error' ? ' err' : ''),
+    `<span class="n">${evCount}</span><span class="k">${esc(ev.type)}</span><span class="v">${esc(v === '{}' ? '' : v)}</span>`);
+  const b = $('#inspbody'); b.appendChild(row);
+  while (b.children.length > 400) b.removeChild(b.firstChild);
+  b.scrollTop = b.scrollHeight;
+}
+
+/* ---------------- thread blocks ---------------- */
+const thread = $('#thread');
+function scrollDown() { if (sets.autoScroll) thread.scrollTop = thread.scrollHeight; }
+function hideEmpty() { const e = $('#emptythread'); if (e) e.remove(); }
+
+function userMsg(task, files) {
+  hideEmpty();
+  const m = el('div', 'msg');
+  const w = el('div');
+  w.appendChild(el('div', 'bubble', esc(task)));
+  if (files && files.length) w.appendChild(el('div', 'attach', '📎 ' + files.map((f) => '@' + f).join(', ')));
+  m.appendChild(w); thread.appendChild(m); scrollDown();
+}
+
+function narrLine(flow) {
+  flow.appendChild(el('div', 'shimmer'));
+  const n = el('div', 'narr', '<span class="spark">✦</span><span class="narr-text">waking the brain…</span><span class="dots"></span><span class="tt">t+0.0s</span>');
+  flow.appendChild(n);
+  const t0 = Date.now();
+  tickTimer = setInterval(() => { n.querySelector('.tt').textContent = `t+${((Date.now() - t0) / 1000).toFixed(1)}s`; $('#hstate').textContent = `working t+${((Date.now() - t0) / 1000).toFixed(0)}s`; }, 100);
+  return n;
+}
+function setNarr(txt) { const n = $('.runflow:last-child .narr-text'); if (n) n.textContent = txt; scrollDown(); }
+function endNarr(narr, code, secs, tools) {
+  clearInterval(tickTimer);
+  narr.classList.add('done');
+  narr.innerHTML = `<span class="spark">✓</span> run finished — exit ${code} · ${secs.toFixed(1)}s · ${tools} tool calls`;
+  $('#hstate').textContent = `done · exit ${code}`; setChip(code === 0 ? 'ok' : '', `done · exit ${code}`);
+}
+
+const KIND = { bash: 'k-bash', git_write: 'k-bash', fs_read: 'k-read', fs_search: 'k-read', fs_list: 'k-read', glob: 'k-read', web_search: 'k-web', web_fetch: 'k-web', fs_write: 'k-write', fs_replace: 'k-write', fs_append: 'k-write', multi_edit: 'k-write' };
+function toolState(obs) {
+  const m = /exit (\d+)(?: in \(([\d.]+)s\)| in ([\d.]+)s| \(([\d.]+)s\))?/.exec(obs || '');
+  if (m) return +m[1] === 0 ? ['ok', `DONE · exit 0${(m[2] || m[3] || m[4]) ? ` · ${(m[2] || m[3] || m[4])}s` : ''}`] : ['err', `exit ${m[1]}`];
+  if (/^OK|^FILE|^PLAN|^LIST|^MATCH/.test(obs || '')) return ['ok', 'DONE'];
+  return ['', 'DONE'];
+}
+function shortArg(tool, argText) { return String(argText || '').replace(new RegExp(`^${tool}\\s*`), '') || tool; }
+
+function thinkBlock(text, gw) {
+  const t = el('div', 'think');
+  t.appendChild(el('button', 'think-head', `<span class="chev">▶</span>Thinking${gw ? ` <span class="gw">· ${esc(gw)}</span>` : ''}`));
+  t.appendChild(el('div', 'think-body', esc(text)));
+  t.querySelector('.think-head').addEventListener('click', () => t.classList.toggle('open'));
+  return t;
+}
+function collapseLastThink(flow) {
+  const th = [...flow.querySelectorAll('.think')].filter((x) => x.classList.contains('open')).pop();
+  if (th && sets.motion) th.classList.remove('open');
+}
+
+function toolCard(ev) {
+  const kind = KIND[ev.tool] || 'k-bash';
+  const [st, label] = toolState(ev.observation);
+  const c = el('div', `tcard ${kind}`);
+  c.appendChild(el('button', 'thead',
+    `<span class="ticon">${kind === 'k-bash' ? '›_' : kind === 'k-read' ? 'eye' : kind === 'k-web' ? '↗' : '✎'}</span>` +
+    `<span class="tname">${esc(ev.tool)}</span><span class="targ" title="${esc(shortArg(ev.tool, ev.argText))}">${esc(shortArg(ev.tool, ev.argText))}</span>` +
+    `<span class="tstate ${st}">${label}</span><span class="chev">▶</span>`));
+  c.appendChild(el('div', 'tbody', `<pre>${esc(ev.observation || '(no output)')}</pre>`));
+  c.querySelector('.thead').addEventListener('click', () => c.classList.toggle('open'));
+  return c;
+}
+
+function todosCard(plan) {
+  const c = el('div', 'tdcard');
+  c.appendChild(el('button', 'thead', `<span class="ticon">☰</span><span class="tname">To-dos</span><span class="targ"></span><span class="tdcount">${plan.done}/${plan.total}</span><span class="chev">▶</span>`));
+  c.appendChild(el('div', 'tbody'));
+  c.querySelector('.thead').addEventListener('click', () => c.classList.toggle('open'));
+  fillTodos(c, plan);
+  return c;
+}
+function fillTodos(c, plan) {
+  c.querySelector('.tdcount').textContent = `${plan.done}/${plan.total}`;
+  const b = c.querySelector('.tbody');
+  b.innerHTML = plan.items.map((i) => `<div class="tditem ${i.state}"><span class="box">${i.state === 'done' ? '✓' : i.state === 'active' ? '◐' : '○'}</span><span>${esc(i.text)}</span></div>`).join('');
+}
+
+function diffCard(diff) {
+  const lines = diff.split('\n');
+  const head = lines.find((l) => l.startsWith('diff --git')) || 'git diff';
+  const stat = lines.find((l) => l.includes('changed,')) || '';
+  const w = el('div', 'diffwrap');
+  w.appendChild(el('button', 'thead', `<span class="ticon">⎇</span><span class="tname">git diff</span><span class="targ">${esc(stat || head)}</span><span class="tstate ok">PATCH</span><span class="chev">▶</span>`));
+  const body = el('div', 'tbody');
+  body.appendChild(el('div', 'dhead', esc(lines.slice(0, 5).join('\n'))));
+  for (const l of lines.slice(5)) {
+    const cls = l.startsWith('+++') || l.startsWith('---') ? 'dhead' : l.startsWith('@@') ? 'hunk' : l.startsWith('+') ? 'add' : l.startsWith('-') ? 'del' : '';
+    body.appendChild(el('div', 'dline ' + cls, esc(l || ' ')));
+  }
+  w.appendChild(body);
+  w.querySelector('.thead').addEventListener('click', () => w.classList.toggle('open'));
+  return w;
+}
+
+/* ---------------- run handling ---------------- */
+let pendingWhy = null, currentFlow = null;
+
+function handle(ev) {
+  inspRow(ev);
+  const flow = currentFlow;
+  if (!flow && ev.type !== 'stderr') return;
+  if (ev.type === 'stderr') { setNarr('engine stderr — see the inspector'); return; }
+  if (ev.type === 'routelog') {
+    const chain = (ev.chain || []).join(' → ') || '…';
+    setNarr(`routing — ${ev.class} step, ${ev.effort} effort · ${chain}`);
+    return;
+  }
+  if (ev.type === 'why') {
+    collapseLastThink(flow);
+    const tb = thinkBlock(ev.why || 'weighing the next step', [ev.gateway, ev.model ? String(ev.model).split('/').pop() : null].filter(Boolean).join(' · '));
+    const cards = [...flow.querySelectorAll('.tcard')];
+    const last = cards[cards.length - 1];
+    if (last && !last.previousElementSibling?.classList.contains('think') && !last.dataset.why) {
+      last.dataset.why = '1'; last.before(tb);
+    } else { flow.appendChild(tb); pendingWhy = tb; }
+    if (sets.motion) tb.classList.add('open');
+    scrollDown();
+    return;
+  }
+  if (ev.type === 'tool') {
+    collapseLastThink(flow);
+    if (ev.tool === 'todo') {
+      const plan = /PLAN \((\d+)\/(\d+) done\):/.exec(ev.observation || '');
+      if (plan) {
+        const items = [];
+        for (const line of (ev.observation || '').split('\n')) {
+          const im = /^- \[( |x|~)\] (.+)$/.exec(line.trim());
+          if (im) items.push({ state: im[1] === 'x' ? 'done' : im[1] === '~' ? 'active' : 'pending', text: im[2].replace(/^#\d+\s*/, '') });
+        }
+        const p = { done: +plan[1], total: +plan[2], items };
+        const existing = [...flow.querySelectorAll('.tdcard')].pop();
+        if (existing) fillTodos(existing, p); else flow.appendChild(todosCard(p));
+        setNarr(`updating the plan — ${p.done}/${p.total} done`);
+      }
+    } else {
+      const card = toolCard(ev);
+      if (pendingWhy) { card.dataset.why = '1'; flow.appendChild(pendingWhy); pendingWhy = null; }
+      flow.appendChild(card);
+      setNarr(`ran ${ev.tool} — ${shortArg(ev.tool, ev.argText)}`);
+    }
+    scrollDown();
+    return;
+  }
+  if (ev.type === 'todos') {
+    const existing = [...flow.querySelectorAll('.tdcard')].pop();
+    if (existing) fillTodos(existing, ev); else flow.appendChild(todosCard(ev));
+    return;
+  }
+  if (ev.type === 'say') {
+    collapseLastThink(flow);
+    setNarr('composing the reply…');
+    flow.appendChild(el('div', 'say md', md(ev.text)));
+    scrollDown();
+    return;
+  }
+  if (ev.type === 'error') { flow.appendChild(el('div', 'say md', `<p style="color:var(--red)"><b>error</b> — ${esc(ev.text || '')}</p>`)); scrollDown(); return; }
+  if (ev.type === 'run_end') {
+    if (flow.dataset.done) return;
+    flow.dataset.done = '1';
+    const narr = flow.querySelector('.narr');
+    endNarr(narr, ev.code, ev.secs, ev.tools);
+    if (ev.diff) flow.appendChild(diffCard(ev.diff));
+    working = false; $('#btnRun').disabled = false;
+    refreshSessions();
+    scrollDown();
+  }
+}
+
+/* ---------------- live run ---------------- */
+async function startRun() {
+  if (working) return;
+  const task = $('#ctext').value.trim();
+  if (!task) return;
+  const files = [...attached];
+  const yolo = $('#yolo').checked;
+  $('#ctext').value = ''; autosize(); attached.clear(); renderChips();
+  userMsg(task, files);
+  working = true; $('#btnRun').disabled = true; $('#hdot').classList.add('busy');
+  setChip('busy', 'working…'); evCount = 0;
+  $('#inspbody').innerHTML = '';
+  const flow = el('div', 'runflow'); thread.appendChild(flow); currentFlow = flow; scrollDown();
+  narrLine(flow);
+  let es = null;
+  try {
+    const r = await fetch('/api/run', { method: 'POST', 'Content-Type': 'application/json', body: JSON.stringify({ task, files, yolo }) });
+    const d = await r.json();
+    if (!r.ok) { toast(d.error || 'run failed'); working = false; $('#btnRun').disabled = false; $('#hdot').classList.remove('busy'); setChip('', 'idle'); return; }
+    es = new EventSource('/api/stream/' + d.id);
+    es.onmessage = (m) => { try { handle(JSON.parse(m.data)); } catch {} };
+    es.onerror = () => { es.close(); };
+  } catch (e) { toast(String(e)); working = false; $('#btnRun').disabled = false; }
+}
+
+/* ---------------- sessions ---------------- */
+async function refreshSessions() {
+  try {
+    const list = await (await fetch('/api/sessions')).json();
+    const box = $('#sessList');
+    box.innerHTML = list.length ? '' : '<div class="empty">no sessions yet — every finished run lands here</div>';
+    for (const s of list) {
+      const d = new Date(s.started);
+      const row = el('div', 'sess',
+        `<div class="t">${esc(s.task)}</div><div class="m">exit ${s.code} · ${s.secs.toFixed(1)}s · ${s.tools} tools · ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>`);
+      row.addEventListener('click', () => replay(s.id));
+      box.appendChild(row);
+    }
+    $('#setSess').textContent = list.length;
+  } catch {}
+}
+async function replay(id) {
+  const s = await (await fetch('/api/session/' + encodeURIComponent(id))).json();
+  closePanels(); newSession(true);
+  replayMode = true; $('#hlive').style.display = '';
+  working = true; $('#btnRun').disabled = true; $('#hdot').classList.add('busy'); setChip('busy', `replaying…`);
+  userMsg(s.task, s.files);
+  evCount = 0; $('#inspbody').innerHTML = '';
+  const flow = el('div', 'runflow'); thread.appendChild(flow); currentFlow = flow;
+  const narr = narrLine(flow);
+  for (const ev of (s.log || [])) { handle(ev); await sleep(sets.motion ? 45 : 0); }
+  if (!s.log?.some((e) => e.type === 'run_end')) handle({ type: 'run_end', code: s.code, secs: s.secs, tools: s.tools, diff: null });
+  else { endNarr(flow.querySelector('.narr'), s.code, s.secs, s.tools); }
+  narr.remove?.();
+  working = false; $('#btnRun').disabled = false; $('#hdot').classList.remove('busy');
+  if (s.diff) flow.appendChild(diffCard(s.diff));
+  toast('replaying a saved session');
+}
+function newSession(keepReplayFlag) {
+  closePanels();
+  thread.innerHTML = ''; evCount = 0; currentFlow = null; pendingWhy = null;
+  $('#inspbody').innerHTML = ''; $('#hcount').style.display = 'none';
+  replayMode = false; $('#hlive').style.display = 'none';
+  thread.appendChild($('#emptythread') || el('div'));
+  if (!keepReplayFlag) toast('new session — the thread is clear');
+  working = false; $('#btnRun').disabled = false; $('#hdot').classList.remove('busy'); setChip('', 'idle');
+  const e = el('div', 'emptythread'); e.id = 'emptythread';
+  e.innerHTML = '<div class="big">✦</div><p>Message buddy — it runs the real engineer-buddy engine on your workspace.<br>Try: “Use the todo tool to plan, then fix app.js to match the README spec, run node test.js to confirm.”</p>';
+  thread.appendChild(e);
+}
+
+/* ---------------- panels ---------------- */
+function closePanels() { ['pSessions', 'pGit', 'pSettings'].forEach((id) => { $('#' + id).style.display = 'none'; }); document.querySelectorAll('.rail button').forEach((b) => b.classList.remove('on')); }
+function togglePanel(id, btn) {
+  const open = $('#' + id).style.display !== 'none';
+  closePanels();
+  if (!open) { $('#' + id).style.display = 'flex'; btn.classList.add('on'); if (id === 'pGit') loadGit(); if (id === 'pSettings') loadBrain(); }
+}
+$('#btnSessions').addEventListener('click', (e) => { togglePanel('pSessions', e.currentTarget); refreshSessions(); });
+$('#btnSettings').addEventListener('click', (e) => togglePanel('pSettings', e.currentTarget));
+$('#btnGit').addEventListener('click', (e) => togglePanel('pGit', e.currentTarget));
+document.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', closePanels));
+$('#btnNewSession').addEventListener('click', () => newSession());
+$('#hlive').addEventListener('click', () => newSession());
+
+/* ---------------- brain / providers ---------------- */
+let brain = null;
+async function loadBrain() {
+  brain = await (await fetch('/api/brain')).json();
+  $('#defchain').textContent = brain.defaults.join(' → ');
+  renderBrainRows();
+}
+function renderBrainRows() {
+  const b = brain; const box = $('#pvRows'); box.innerHTML = '';
+  for (const g of b.known) {
+    const row = el('div', 'pv');
+    const on = !b.current.disabled.includes(g) && b.current.order.includes(g);
+    const isDef = b.defaults.includes(g);
+    row.innerHTML = `<div class="row">
+      <div class="ord"><button data-mv="up" title="move up">▲</button><button data-mv="dn" title="move down">▼</button></div>
+      <div style="flex:1"><div class="lbl">${g}${isDef ? ' <span class="tag-def">engine default</span>' : ' <span class="tag-def">extra</span>'}</div>
+      <input type="text" data-model="${g}" placeholder="model — auto (engine default list)" value="${esc(b.current.models[g] || '')}"></div>
+      <button class="sw ${on ? 'on' : ''}" data-gw="${g}"></button></div>`;
+    row.querySelector('.sw').addEventListener('click', (e) => {
+      const cur = brain.current;
+      if (cur.disabled.includes(g)) cur.disabled = cur.disabled.filter((x) => x !== g);
+      else cur.disabled.push(g);
+      e.currentTarget.classList.toggle('on');
+      updateBrainPreview();
+    });
+    row.querySelectorAll('[data-mv]').forEach((btn) => btn.addEventListener('click', () => {
+      const o = brain.current.order;
+      const i = o.indexOf(g), j = btn.dataset.mv === 'up' ? i - 1 : i + 1;
+      if (i < 0 || j < 0 || j >= o.length) return;
+      [o[i], o[j]] = [o[j], o[i]];
+      renderBrainRows(); updateBrainPreview();
+    }));
+    row.querySelector('[data-model]').addEventListener('input', (e) => { brain.current.models[g] = e.target.value.trim(); });
+    box.appendChild(row);
+  }
+  $('#customFields').style.display = brain.current.custom?.enabled ? 'block' : 'none';
+  document.querySelector('[data-custom]').classList.toggle('on', Boolean(brain.current.custom?.enabled));
+  $('#cuBase').value = brain.current.custom?.baseUrl || '';
+  $('#cuKey').value = brain.current.custom?.apiKey || '';
+  $('#cuModel').value = brain.current.custom?.model || '';
+  updateBrainPreview();
+}
+function updateBrainPreview() {
+  const b = brain.current;
+  const chain = b.order.filter((g) => !b.disabled.includes(g));
+  $('#brainPreview').textContent = 'chain: ' + (chain.map((g) => (b.models[g] ? `${g}(${b.models[g]})` : (g === 'kilo' && b.custom?.enabled ? `${g}→custom:${b.custom.model}` : g))).join(' → ') || '(all disabled)');
+}
+document.querySelector('[data-custom]').addEventListener('click', () => { brain.current.custom.enabled = !brain.current.custom.enabled; renderBrainRows(); });
+['cuBase', 'cuKey', 'cuModel'].forEach((id) => $('#' + id).addEventListener('input', () => {
+  brain.current.custom.baseUrl = $('#cuBase').value.trim();
+  brain.current.custom.apiKey = $('#cuKey').value.trim();
+  brain.current.custom.model = $('#cuModel').value.trim();
+  updateBrainPreview();
+}));
+$('#brainSave').addEventListener('click', async () => {
+  const r = await (await fetch('/api/brain', { method: 'POST', 'Content-Type': 'application/json', body: JSON.stringify(brain.current) })).json();
+  if (r.error) return toast(r.error);
+  toast('brain saved — applies from the next run · ' + r.preview);
+  $('#hbrain').innerHTML = `brain <b>${esc(r.preview.length > 42 ? r.preview.slice(0, 42) + '…' : r.preview)}</b>`;
+  loadBrain();
+});
+$('#brainReset').addEventListener('click', async () => {
+  await fetch('/api/brain', { method: 'POST', 'Content-Type': 'application/json', body: JSON.stringify({ order: brain.defaults, disabled: [], models: {}, custom: { enabled: false, baseUrl: '', apiKey: '', model: '' } }) });
+  toast('brain reset to engine defaults');
+  $('#hbrain').innerHTML = `brain <b>${brain.defaults.join(' → ')}</b>`;
+  loadBrain();
+});
+
+/* ---------------- git & github ---------------- */
+async function loadGit() {
+  const gh = await (await fetch('/api/github')).json();
+  $('#ghConnected').style.display = gh.login ? '' : 'none';
+  $('#ghForm').style.display = gh.login ? 'none' : '';
+  if (gh.login) { $('#ghLogin').textContent = '@' + gh.login; $('#ghAvatar').src = gh.avatar; }
+  const st = await (await fetch('/api/git/status')).json();
+  const box = $('#gitRepo');
+  if (!st.hasRepo) { box.innerHTML = '<div class="empty">not a git repo</div>'; $('#gitCreate').style.display = ''; return; }
+  box.innerHTML = `<div class="ghcard">
+    <div class="row"><div class="lbl">branch</div><div class="sub mono">${esc(st.branch)}</div></div>
+    <div class="row"><div class="lbl">changes</div><div class="sub">${st.dirtyCount} dirty · ↑${st.ahead} ↓${st.behind}</div></div>
+    <div class="row"><div class="lbl">remote</div><div class="sub mono">${esc(st.remote ? st.remote.replace(/^https:\/\/[^@]*@/, 'https://') : 'none')}</div></div></div>`;
+  $('#gitCreate').style.display = st.remote ? 'none' : '';
+}
+$('#ghConnect').addEventListener('click', async () => {
+  const r = await (await fetch('/api/github/connect', { method: 'POST', 'Content-Type': 'application/json', body: JSON.stringify({ token: $('#ghToken').value.trim() }) })).json();
+  if (r.error) { toast(r.error); return; }
+  toast('connected as @' + r.login); $('#ghToken').value = ''; loadGit();
+});
+$('#ghDisconnect').addEventListener('click', async () => { await fetch('/api/github/disconnect', { method: 'POST' }); loadGit(); });
+function gitShow(out) { const g = $('#gitOut'); g.style.display = 'block'; g.textContent = out || '(no output)'; }
+$('#gitCommit').addEventListener('click', async () => {
+  const m = prompt('Commit message', 'work with buddy');
+  if (!m) return;
+  const r = await (await fetch('/api/git/commit', { method: 'POST', 'Content-Type': 'application/json', body: JSON.stringify({ message: m }) })).json();
+  gitShow(r.out || r.error); loadGit();
+});
+$('#gitPush').addEventListener('click', async () => {
+  const r = await (await fetch('/api/git/push', { method: 'POST' })).json();
+  gitShow(r.out || r.error); loadGit();
+});
+$('#gitCreate').addEventListener('click', async () => {
+  const name = prompt('New GitHub repository name', 'buddy-workspace');
+  if (!name) return;
+  const r = await (await fetch('/api/github/create', { method: 'POST', 'Content-Type': 'application/json', body: JSON.stringify({ name, isPrivate: true }) })).json();
+  gitShow((r.out || '') + (r.url ? `\n${r.url}` : '') || r.error);
+  if (r.ok) { const p = await (await fetch('/api/git/push', { method: 'POST' })).json(); gitShow(`created ${r.url}\n${p.out || p.error}`); }
+  loadGit();
+});
+$('#gitRefresh').addEventListener('click', loadGit);
+
+/* ---------------- inspector / composer / files ---------------- */
+$('#btnInspector').addEventListener('click', () => { sets.inspectorOpen = !sets.inspectorOpen; saveSets(); applySets(); });
+$('#inspX').addEventListener('click', () => { sets.inspectorOpen = false; saveSets(); applySets(); });
+
+const attached = new Set();
+$('#btnFiles').addEventListener('click', async () => {
+  const fp = $('#fpop');
+  if (fp.style.display === 'block') { fp.style.display = 'none'; return; }
+  const files = await (await fetch('/api/files')).json();
+  const list = $('#fpopList'); list.innerHTML = files.length ? '' : '<div class="empty">no files in the workspace</div>';
+  for (const f of files) {
+    const l = el('label', '', `<input type="checkbox" ${attached.has(f) ? 'checked' : ''}> ${esc(f)}`);
+    l.querySelector('input').addEventListener('change', (e) => { e.target.checked ? attached.add(f) : attached.delete(f); renderChips(); });
+    list.appendChild(l);
+  }
+  fp.style.display = 'block';
+});
+function renderChips() {
+  const c = $('#attchips');
+  c.style.display = attached.size ? 'flex' : 'none';
+  c.innerHTML = [...attached].map((f) => `<span>@${esc(f)}<b data-rm="${esc(f)}">✕</b></span>`).join('');
+  c.querySelectorAll('[data-rm]').forEach((b) => b.addEventListener('click', () => { attached.delete(b.dataset.rm); renderChips(); }));
+}
+document.addEventListener('click', (e) => { if (!$('#fpop').contains(e.target) && e.target !== $('#btnFiles')) $('#fpop').style.display = 'none'; });
+
+const ctext = $('#ctext');
+function autosize() { ctext.style.height = 'auto'; ctext.style.height = Math.min(ctext.scrollHeight, 150) + 'px'; }
+ctext.addEventListener('input', autosize);
+ctext.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); startRun(); } });
+$('#btnRun').addEventListener('click', startRun);
+
+/* ---------------- boot ---------------- */
+(async function boot() {
+  applySets(); autosize(); refreshSessions();
+  try {
+    const h = await (await fetch('/api/health')).json();
+    $('#hengine').textContent = `engine v${h.version}`;
+    $('#hbrain').innerHTML = `brain <b>${esc(h.chain)}</b>`;
+    $('#setEngine').textContent = `engineer-buddy v${h.version} — the real engine, run one-shot per task`;
+    $('#setWs').textContent = h.workspace;
+  } catch {}
+  loadBrain();
+})();
+</script>
+
+
+</body>
+</html>
