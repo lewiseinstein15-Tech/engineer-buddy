@@ -1,8 +1,8 @@
 // llm7.js — llm7.io free keyless API. Anonymous access uses the literal token
 // "unused". Verified keyless 2026-10-25 (gpt-oss:20b end-to-end OK).
-import { fetchWithTimeout, RateLimitError, BuddyError } from '../../util.js';
+import { RateLimitError, BuddyError } from '../../util.js';
 import { extractUsage, gwCtxLimit } from '../usage.js';
-import { fetchStreaming, openAIStreamOrBuffer } from '../sse.js';
+import { fetchStreaming, openAIStreamOrBuffer, readBodyCapped } from '../sse.js';
 
 const STREAM_IDLE_MS = 45000;
 
@@ -20,7 +20,7 @@ export function createLlm7Gateway(cfg, timeouts) {
       let lastErr = null;
       const wantsStream = typeof onDelta === 'function';
       for (const m of chain) {
-        let res;
+        let res, aborter;
         try {
           const init = {
             method: 'POST',
@@ -38,9 +38,9 @@ export function createLlm7Gateway(cfg, timeouts) {
             }),
           };
           if (wantsStream) {
-            ({ res } = await fetchStreaming(`${cfg.baseUrl}/chat/completions`, init, { timeoutMs }));
+            ({ res, aborter } = await fetchStreaming(`${cfg.baseUrl}/chat/completions`, init, { timeoutMs }));
           } else {
-            res = await fetchWithTimeout(`${cfg.baseUrl}/chat/completions`, init, timeoutMs);
+            ({ res, aborter } = await fetchStreaming(`${cfg.baseUrl}/chat/completions`, init, { timeoutMs }));
           }
         } catch (e) {
           lastErr = new BuddyError(`llm7: network error: ${e.message}`, { code: 'NETWORK', cause: e });
@@ -60,6 +60,8 @@ export function createLlm7Gateway(cfg, timeouts) {
           const { text: sseText, usage: sseUsage, streamed, ttms, truncated } = await openAIStreamOrBuffer(res, onDelta, {
             idleMs: STREAM_IDLE_MS,
             totalMs: timeoutMs * 3,
+            aborter, // v0.69.2: arm the idle/total watchdogs — without it a stalled stream hung forever
+            firstPayloadMs: timeouts.firstPayloadMs ?? 60000,
           }).catch((e) => {
             throw new BuddyError(`llm7: stream error: ${e.message}`, { code: 'NETWORK', cause: e });
           });
@@ -75,7 +77,7 @@ export function createLlm7Gateway(cfg, timeouts) {
           lastErr = new BuddyError('llm7: empty response', { code: 'EMPTY_RESPONSE' });
           continue;
         }
-        const json = await res.json().catch(() => null);
+        const json = await readBodyCapped(res, aborter, timeouts.firstPayloadMs ?? 60000).catch(() => null);
         const text = json?.choices?.[0]?.message?.content;
         // finish_reason 'length' = cut off on max_tokens (v0.63.0)
         if (typeof text === 'string' && text.trim())

@@ -30,7 +30,10 @@ export const DEFAULT_CONFIG = {
     labels: { clean: 'buddy:clean', changes: 'buddy:changes-requested', critical: 'buddy:critical' },
   },
   circuitBreaker: { failureThreshold: 2, cooldownMs: 120000, maxRoundTrips: 2 },
-  timeouts: { chatMs: 150000, httpMs: 30000 },
+  // firstPayloadMs (v0.69.2): bound the wait for the first real SSE payload —
+  // a relay holding the stream open with only keepalive comments must not
+  // hang a turn; the gateway aborts and the router fails over.
+  timeouts: { chatMs: 150000, httpMs: 30000, firstPayloadMs: 60000 },
   // v0.2 — write path (issue fixer). Conservative by default.
   write: {
     maxFilesChanged: 10,

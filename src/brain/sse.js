@@ -89,25 +89,45 @@ export async function* bodyChunks(res, { idleMs = 45000, totalMs = null, aborter
  * Handles \r\n and split lines across chunk boundaries.
  */
 export async function* sseData(res, opts = {}) {
+  const { aborter = null, firstPayloadMs = 0 } = opts;
   let line = '';
-  for await (const chunk of bodyChunks(res, opts)) {
-    let i = 0;
-    while (i < chunk.length) {
-      const nl = chunk.indexOf('\n', i);
-      if (nl === -1) {
-        line += chunk.slice(i);
-        break;
+  // First-payload watchdog (v0.69.2): a relay can hold the stream open and
+  // dribble SSE comment lines (`:` keepalives) forever — bytes that keep
+  // resetting the byte-idle watchdog in bodyChunks while carrying zero
+  // content. If no real `data:` payload arrives within firstPayloadMs, abort
+  // the request so the gateway surfaces a NETWORK error and the router
+  // fails over to the next gateway instead of hanging the turn.
+  let fpTimer = null;
+  if (aborter && firstPayloadMs > 0) {
+    fpTimer = setTimeout(() => {
+      try { aborter.abort(new Error(`no stream payload within ${firstPayloadMs}ms`)); } catch { /* already aborted */ }
+    }, firstPayloadMs);
+  }
+  try {
+    for await (const chunk of bodyChunks(res, opts)) {
+      let i = 0;
+      while (i < chunk.length) {
+        const nl = chunk.indexOf('\n', i);
+        if (nl === -1) {
+          line += chunk.slice(i);
+          break;
+        }
+        line += chunk.slice(i, nl);
+        i = nl + 1;
+        const trimmed = line.replace(/\r$/, '');
+        line = '';
+        if (!trimmed || trimmed.startsWith(':')) continue; // comment / keepalive
+        if (!trimmed.startsWith('data:')) continue; // event:/id:/unknown fields
+        const payload = trimmed.slice(5).trim();
+        if (payload === '[DONE]') return;
+        if (payload) {
+          if (fpTimer) { clearTimeout(fpTimer); fpTimer = null; }
+          yield payload;
+        }
       }
-      line += chunk.slice(i, nl);
-      i = nl + 1;
-      const trimmed = line.replace(/\r$/, '');
-      line = '';
-      if (!trimmed || trimmed.startsWith(':')) continue; // comment / keepalive
-      if (!trimmed.startsWith('data:')) continue; // event:/id:/unknown fields
-      const payload = trimmed.slice(5).trim();
-      if (payload === '[DONE]') return;
-      if (payload) yield payload;
     }
+  } finally {
+    if (fpTimer) clearTimeout(fpTimer);
   }
 }
 
@@ -224,6 +244,31 @@ function mapOllamaUsage(final) {
 }
 
 /**
+ * Cap a buffered body read (v0.69.2): the header-phase timeout only bounds
+ * time-to-headers — a relay that answers headers then never completes the
+ * body hung `res.json()` forever. Race the read against an abort deadline;
+ * the gateway's caller sees the rejection and fails over.
+ */
+export async function readBodyCapped(res, aborter, ms, asText = false) {
+  const read = asText ? res.text() : res.json();
+  if (!aborter || !ms) return read;
+  let t = null;
+  try {
+    return await Promise.race([
+      read,
+      new Promise((_, rej) => {
+        t = setTimeout(() => {
+          try { aborter.abort(new Error(`buffered body exceeded ${ms}ms`)); } catch { /* already aborted */ }
+          rej(new Error(`buffered body exceeded ${ms}ms`));
+        }, ms);
+      }),
+    ]);
+  } finally {
+    if (t) clearTimeout(t);
+  }
+}
+
+/**
  * One entry point for OpenAI-style relays: consume `res` as SSE when the
  * gateway actually streamed, else fall back to the classic buffered JSON
  * body (relays that ignore stream:true must keep working untouched).
@@ -235,7 +280,7 @@ export async function openAIStreamOrBuffer(res, onDelta, opts = {}) {
     const { text, usage, ttms, finish, reasoningChars } = await streamOpenAI(res, onDelta, opts);
     return { text, usage, streamed: true, ttms, truncated: finish === 'length', reasoningChars };
   }
-  const json = await res.json().catch(() => null);
+  const json = await readBodyCapped(res, opts.aborter, opts.firstPayloadMs ?? 60000).catch(() => null);
   const msg = json?.choices?.[0]?.message;
   const text =
     typeof msg?.content === 'string'

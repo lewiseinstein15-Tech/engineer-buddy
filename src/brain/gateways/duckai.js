@@ -6,7 +6,7 @@
 //   1) GET  https://duckduckgo.com/duckchat/v1/status   (x-vqd-accept: 1) → x-vqd-4 token
 //   2) POST https://duckduckgo.com/duckchat/v1/chat     (x-vqd-4: token) → SSE stream
 import { fetchWithTimeout, RateLimitError, BuddyError } from '../../util.js';
-import { fetchStreaming, sseData } from '../sse.js';
+import { fetchStreaming, readBodyCapped, sseData } from '../sse.js';
 
 const STREAM_IDLE_MS = 45000;
 
@@ -34,12 +34,12 @@ export function createDuckAiGateway(cfg, timeouts) {
     async chat(messages, { maxTokens = 2048, temperature = 0.2, timeoutMs = timeouts.chatMs, model, onDelta = null } = {}) {
       const m = model || models[0];
       const vqd = await getVqd(timeouts.httpMs);
-      let res;
+      let res, aborter;
       if (typeof onDelta === 'function') {
         // Streaming path (v0.28.0): Duck.ai already answers SSE — consume the
         // body incrementally instead of buffering res.text().
         try {
-          ({ res } = await fetchStreaming(
+          ({ res, aborter } = await fetchStreaming(
             `${BASE}/v1/chat`,
             {
               method: 'POST',
@@ -66,7 +66,7 @@ export function createDuckAiGateway(cfg, timeouts) {
         }
         let content = '';
         try {
-          for await (const payload of sseData(res, { idleMs: STREAM_IDLE_MS, totalMs: timeoutMs * 3 })) {
+          for await (const payload of sseData(res, { idleMs: STREAM_IDLE_MS, totalMs: timeoutMs * 3, aborter, firstPayloadMs: timeouts.firstPayloadMs ?? 60000 })) {
             try {
               const j = JSON.parse(payload);
               if (typeof j?.message?.content === 'string' && j.message.content) {
@@ -86,7 +86,7 @@ export function createDuckAiGateway(cfg, timeouts) {
         return { text: content.trim(), model: m, gateway: 'duckai', streamed: true };
       }
       try {
-        res = await fetchWithTimeout(
+        ({ res, aborter } = await fetchStreaming(
           `${BASE}/v1/chat`,
           {
             method: 'POST',
@@ -99,8 +99,8 @@ export function createDuckAiGateway(cfg, timeouts) {
             },
             body: JSON.stringify({ model: m, messages, stream: true }),
           },
-          timeoutMs
-        );
+          { timeoutMs }
+        ));
       } catch (e) {
         throw new BuddyError(`duckai: network error: ${e.message}`, { code: 'NETWORK', cause: e });
       }
@@ -112,7 +112,7 @@ export function createDuckAiGateway(cfg, timeouts) {
         throw new BuddyError(`duckai: HTTP ${res.status} ${body.slice(0, 160)}`, { code: 'HTTP_' + res.status });
       }
 
-      const raw = await res.text().catch(() => '');
+      const raw = await readBodyCapped(res, aborter, timeouts.firstPayloadMs ?? 60000, true).catch(() => '');
       // Parse SSE "data: {...}" chunks; also tolerate a plain JSON body.
       let content = '';
       if (raw.trim().startsWith('{')) {

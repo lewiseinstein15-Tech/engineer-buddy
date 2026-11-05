@@ -5,9 +5,9 @@
 // parks Pollinations for exactly that long and moves on. Verified 2026-10-25.
 // Vision-capable (v0.13.3): the openai endpoint accepts image_url content
 // parts — this is Buddy's default path for screenshot/@image.png input.
-import { fetchWithTimeout, RateLimitError, BuddyError } from '../../util.js';
+import { RateLimitError, BuddyError } from '../../util.js';
 import { extractUsage, gwCtxLimit } from '../usage.js';
-import { fetchStreaming, openAIStreamOrBuffer } from '../sse.js';
+import { fetchStreaming, openAIStreamOrBuffer, readBodyCapped } from '../sse.js';
 
 const STREAM_IDLE_MS = 45000;
 
@@ -24,7 +24,7 @@ export function createPollinationsGateway(cfg, timeouts) {
     async chat(messages, { maxTokens = 2048, temperature = 0.2, timeoutMs = timeouts.chatMs, model, onDelta = null } = {}) {
       const m = model || models[0];
       const wantsStream = typeof onDelta === 'function';
-      let res;
+      let res, aborter;
       try {
         const init = {
           method: 'POST',
@@ -42,9 +42,9 @@ export function createPollinationsGateway(cfg, timeouts) {
           }),
         };
         if (wantsStream) {
-          ({ res } = await fetchStreaming(`${cfg.baseUrl}/openai`, init, { timeoutMs }));
+          ({ res, aborter } = await fetchStreaming(`${cfg.baseUrl}/openai`, init, { timeoutMs }));
         } else {
-          res = await fetchWithTimeout(`${cfg.baseUrl}/openai`, init, timeoutMs);
+          ({ res, aborter } = await fetchStreaming(`${cfg.baseUrl}/openai`, init, { timeoutMs }));
         }
       } catch (e) {
         throw new BuddyError(`pollinations: network error: ${e.message}`, { code: 'NETWORK', cause: e });
@@ -66,6 +66,8 @@ export function createPollinationsGateway(cfg, timeouts) {
         const { text: sseText, usage: sseUsage, streamed, ttms, truncated } = await openAIStreamOrBuffer(res, onDelta, {
           idleMs: STREAM_IDLE_MS,
           totalMs: timeoutMs * 3,
+          aborter, // v0.69.2: arm the idle/total watchdogs — without it a stalled stream hung forever
+          firstPayloadMs: timeouts.firstPayloadMs ?? 60000,
         }).catch((e) => {
           throw new BuddyError(`pollinations: stream error: ${e.message}`, { code: 'NETWORK', cause: e });
         });
@@ -81,7 +83,7 @@ export function createPollinationsGateway(cfg, timeouts) {
         throw new BuddyError('pollinations: empty response', { code: 'EMPTY_RESPONSE' });
       }
 
-      const raw = await res.text().catch(() => '');
+      const raw = await readBodyCapped(res, aborter, timeouts.firstPayloadMs ?? 60000, true).catch(() => '');
       try {
         const json = JSON.parse(raw);
         const msg = json?.choices?.[0]?.message;

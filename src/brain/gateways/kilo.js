@@ -33,7 +33,7 @@
 //      lesson: model quality is a human judgment the engine never guesses).
 import { fetchWithTimeout, RateLimitError, BuddyError, debugLog } from '../../util.js';
 import { extractUsage, gwCtxLimit } from '../usage.js';
-import { fetchStreaming, openAIStreamOrBuffer } from '../sse.js';
+import { fetchStreaming, openAIStreamOrBuffer, readBodyCapped } from '../sse.js';
 
 // Streaming body watchdogs (v0.28.0): a relay that stops sending bytes must
 // not hang the turn — abort after 45s of silence, 3× the headers timeout in
@@ -62,13 +62,14 @@ async function getFreeModels(cfg, httpMs) {
   if (cfg.models !== 'auto' || modelCache.ids.length) {
     if (Date.now() - modelCache.at < MODEL_TTL_MS || cfg.models !== 'auto') return modelCache.ids;
   }
-  const res = await fetchWithTimeout(
+  const { res, aborter } = await fetchStreaming(
     `${cfg.baseUrl}/v1/models`,
     { headers: { Authorization: `Bearer ${cfg.apiKey || 'anonymous'}` } },
-    httpMs
+    { timeoutMs: httpMs }
   );
   if (!res.ok) throw new BuddyError(`kilo models list HTTP ${res.status}`, { code: 'HTTP_' + res.status });
-  const json = await res.json();
+  const json = await readBodyCapped(res, aborter, httpMs).catch(() => null);
+  if (!json) throw new BuddyError('kilo models list: body never completed', { code: 'NETWORK' });
   const ids = (json?.data || []).map((m) => m.id).filter(Boolean);
   modelCache = { at: Date.now(), ids };
   return ids;
@@ -162,12 +163,12 @@ export function createKiloGateway(cfg, timeouts) {
         ...(wantsStream ? { stream_options: { include_usage: true } } : {}),
       };
 
-      let res;
+      let res, aborter;
       try {
         if (wantsStream) {
           // Streaming path (v0.28.0): fetchStreaming returns the AbortController
           // so the SSE reader's idle/total watchdogs abort the SAME request.
-          ({ res } = await fetchStreaming(
+          ({ res, aborter } = await fetchStreaming(
             `${cfg.baseUrl}/v1/chat/completions`,
             {
               method: 'POST',
@@ -182,7 +183,7 @@ export function createKiloGateway(cfg, timeouts) {
             { timeoutMs }
           ));
         } else {
-          res = await fetchWithTimeout(
+          ({ res, aborter } = await fetchStreaming(
             `${cfg.baseUrl}/v1/chat/completions`,
             {
               method: 'POST',
@@ -194,8 +195,8 @@ export function createKiloGateway(cfg, timeouts) {
               },
               body: JSON.stringify(body),
             },
-            timeoutMs
-          );
+            { timeoutMs }
+          ));
         }
       } catch (e) {
         throw new BuddyError(`kilo: network error: ${e.message}`, { code: 'NETWORK', cause: e });
@@ -222,6 +223,8 @@ export function createKiloGateway(cfg, timeouts) {
         const { text: sseText, usage: sseUsage, streamed, ttms, truncated, reasoningChars } = await openAIStreamOrBuffer(res, onDelta, {
           idleMs: STREAM_IDLE_MS,
           totalMs: timeoutMs * 3,
+          aborter, // v0.69.2: arm the idle/total watchdogs — without it a stalled stream hung forever
+          firstPayloadMs: timeouts.firstPayloadMs ?? 60000,
         }).catch((e) => {
           throw new BuddyError(`kilo: stream error: ${e.message}`, { code: 'NETWORK', cause: e });
         });
@@ -237,7 +240,7 @@ export function createKiloGateway(cfg, timeouts) {
         throw modelBad(this._emptyMsg(chosen, reasoningChars), { code: 'EMPTY_RESPONSE' });
       }
 
-      const json = await res.json().catch(() => null);
+      const json = await readBodyCapped(res, aborter, timeouts.firstPayloadMs ?? 60000).catch(() => null);
       // Inline error envelope (v0.64.0): the relay answers HTTP 200 with
       // {"error":{"code":502,"message":"Inference connection error…"}} and NO
       // choices — witnessed live 2026-10-31 (provider_unavailable). This is
