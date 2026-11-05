@@ -184,6 +184,10 @@ function runTask(body) {
       }
       if (ev.type === 'tool') r.tools++;
       if (ev.type === 'say') r.said = ev.text;
+      // Live thoughts (engine v0.69.1): display-only narration snapshots —
+      // they ride the SSE to the UI but stay out of the saved session log,
+      // so replays keep the real event trail without ~8 rows/s of noise.
+      if (ev.type === 'stream') { sse(r.res, ev); continue; }
       record(id, ev); sse(r.res, ev);
     }
   });
@@ -200,6 +204,7 @@ function runTask(body) {
     record(id, end); sse(r.res, end);
     const sid = `${new Date().toISOString().replace(/[:.]/g, '-')}-${slug(task)}.json`;
     try {
+      fs.mkdirSync(SESSIONS_DIR, { recursive: true });
       fs.writeFileSync(path.join(SESSIONS_DIR, sid), JSON.stringify({
         id: sid, task, files, yolo, started: r.started, code, secs: r.secs, tools: r.tools, said: r.said, todos: r.todos, log: r.log,
       }));
@@ -212,6 +217,9 @@ function runTask(body) {
 
 // ------------------------------------------------------------------ replays --
 function sessionList() {
+  // The workspace (and with it .buddy-desktop/) can be re-seeded while the
+  // server is up — recreate the sessions dir instead of 500-ing.
+  fs.mkdirSync(SESSIONS_DIR, { recursive: true });
   const out = [];
   for (const f of fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json')).sort().reverse()) {
     try {

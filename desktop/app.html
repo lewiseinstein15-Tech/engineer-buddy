@@ -102,6 +102,7 @@ input:focus,textarea.tin:focus{outline:none;border-color:#b49b62}
 .narr .dots::after{content:"";animation:dots 1.2s steps(4) infinite}
 @keyframes dots{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
 .narr .tt{color:var(--mut);font-size:11.5px;font-family:ui-monospace,Menlo,monospace;margin-left:2px}
+.narr.thought .narr-text{font-style:italic;color:#8a6a3a}
 .narr.done{color:var(--mut);font-size:12.5px}
 .narr.done .spark{animation:none;color:#3f9d4e}
 .shimmer{height:3px;border-radius:3px;margin:0 0 12px;background:linear-gradient(90deg,#e8ddc2 25%,#c9a55b 50%,#e8ddc2 75%);background-size:200% 100%;animation:sh 1.4s linear infinite}
@@ -372,6 +373,7 @@ let toastT;
 function toast(m) { const t = $('#toast'); t.textContent = m; t.style.display = 'block'; clearTimeout(toastT); toastT = setTimeout(() => t.style.display = 'none', 2600); }
 
 let evCount = 0, working = false, tickTimer = null, replayMode = false;
+let lastEventAt = 0, firstEventSeen = false; // narration wait-ladder state (reset per run)
 function setChip(state, txt) { const c = $('#hstate'); c.textContent = txt; c.className = 'chip' + (state === 'ok' ? ' state-ok' : state === 'busy' ? ' state-busy' : ''); }
 
 /* ---------------- inspector ---------------- */
@@ -407,10 +409,45 @@ function narrLine(flow) {
   const n = el('div', 'narr', '<span class="spark">✦</span><span class="narr-text">waking the brain…</span><span class="dots"></span><span class="tt">t+0.0s</span>');
   flow.appendChild(n);
   const t0 = Date.now();
-  tickTimer = setInterval(() => { n.querySelector('.tt').textContent = `t+${((Date.now() - t0) / 1000).toFixed(1)}s`; $('#hstate').textContent = `working t+${((Date.now() - t0) / 1000).toFixed(0)}s`; }, 100);
+  lastEventAt = t0; firstEventSeen = false; n.classList.remove('thought');
+  // The wait must never look stuck: until the first real event lands, the
+  // ladder moves through honest stages; mid-run a >15s silence (model call
+  // with no streamed thought) reads "waiting on the model…" with a live t+.
+  tickTimer = setInterval(() => {
+    const t = (Date.now() - t0) / 1000, idle = (Date.now() - lastEventAt) / 1000;
+    n.querySelector('.tt').textContent = `t+${t.toFixed(1)}s`;
+    $('#hstate').textContent = `working t+${t.toFixed(0)}s`;
+    const txt = n.querySelector('.narr-text');
+    if (!firstEventSeen) txt.textContent = idle < 6 ? 'waking the brain…' : idle < 18 ? 'sent to the brain — waiting for the first thought…' : `still thinking… (t+${t.toFixed(0)}s, no word yet)`;
+    else if (idle > 15) txt.textContent = `waiting on the model… t+${t.toFixed(0)}s`;
+  }, 100);
   return n;
 }
-function setNarr(txt) { const n = $('.runflow:last-child .narr-text'); if (n) n.textContent = txt; scrollDown(); }
+function setNarr(txt) {
+  lastEventAt = Date.now(); firstEventSeen = true;
+  const n = $('.runflow:last-child .narr-text'); if (n) n.textContent = txt;
+  scrollDown();
+}
+// Live thoughts (engine v0.69.1): the same tolerant extraction the TUI busy
+// footer shows — the tool being called or the words of a say, as they stream.
+function streamNarr(ev) {
+  const clean = (s) => String(s).replace(/\s+/g, ' ').trim();
+  let txt = null;
+  if (ev.message && ev.message.trim()) {
+    const msg = clean(ev.message);
+    txt = `✻ ${msg.length > 78 ? '…' + msg.slice(-77) : msg}`;
+  } else if (ev.tool) {
+    let arg = '';
+    const m = /"(?:path|command|message|text|query|dir)"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(ev.raw || '');
+    if (m) arg = m[1].replace(/\\n/g, ' ').replace(/\\"/g, '"').replace(/\\\\/g, '\\').replace(/\s+/g, ' ').trim();
+    txt = `→ ${ev.tool}${arg ? ` ${arg}` : ''}`;
+    if (txt.length > 80) txt = txt.slice(0, 79) + '…';
+  }
+  if (!txt) return;
+  const n = $('.runflow:last-child .narr');
+  if (n) n.classList.add('thought');
+  setNarr(txt);
+}
 function endNarr(narr, code, secs, tools) {
   clearInterval(tickTimer);
   narr.classList.add('done');
@@ -487,6 +524,7 @@ function diffCard(diff) {
 let pendingWhy = null, currentFlow = null;
 
 function handle(ev) {
+  if (ev.type === 'stream') { streamNarr(ev); return; } // display-only: not in the inspector, not in replays
   inspRow(ev);
   const flow = currentFlow;
   if (!flow && ev.type !== 'stderr') return;
