@@ -543,6 +543,14 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
   const turnBudget = resolveTurnBudget(getChatSetting(root, 'maxSteps'));
   const effortRef = EFFORT_PRESETS[persistedEffort] ? { ...EFFORT_PRESETS[persistedEffort] } : null;
   if (effortRef && turnBudget.budget !== null) effortRef.maxSteps = turnBudget.budget;
+  // Live thoughts on the machine trail (v0.69.1): a stream-json one-shot gets
+  // the same tolerant extraction the TUI busy footer has — while the brain's
+  // reply streams in, the visible parts (the tool being called, the words of
+  // a say) ride the transcript as {type:'stream'} events so a watcher like
+  // buddy-desktop shows a moving wait instead of a silent one. Display-only:
+  // the real parse in chat.js is untouched; json/text modes stay buffered.
+  const oneShotStream = fmt === 'stream-json' ? makeThoughtExtractor() : null;
+  let lastStreamPaint = 0;
   const { chat, hooks } = await createBuddySession({
     root,
     router,
@@ -554,6 +562,22 @@ export async function runOneShot({ router, root = process.cwd(), task, safe = fa
     routing: buildRoutingConfig(config, root, effortRef),
     repoMap: repoMapProvider,
     extraDirs,
+    streaming: oneShotStream ? { enabled: true } : null,
+    onStream: oneShotStream
+      ? (frag) => {
+          const snap = oneShotStream.push(frag);
+          if (!snap) return;
+          const now = Date.now();
+          if (now - lastStreamPaint < 120) return; // throttle paints, not data
+          lastStreamPaint = now;
+          process.stdout.write(`${JSON.stringify({
+            type: 'stream',
+            ...(snap.tool ? { tool: snap.tool } : {}),
+            ...(snap.message ? { message: snap.message.slice(-200) } : {}),
+            raw: snap.raw,
+          })}\n`);
+        }
+      : null,
     onEvent: (ev) => {
       events.push(ev);
       render(ev);
@@ -782,7 +806,8 @@ export async function startRepl({ router, root = process.cwd(), config = {}, yol
   const selfHealingOn = getChatSetting(root, 'selfHealing', true) !== false;
   // Streaming thoughts (v0.28.0): default ON in the TUI — the busy footer
   // grows a live thought line fed by raw gateway deltas. Persisted under
-  // chat.stream; one-shot/CI paths never pass onStream so they never change.
+  // chat.stream; the stream-json one-shot passes its own onStream (v0.69.1)
+  // while json/text one-shots stay fully buffered.
   const streamRef = { enabled: getChatSetting(root, 'stream', true) !== false };
   const thoughtExtractor = makeThoughtExtractor();
   let lastThoughtPaint = 0;
