@@ -16,8 +16,11 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 7822;
 const WORKSPACE = process.env.BUDDY_WORKSPACE || '/tmp/buddy-workspace';
+// engine: env override > sibling engineer-buddy checkout > the repo checkout this folder is part of
 const ENGINE = process.env.ENGINEER_BUDDY_PATH
-  || (fs.existsSync(path.join(__dirname, '..', 'engineer-buddy')) ? path.join(__dirname, '..', 'engineer-buddy') : null);
+  || [path.join(__dirname, '..', 'engineer-buddy'), path.join(__dirname, '..')]
+      .find((p) => fs.existsSync(path.join(p, 'src', 'index.js')))
+  || path.join(__dirname, '..');
 const ENGINE_SRC = path.join(ENGINE, 'src', 'index.js');
 const APP_DIR = path.join(WORKSPACE, '.buddy-desktop');
 const SESSIONS_DIR = path.join(APP_DIR, 'sessions');

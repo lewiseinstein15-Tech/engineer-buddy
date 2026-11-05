@@ -122,6 +122,20 @@ Windows notes, stated honestly:
   anything executes, on every OS; on Windows the system shell is cmd.exe via
   Node's `shell: true` and the same allow/deny rules apply.
 
+### The desktop app (buddy-desktop)
+
+Buddy out of the terminal: a warm, chat-shaped desktop UI where every step of a run becomes a block in the conversation — collapsible command cards, thinking lines with the gateway and model that reasoned them, a live to-dos card, the workspace diff — and the final answer arrives in its own titled, fully rendered card (markdown, tables, code blocks with a working copy button). The UI wraps the real engine over its documented `stream-json` interface; nothing is re-implemented, and it stays zero-dependency beyond Node ≥ 20.
+
+```bash
+git clone https://github.com/lewiseinstein15-Tech/engineer-buddy.git
+cd engineer-buddy
+./desktop/start.sh               # → http://127.0.0.1:7822
+# or aim it at any git project:
+BUDDY_WORKSPACE=/path/to/your/project ./desktop/start.sh
+```
+
+Full feature tour — sessions replay, provider/model settings, the git & GitHub panel: [desktop/README.md](desktop/README.md). A 90-second, one-take recording of a real run (question typed on camera → narrated run → every block opened one by one → the rendered answer): [desktop/demo/buddy-desktop-demo.mp4](desktop/demo/buddy-desktop-demo.mp4).
+
 ## Buddy Code — the terminal coding agent (v0.8)
 
 Like Claude Code, but keyless and $0. Run it in any repo:

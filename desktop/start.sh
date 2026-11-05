@@ -4,7 +4,14 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-ENGINEER_BUDDY_PATH="${ENGINEER_BUDDY_PATH:-$(cd .. && pwd)/engineer-buddy}"
+# engine: env override > sibling engineer-buddy checkout > this repo checkout
+if [[ -z "${ENGINEER_BUDDY_PATH:-}" ]]; then
+  if [[ -d ../engineer-buddy ]]; then
+    ENGINEER_BUDDY_PATH="$(cd .. && pwd)/engineer-buddy"
+  else
+    ENGINEER_BUDDY_PATH="$(cd .. && pwd)"
+  fi
+fi
 export ENGINEER_BUDDY_PATH
 BUDDY_WORKSPACE="${BUDDY_WORKSPACE:-/tmp/buddy-workspace}"
 export BUDDY_WORKSPACE
