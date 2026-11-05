@@ -24,8 +24,11 @@ case "$(uname -s)" in
     exec open "$URL"
     ;;
   *)
+    # --class groups the window under X11; --wayland-app-id does the same on
+    # native-Wayland compositors (Hyprland/Sway — e.g. Omarchy), where --class
+    # alone would leave the window id'd as plain "chromium".
     for b in google-chrome google-chrome-stable chromium chromium-browser microsoft-edge brave-browser; do
-      if command -v "$b" >/dev/null 2>&1; then exec "$b" --app="$URL" --class=buddy-desktop; fi
+      if command -v "$b" >/dev/null 2>&1; then exec "$b" --app="$URL" --class=buddy-desktop --wayland-app-id=buddy-desktop; fi
     done
     exec xdg-open "$URL"
     ;;
